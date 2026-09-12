@@ -1,0 +1,182 @@
+# MiniCPM MLX 双工路线语音输出断续修复 — 交接文档
+
+> 日期：2026-09-12（Asia/Shanghai）
+> 工作树：`/Users/mincer/项目/s2s/runtime/speech-swift-minicpm-native`（分支 `feature/minicpm-o-native`）
+> 范围：Swift 原生 MLX 双工服务（`MINICPM_DUPLEX_BACKEND=mlx` 路线）的音频输出连续性、复读防护、探针窗口归属与构建环境
+> 上游背景：`HANDOFF_MINICPM_MLX.md`（主集成目录）第 15/16 节
+
+## 1. 问题与定量证据
+
+用户报告：MLX 路线输出语音断断续续。
+
+对真实会话录音流（`data-native/sessions/<id>/stream.jsonl`）做播放模拟分析
+（脚本思路见第 5 节）：修复前每个约 1.0 秒的音频块平均 1.78 秒才到达
+（中位数），单次回答内部存在 0.8–5.8 秒空窗，5 轮对话共 17 次播放缓冲
+清空（underrun）——这就是"断断续续"。
+
+## 2. 根因
+
+传输 worker 是"一个 `input.append` → prefill → 一个 generate unit（约 1 秒
+音频）"的串行循环：**输出节奏被客户端发包节奏锁死**。
+
+- 生成本身并不慢：阶段计时显示每个 unit 的 LLM 解码 0.16–0.43s、语义 TTS
+  0.03–0.37s、Token2Wav 0.17–0.39s，合计 RTF 0.5–0.9（快于实时）。
+- 但客户端每 1.0 秒才送来一个 1 秒包（浏览器），探针更慢（等 ack 后再等满
+  1 秒 ≈ 1.6–1.7 秒/包）。生成跑不满，输出速率 ≈ min(生成速率, 包到达率)。
+- 浏览器 1.0 秒喂包恰好贴着实时零余量：任何单 unit 尖峰（首块 forceFlush、
+  semantic TTS / Token2Wav 尖峰、首次 Metal 编译）都会让播放器断流。
+- 浏览器 `AudioPlayer.endTurn()` 不清空已排程音频（自然句尾依赖它），所以
+  不能靠"无限跑 ahead + 打断时靠客户端丢弃"解决，领先距离必须有界。
+
+## 3. 修复内容（按文件）
+
+### 3.1 `Sources/MiniCPMDemoBackend/Backend.swift`
+
+- 把 `append()` 内联的"engine 输出 → wire 事件"转换提取为
+  `emitOutputs(_:inputID:requestedResponseID:wallClockStart:)`（throwing），
+  `append` 与新的 `continueResponse` 共用；response 打开/关闭/新开时同步
+  维护 `activeResponseID`、`pendingFinalize` 与领先计数。
+- 新增 `continueResponse() -> [MiniCPMDemoEvent]?`：当 `state == .active`、
+  双工模式、`activeResponseID != nil`、`!pendingFinalize` 且领先预算未用完
+  时，用全零 16k 采样 continuation tick（`continuation_tick=true`、
+  `speech_active=false`，引擎跳过音频编码器，prefill 约 1ms）自驱动生成
+  下一个 unit；input_id 使用 `cont_%08llu` 前缀。引擎拒绝/turn 结束/预算
+  用尽返回 nil。
+- 新增 `continuationLeadUnits` 计数与 `maxContinuationLeadUnits = 3`：
+  合成 unit 计入，**真实 input.append 回补 1**（`append` 入口处
+  `max(0, count-1)`）。该值即 barge-in 时可能需要丢弃的陈旧音频上限
+  （≤3 秒），也是吸收生成尖峰的播放缓冲。
+- 所有 `activeResponseID = nil` 的生命周期点同步清零领先计数
+  （cancel/reset/close/error/listen 关闭/新 response 开启）。
+- 新增私有 `encodeFloat32(_:)` 用于合成 tick 的 PCM 载荷。
+
+### 3.2 `Sources/MiniCPMDemoBackend/Server.swift`
+
+生成 worker 增加 `driveContinuation(for:)`，在每个真实输入处理完
+（emit + commit）之后调用：
+
+- 循环条件：`generationEpoch.isCurrent(queued.epoch)`——barge-in/reset
+  立即退出；
+- **队列非空立即 return 回主 FIFO 循环**：真实输入永远优先，直播用户
+  音频按序 prefill，不积累落后；
+- 每 unit 走与主路径一致的 emit（epoch 逐事件校验，陈旧事件在
+  `emitMiniCPMDemoEvents` 处丢弃）→ `commitPendingResponse()`；
+- 错误事件写线后抛出，行为与主路径一致（关闭 FIFO，由下一输入触发
+  transport teardown）。
+
+### 3.3 `Sources/MiniCPMDuplexRuntime/MiniCPMNativeDuplexEngine.swift`
+
+新增 `MiniCPMResponseRepeatGuard`（8-bit 解码器的退化复读循环防护）：
+
+- 检测规则移植自参考 Python 双工协调器（`minicpm_duplex/server.py` 的
+  `_repeated_phrase_suffix`）：归一化（字母/数字，含 CJK）后，≤12 字短语
+  连续重复 4 次（单字符循环如"哈哈"排除），并扩展**句子级规则**：13–24
+  字短语连续重复 3 次（one-second unit 会把循环切在任意位置，长句循环
+  只有 4 次阈值会漏）。
+- 另加 120 unit 回答上限（对齐上游 streaming answer 安全上限）。
+- 触发后的行为：在 `generate()` 入口处消费 trip，复用既有
+  `forceListenOverride` 路径——`closeTurnForForcedListen`（KV 喂 turn_eos）
+  + 强制采样 `<|listen|>` + 释放 TTS/Token2Wav turn 状态，response 正常
+  关闭，协议边界干净。
+- 接线点：`generate()` 末尾对 spoken unit 追加文本并检查；`isListen`、
+  `endOfTurn`、`prepare`、`reset`、`interrupt`（经
+  `repairInterruptedTurn`）、`rollback`（被丢弃的 unit 文本不得计入）
+  处 reset。
+- 存量文本仅保留尾部 600 字符（检测窗口 + 余量）。
+
+### 3.4 测试（新增 7 个）
+
+- `Tests/MiniCPMDemoBackendTests/MiniCPMDemoBackendTests.swift`：
+  - `testContinueResponseStreamsNextUnitFromSyntheticContinuationTick`
+    （合成 tick 的输入形态、同 response 归属、cont_ 前缀、关闭后拒驱）；
+  - `testContinueResponseStopsAtLeadBudgetAndRefillsOnRealInput`
+    （预算 3 + 真实输入回补 1）；
+  - `testContinueResponseIsRefusedWithoutAnOpenResponse`；
+  - 新增 `ScriptedDuplexEngine` 桩。
+- `Tests/MiniCPMDuplexRuntimeTests/MiniCPMDuplexRuntimeTests.swift`：
+  短语 4 次阈值、句子级 3 次阈值、单字符循环/短文本豁免、120 unit 上限。
+
+### 3.5 `scripts/probe_minicpm_native_duplex.py`
+
+全双工修复后，旧 response 的 `turn_end` 可能落进下一个问题窗口（模型
+听到新问题才收口旧回答），回答尾部与 `cont_*` 单元也会在窗口之间到达。
+探针窗口归属修正：
+
+- end 边界到达时若**当前窗口尚无任何模型输出**（text/audio 都没有），
+  视为前一 response 的收口，不完成当前窗口，继续等本窗口自己的回答；
+- 当前无窗口时到达的 text/audio：归属最近完成的 turn（续说/尾部），不再
+  误报 unsolicited；启动期（尚无任何 turn）的 unsolicited 与复读检测
+  全部保留；
+- `last_completed_turn` 跟踪，response.done / listen_end / 超时完成路径
+  均登记。
+
+## 4. 设计权衡记录
+
+- **领先预算为什么是 3 而不是无限/120**：浏览器 `endTurn()` 不清空已排程
+  音频；无限跑 ahead 时打断要冲掉的陈旧音频无界（长回答可累积十几秒）。
+  3 秒足够吸收实测尖峰（首块 forceFlush ≈ 1.2s、TTS/T2W 尖峰 ≤0.4s），
+  同时把打断排空压到 ≤3 秒。真实输入按 1/s 回补，稳态缓冲 ≈ 3 秒。
+- **探针 ack 语义不受影响**：driver 单元的 delta 带 `cont_*` id，不会误
+  ack 探针的真实输入；unsolicited 判定只在无 turn 上下文时触发。
+- **continuation tick 与既有语义一致**：探针在回答期本来就发
+  `continuation_tick` 静音包（prefill_ms≈1.1），P1–P4 全部在这些语义上
+  通过；驱动只是把同样的输入在队列空缺时自动补上。
+
+## 5. 回归证据（2026-09-12）
+
+- normal 探针 5/5，`unsolicited=0`、`repeated=0`；回答内部空窗
+  **0.000s**（修复前 17 次清空、最差 5.8s）：
+  - `sess_A7448859DDF6`（lead-budget 构建）18 块音频 5 个回答；
+  - 最终烟雾 `sess_…（/tmp/mlx-final-check-*）` 5/5。
+- story 探针 3/3（复读 guard 生效后；修复前一次运行复现 48 包超时、
+  无边界、复读循环）。
+- barge-in 探针 3/3：第一轮"好的，我"后打断，第二轮"7加8等于15。"、
+  第三轮"9减4等于5。"，无旧输出越过 cancel。
+- Swift：`MiniCPMDuplexRuntimeTests` 33/33、`MiniCPMDemoBackendTests`
+  53/53、`MiniCPMDemoServiceTests` 5/5。
+- 前端 static 15/15；`scripts/tests` 审计 62/62；主集成目录 `tests/`
+  122 通过（6 个既有 skip）。
+- 播放模拟分析方法：按 `stream.jsonl` 的 audio delta 到达时间戳与 blob
+  WAV 时长，逐 turn 计算 `max(gap − 前块时长)` 作为回答内部 stall。
+
+## 6. 构建环境修复与注意
+
+- 默认 `.build` release scratch 曾报 `missing required module
+  '_NumericsShims'`：Xcode 升级后残留过期 clang module cache。删除
+  `.build/arm64-apple-macosx/release` 后全新构建即恢复（本次已在默认
+  scratch 完成干净重建；临时 scratch `.build-rel-fix` 亦可）。
+- **注意 `.build/release` 是指向 `.build/arm64-apple-macosx/release` 的
+  符号链接**：清理该目录会把 `scripts/build_mlx_metallib.sh` 放置的
+  `mlx.metallib` 一并删除，运行时报 `MLX error: Failed to load the
+  default metallib`。重建方法：
+  `./scripts/build_mlx_metallib.sh release`（产物落在二进制旁边，MLX
+  按 binary 同目录 → SwiftPM bundle → METAL_PATH 顺序查找）。
+- 部署：release 二进制位于 `.build/release/minicpm-mlx-server`（launcher
+  默认路径，native link 自检通过，无 Python/PyTorch 链接）。
+
+## 7. 当前运行状态
+
+- 服务：`127.0.0.1:7861`，`backend=swift_mlx`，`status=ready`，经
+  `MINICPM_DUPLEX_BACKEND=mlx MINICPM_DUPLEX_PORT=7861
+  ./minicpm_duplex_service.sh start` 启动（launchd label
+  `com.mincer.minicpm-duplex`）。`7860` 为无关 LTX UI（本轮已不在监听）。
+- 日志：`.runtime/minicpm-duplex/server.{stdout,stderr}.log`。
+
+## 8. 已知边界与遗留
+
+- 首音延迟（6–13s）与 8-bit 量化导致的文字含混为既有问题，本次未改。
+- 回答最开头仍可能出现一次 ≤0.13 秒的间隙（首块尖峰发生在缓冲建立前），
+  播放器启动延迟（~200ms 起）可掩盖。
+- turn 边界（提问期）的等待时间由输入节奏决定，不属于本次断续问题。
+- 浏览器端 `endTurn` 保留 ≤1 秒句尾缓冲属设计行为；模型主动收口时客户端
+  可能多播 ≤3 秒（领先预算上限）——如需更急的打断可后续在客户端
+  interrupt 路径加 `audioPlayer.stopAll()`。
+- P5 真实麦克风/扬声器 AEC（E4）、P7 产品阈值、P8 全量 runner 仍未验收，
+  见主 handoff。
+
+## 9. 安全规则（延续主 handoff）
+
+- 本提交仅包含本次会话改动与本文档；工作树中其余未跟踪 WIP 保持原状。
+- 不执行 `git reset --hard` / `git checkout --` / 清理未跟踪文件；
+  不 push 到远端，除非用户明确要求。
+- 重型 build/test 与模型服务严格串行；不要仅凭历史 PID 停进程。
