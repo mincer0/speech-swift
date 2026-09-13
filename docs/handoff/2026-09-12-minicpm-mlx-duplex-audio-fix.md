@@ -271,3 +271,36 @@ think 泄漏 0；normal 5/5、barge-in 3/3、回答内播放模拟最差 stall �
 "阳光明[媚的]早晨"）——这是量化模型跨单元采样的质量天花板；BF16 在本机
 RTF 3.1 不可用，group-32 重量化需要重做 golden parity（上游 demo 检出
 `/tmp/MiniCPM-o-Demo` 已被系统清理），留待后续决策。
+
+## 12. 追加修复（2026-09-13 晚）：句中 yield 碎片化的门控与惩罚
+
+用户再次实测后取证（sess_C7154416E736），根因链完整闭合：
+
+模型在用户说话期间频繁句中 yield（turn_eos）→ 语义 TTS turn 重置
+（token2wav_decoder_positions 回到 302）→ 续句片段成为新 TTS turn 的
+悬空开头 → `minNewTokens=0` 允许其立即采样 EOS → 0 语音码 → 发出
+"前导静音 + 尾端残音"的 padding chunk（该 chunk 的
+`audio_padding_samples` 缺失是因为 endOfTurn unit 不加 transport
+padding，前导静音来自 vocoder 自身）→ 用户听到 1 秒级空洞与残缺词。
+波形取证：文本 unit 的音频含 96% 静音（RMS 0.0007–0.0017）。
+
+修复（沿用 Python 稳定模式的既定产品语义）：
+
+- **前端稳定模式门控**（live-input-timeline.js）：用户**正在说话**时
+  `responseWindowActive=false`（首个 listen/speak 决策走 greedy → 模型
+  确定性听写，不再插话碎片）；采样窗口只在**用户停顿后**的 3-chunk
+  窗口内打开。此前窗口在语音期间保持打开是模型不断插话的直接原因。
+  相关前端静态测试已更新为新语义。
+- **服务端 lengthPenalty 默认 1.1 → 1.2**（仅 turn_eos 的 logit 惩罚，
+  不影响 listen/barge-in 与 chunk 边界）：进一步抑制句中 yield。
+  注意：1.45 的校准实验作废——训练进程（rhythmnet_v24_tempo_robust，
+  20:03 启动）与推理抢 GPU，实测 RTF 10–14（正常 0.7–0.8），该轮数据
+  全部受污染；1.2 未在干净环境下重新校准。
+
+诊断性发现（不修，记录）：音频编码器对 denormal 级输入（≤1e-38）会产生
+NaN 并沿 LLM/TTS/vocoder 链路传播（诊断探针的注入字节模式触发）；
+浏览器零填充静音走 continuation promotion 不经过编码器，真实麦克风
+room tone（~1e-4）是否触发待验证。建议后续在 mel 能量下限处做 clamp。
+
+遗留：GPU 与训练任务共享时，实时性必然劣化 15–20 倍——这不是服务端
+可修复的问题；验收测试必须在无训练负载下进行。
