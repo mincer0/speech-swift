@@ -973,12 +973,15 @@ extension MiniCPMDemoBackendTests {
         XCTAssertNil(exhausted, "a closed turn must not be driven further")
     }
 
-    func testContinueResponseStopsAtLeadBudgetAndRefillsOnRealInput() async throws {
-        let script = Array(repeating: ScriptedDuplexUnit.spoken, count: 16)
-        let modelEngine = ScriptedDuplexEngine(script: script)
+    func testContinueResponseStopsAtPlaybackCushionBound() async throws {
+        // Each scripted unit emits two seconds of audio, so the un-played
+        // client buffer crosses maxBufferedAudioSeconds after the second
+        // synthetic unit and the driver must stop.
+        let modelEngine = ScriptedDuplexEngine(
+            script: Array(repeating: .spoken, count: 8), samplesPerUnit: 48_000)
         let runtime = MiniCPMDuplexRuntime(engineFactory: { modelEngine })
         let adapter = MiniCPMDuplexRuntimeEngineAdapter(
-            runtime: runtime, sessionID: "backend-continue-cap")
+            runtime: runtime, sessionID: "backend-continue-cushion")
         let backend = MiniCPMDemoBackend(engine: adapter)
 
         _ = await backend.handle(MiniCPMDemoRequest(
@@ -996,20 +999,93 @@ extension MiniCPMDemoBackendTests {
             generated += 1
         }
         XCTAssertEqual(
-            generated, MiniCPMDemoBackend.maxContinuationLeadUnits,
-            "run-ahead generation must stop at the lead budget")
+            generated, Int(MiniCPMDemoBackend.maxBufferedAudioSeconds / 2.0),
+            "run-ahead must stop once the un-played client buffer is full")
+        let exhausted = await backend.continueResponse()
+        XCTAssertNil(exhausted)
+    }
 
-        // A real client packet pays back one lead unit, so exactly one more
-        // synthetic unit is allowed before the budget is spent again.
+    func testContinueResponseStopsAtSyntheticStreakCapAndRealInputResumes() async throws {
+        // Tiny audio units never fill the playback cushion, so the
+        // consecutive-synthetic-unit backstop is what stops the driver.
+        let modelEngine = ScriptedDuplexEngine(
+            script: Array(repeating: .spoken, count: 32), samplesPerUnit: 2_400)
+        let runtime = MiniCPMDuplexRuntime(engineFactory: { modelEngine })
+        let adapter = MiniCPMDuplexRuntimeEngineAdapter(
+            runtime: runtime, sessionID: "backend-continue-streak")
+        let backend = MiniCPMDemoBackend(engine: adapter)
+
+        _ = await backend.handle(MiniCPMDemoRequest(
+            type: "session.init",
+            payload: .object(["mode": .string("full_duplex")])))
+        _ = await backend.handle(MiniCPMDemoRequest(
+            type: "input.append",
+            input: .object(["text": .string("hello")])))
+        try await backend.commitPendingResponse()
+
+        var generated = 0
+        while let events = await backend.continueResponse() {
+            XCTAssertFalse(events.contains { $0.type == "error" })
+            try await backend.commitPendingResponse()
+            generated += 1
+        }
+        XCTAssertEqual(
+            generated, MiniCPMDemoBackend.maxConsecutiveSyntheticUnits,
+            "the synthetic streak backstop must stop the driver")
+
+        // A real client packet ends the streak, so the driver may run again.
         _ = await backend.handle(MiniCPMDemoRequest(
             type: "input.append",
             input: .object(["text": .string("again")])))
         try await backend.commitPendingResponse()
-        let refilled = try await requireContinue(backend)
-        XCTAssertFalse(refilled.contains { $0.type == "error" })
+        let resumed = try await requireContinue(backend)
+        XCTAssertFalse(resumed.contains { $0.type == "error" })
+    }
+
+    func testSilentDuplexPacketsArePromotedToContinuationTicks() async throws {
+        let modelEngine = ScriptedDuplexEngine(script: [.spoken, .spoken])
+        let runtime = MiniCPMDuplexRuntime(engineFactory: { modelEngine })
+        let adapter = MiniCPMDuplexRuntimeEngineAdapter(
+            runtime: runtime, sessionID: "backend-silent-promotion")
+        let backend = MiniCPMDemoBackend(engine: adapter)
+
+        _ = await backend.handle(MiniCPMDemoRequest(
+            type: "session.init",
+            payload: .object(["mode": .string("full_duplex")])))
+        _ = await backend.handle(MiniCPMDemoRequest(
+            type: "input.append",
+            input: .object(["text": .string("hello")])))
         try await backend.commitPendingResponse()
-        let exhausted = await backend.continueResponse()
-        XCTAssertNil(exhausted, "the refilled budget covers exactly one unit")
+        // A browser-style silent packet without any client-side flag.
+        let zeros = [Float](repeating: 0, count: 16_000)
+        _ = await backend.handle(MiniCPMDemoRequest(
+            type: "input.append",
+            input: .object([
+                "audio": .string(Self.base64OfFloat32(zeros)),
+                "format": .string("pcm_f32le"),
+                "sample_rate": .number(16_000),
+                "speech_active": .bool(false),
+            ])))
+        try await backend.commitPendingResponse()
+        let prefillInputs = await modelEngine.prefillInputs
+        XCTAssertGreaterThanOrEqual(prefillInputs.count, 2)
+        let promoted = prefillInputs.last
+        XCTAssertEqual(promoted?.continuationOnly, true,
+                       "all-zero duplex audio must be promoted server-side")
+        // Non-zero audio must keep the regular encode path.
+        let loud = [Float](repeating: 0.25, count: 16_000)
+        _ = await backend.handle(MiniCPMDemoRequest(
+            type: "input.append",
+            input: .object([
+                "audio": .string(Self.base64OfFloat32(loud)),
+                "format": .string("pcm_f32le"),
+                "sample_rate": .number(16_000),
+                "speech_active": .bool(true),
+            ])))
+        try await backend.commitPendingResponse()
+        let after = await modelEngine.prefillInputs
+        XCTAssertEqual(after.last?.continuationOnly, false,
+                       "non-zero audio must not be promoted")
     }
 
     func testContinueResponseIsRefusedWithoutAnOpenResponse() async throws {
@@ -1043,6 +1119,17 @@ extension MiniCPMDemoBackendTests {
     }
 }
 
+private extension MiniCPMDemoBackendTests {
+    static func base64OfFloat32(_ samples: [Float]) -> String {
+        var data = Data(capacity: samples.count * 4)
+        for sample in samples {
+            var bits = sample.bitPattern.littleEndian
+            withUnsafeBytes(of: &bits) { data.append(contentsOf: $0) }
+        }
+        return data.base64EncodedString()
+    }
+}
+
 /// Scripted duplex engine unit kinds for the continuation-driver tests.
 private enum ScriptedDuplexUnit { case spoken, listen }
 
@@ -1051,10 +1138,12 @@ private enum ScriptedDuplexUnit { case spoken, listen }
 private final class ScriptedDuplexEngine: MiniCPMDuplexEngine, @unchecked Sendable {
     private let lock = NSLock()
     private var script: [ScriptedDuplexUnit]
+    private let samplesPerUnit: Int
     private(set) var prefillInputs: [MiniCPMDuplexInput] = []
 
-    init(script: [ScriptedDuplexUnit]) {
+    init(script: [ScriptedDuplexUnit], samplesPerUnit: Int = 2_400) {
         self.script = script
+        self.samplesPerUnit = samplesPerUnit
     }
 
     func prepare(mode: MiniCPMDuplexMode, config: MiniCPMDuplexConfig) throws -> String { "prompt" }
@@ -1074,7 +1163,7 @@ private final class ScriptedDuplexEngine: MiniCPMDuplexEngine, @unchecked Sendab
         case .spoken:
             return MiniCPMDuplexOutput(
                 text: "片段",
-                audio: [Float](repeating: 0.1, count: 2_400),
+                audio: [Float](repeating: 0.1, count: samplesPerUnit),
                 isListen: false,
                 endOfTurn: false,
                 needsFinalize: true,

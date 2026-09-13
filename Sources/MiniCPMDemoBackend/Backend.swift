@@ -441,19 +441,25 @@ public actor MiniCPMDemoBackend {
     private var lastInitializeParameters: [String: MiniCPMJSONValue] = [:]
     private var lastMetrics: [String: MiniCPMJSONValue] = ["backend": .string("swift_mlx")]
     private let recorder: (any MiniCPMDemoEventRecorder)?
-    /// Run-ahead lead measured in synthetic (no-client-input) one-second
-    /// units the driver generated into the currently open spoken response.
-    /// Each real client packet pays one unit back, so this is the model-time
-    /// distance between generated output and the client's input clock — the
-    /// amount of buffered audio a barge-in can never exceed.  Real queued
-    /// input always takes priority over driving further ahead.
-    private var continuationLeadUnits = 0
-    /// Bounds how far generation may run ahead of the client's input clock:
-    /// large enough to absorb per-unit generation spikes (semantic TTS and
-    /// Token2Wav bursts, the first-chunk force flush) and to keep the player
-    /// buffered, small enough that interrupting a response discards at most a
-    /// few seconds of already-generated audio.
-    static let maxContinuationLeadUnits = 3
+    /// Audio seconds already sent (as deltas) into the currently open spoken
+    /// response, and the wall-clock timestamp of its first audio delta.
+    /// A browser plays at 1x realtime, so `sent − elapsed` approximates the
+    /// client's buffered audio — the quantity a barge-in can never exceed and
+    /// the cushion that absorbs generation spikes.  Unlike counting synthetic
+    /// units against client packets, this bound holds no matter how the units
+    /// were produced.
+    private var responseAudioSentSeconds: Double = 0
+    private var responseFirstAudioAtNS: UInt64?
+    /// Consecutive driver-generated units without an intervening real input.
+    /// Secondary backstop for responses that emit no (or tiny) audio, where
+    /// the playback-based bound alone would never engage.
+    private var syntheticStreak = 0
+    /// Playback-cushion bound in seconds: large enough to absorb per-unit
+    /// generation spikes (semantic TTS / Token2Wav bursts, the first-chunk
+    /// force flush) and to keep the player buffered, small enough that
+    /// interrupting a response discards at most a few seconds of audio.
+    static let maxBufferedAudioSeconds: Double = 3.0
+    static let maxConsecutiveSyntheticUnits = 4
 
     public init(
         engine: any MiniCPMDemoBackendEngine = MiniCPMDemoNoopEngine(),
@@ -491,7 +497,9 @@ public actor MiniCPMDemoBackend {
         } catch {
             state = .error
             activeResponseID = nil
-            continuationLeadUnits = 0
+            responseAudioSentSeconds = 0
+            responseFirstAudioAtNS = nil
+            syntheticStreak = 0
             pendingFinalize = false
             await engine.stop()
             return [errorEvent(code: "backend_error", message: error.localizedDescription)]
@@ -508,7 +516,9 @@ public actor MiniCPMDemoBackend {
         lastInitializeParameters = parameters
         pendingFinalize = false
         activeResponseID = nil
-        continuationLeadUnits = 0
+        responseAudioSentSeconds = 0
+        responseFirstAudioAtNS = nil
+            syntheticStreak = 0
         sessionID = "sess_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12))"
         state = .initialized
         try await engine.initialize(mode: mode, parameters: parameters)
@@ -554,13 +564,22 @@ public actor MiniCPMDemoBackend {
             throw MiniCPMDemoBackendError.invalidState("previous response is awaiting transport acceptance")
         }
         inputCounter += 1
-        let decodedInput = MiniCPMDemoWireDecoder.normalizeObject(input)
+        var decodedInput = MiniCPMDemoWireDecoder.normalizeObject(input)
         let inputID = messageID
             ?? decodedInput["input_id"]?.stringValue
             ?? "in_\(String(format: "%08llu", inputCounter))"
-        // A real client packet advances the model's input timeline by one
-        // packet, so it pays back one unit of run-ahead lead.
-        continuationLeadUnits = max(0, continuationLeadUnits - 1)
+        // A real client packet ends any synthetic streak.
+        syntheticStreak = 0
+        // Browser clients only mark zero-filled silence with
+        // `continuation_tick` while their own model-state heuristic says
+        // "speaking", so plenty of silent packets arrive unmarked and each
+        // would otherwise pay a full 350-440ms audio-encoder prefill.  The
+        // engine itself still validates every precondition (turn open, no
+        // frames/text, all-zero samples), so deciding it here purely saves
+        // that work; nothing about the client flag is trusted.
+        if isDuplexMode, Self.isAllZeroAudioInput(decodedInput) {
+            decodedInput["continuation_tick"] = .bool(true)
+        }
         let requestedResponseID = decodedInput["response_id"]?.stringValue
         let wallClockStart = DispatchTime.now().uptimeNanoseconds
         var events: [MiniCPMDemoEvent] = [emit("input.accepted", payload: ["input_id": .string(inputID)], inputID: inputID)]
@@ -598,7 +617,9 @@ public actor MiniCPMDemoBackend {
         } catch {
             state = .error
             activeResponseID = nil
-            continuationLeadUnits = 0
+            responseAudioSentSeconds = 0
+            responseFirstAudioAtNS = nil
+            syntheticStreak = 0
             pendingFinalize = false
             await engine.stop()
             events.append(errorEvent(code: "engine_error", message: error.localizedDescription, inputID: inputID))
@@ -632,13 +653,17 @@ public actor MiniCPMDemoBackend {
                 // A listen marker closes the currently spoken response.
                 responseID = nil
                 activeResponseID = nil
-                continuationLeadUnits = 0
+                responseAudioSentSeconds = 0
+                responseFirstAudioAtNS = nil
+            syntheticStreak = 0
                 continue
             }
             if responseID == nil {
                 responseID = "resp_\(String(format: "%08llu", nextResponse()))"
                 activeResponseID = responseID
-                continuationLeadUnits = 0
+                responseAudioSentSeconds = 0
+                responseFirstAudioAtNS = nil
+            syntheticStreak = 0
                 events.append(emit("response.started", payload: ["response_id": .string(responseID!)], responseID: responseID, inputID: inputID))
             }
             if let text = output.text, !text.isEmpty {
@@ -650,6 +675,11 @@ public actor MiniCPMDemoBackend {
                     format: output.format,
                     sampleRate: output.sampleRate,
                     data: audio))
+                if responseFirstAudioAtNS == nil {
+                    responseFirstAudioAtNS = DispatchTime.now().uptimeNanoseconds
+                }
+                responseAudioSentSeconds += Double(Self.base64SampleCount(audio))
+                    / Double(max(1, output.sampleRate))
                 events.append(emit("response.output.delta", payload: ["kind": .string("audio"), "audio": .string(audio), "format": .string(output.format), "sample_rate": .number(Double(output.sampleRate)), "metrics": .object(mergedMetrics(output.metrics, wallClockStart: wallClockStart))], responseID: responseID, inputID: inputID))
             }
             if output.needsFinalize { pendingFinalize = true }
@@ -657,7 +687,9 @@ public actor MiniCPMDemoBackend {
                 events.append(emit("response.done", payload: ["text": .string(textParts.joined()), "audio": combinedAudio(audioParts).map(MiniCPMJSONValue.string) ?? .null, "reason": .string(output.reason ?? "turn_end"), "metrics": .object(mergedMetrics(output.metrics, wallClockStart: wallClockStart))], responseID: responseID, inputID: inputID))
                 pendingFinalize = pendingFinalize || output.needsFinalize
                 activeResponseID = nil
-                continuationLeadUnits = 0
+                responseAudioSentSeconds = 0
+                responseFirstAudioAtNS = nil
+            syntheticStreak = 0
                 responseID = nil
             } else if output.done, isDuplexMode,
                       output.reason == "turn_end" || output.reason == "end_of_turn" {
@@ -667,7 +699,9 @@ public actor MiniCPMDemoBackend {
                     events.append(emit("response.output.delta", payload: ["kind": .string("listen"), "reason": .string("turn_end")], responseID: responseID, inputID: inputID))
                 }
                 activeResponseID = nil
-                continuationLeadUnits = 0
+                responseAudioSentSeconds = 0
+                responseFirstAudioAtNS = nil
+            syntheticStreak = 0
                 responseID = nil
             }
         }
@@ -690,7 +724,17 @@ public actor MiniCPMDemoBackend {
         guard state == .active, isDuplexMode, activeResponseID != nil, !pendingFinalize else {
             return nil
         }
-        guard continuationLeadUnits < Self.maxContinuationLeadUnits else {
+        if let firstAt = responseFirstAudioAtNS {
+            // The browser plays at 1x realtime starting from the first audio
+            // delta's arrival, so anything sent beyond elapsed wall time is
+            // un-played client buffer.  Stop driving once that cushion is
+            // full; real packets (1s audio per 1s wall) keep it topped up
+            // while absorbing generation spikes.
+            let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds &- firstAt) / 1_000_000_000.0
+            let buffered = responseAudioSentSeconds - elapsedSeconds
+            guard buffered < Self.maxBufferedAudioSeconds else { return nil }
+        }
+        guard syntheticStreak < Self.maxConsecutiveSyntheticUnits else {
             return nil
         }
         inputCounter += 1
@@ -708,7 +752,7 @@ public actor MiniCPMDemoBackend {
             let prefill = try await engine.prefillResult(mode: mode, input: syntheticInput)
             guard prefill.accepted else { return nil }
             let outputs = try await engine.generate(mode: mode, input: syntheticInput)
-            continuationLeadUnits += 1
+            syntheticStreak += 1
             return try emitOutputs(
                 outputs,
                 inputID: inputID,
@@ -717,11 +761,63 @@ public actor MiniCPMDemoBackend {
         } catch {
             state = .error
             activeResponseID = nil
-            continuationLeadUnits = 0
+            responseAudioSentSeconds = 0
+            responseFirstAudioAtNS = nil
+            syntheticStreak = 0
             pendingFinalize = false
             await engine.stop()
             return [errorEvent(code: "engine_error", message: error.localizedDescription, inputID: inputID)]
         }
+    }
+
+    /// Detect a silent Float32 PCM packet so the backend can offer the
+    /// engine a continuation tick without trusting the client's own flag.
+    /// Only plain `pcm_f32le` payloads are inspected; anything else (WAV
+    /// containers, 16-bit PCM, lists) stays on the regular encode path.
+    static func isAllZeroAudioInput(_ input: [String: MiniCPMJSONValue]) -> Bool {
+        guard input["text"] == nil, input["video_frames"] == nil,
+              input["frame_base64_list"] == nil, input["messages"] == nil else {
+            return false
+        }
+        let format = input["format"]?.stringValue?.lowercased()
+        if let format, !format.isEmpty, !format.contains("f32") {
+            return false
+        }
+        // `normalizeObject` already decodes base64 PCM into a numeric array
+        // at the wire boundary, so both representations can reach here.
+        switch input["audio"] ?? input["audio_waveform"] {
+        case .array(let values):
+            guard !values.isEmpty else { return false }
+            for value in values {
+                guard let number = value.numberValue, number == 0, number.isFinite else {
+                    return false
+                }
+            }
+            return true
+        case .string(let encoded):
+            guard !encoded.isEmpty,
+                  encoded.count <= 8 * 1024 * 1024,
+                  let data = Data(base64Encoded: encoded),
+                  !data.isEmpty,
+                  data.count.isMultiple(of: 4) else {
+                return false
+            }
+            return data.withUnsafeBytes { raw in
+                let samples = raw.bindMemory(to: Float.self)
+                for sample in samples where sample != 0 || !sample.isFinite {
+                    return false
+                }
+                return true
+            }
+        default:
+            return false
+        }
+    }
+
+    /// Approximate decoded Float32 sample count of a base64 PCM payload.
+    static func base64SampleCount(_ encoded: String) -> Int {
+        let padding = encoded.hasSuffix("==") ? 2 : (encoded.hasSuffix("=") ? 1 : 0)
+        return max(0, encoded.count / 4 * 3 - padding) / MemoryLayout<Float>.stride
     }
 
     private static func encodeFloat32(_ samples: [Float]) -> String {
@@ -740,7 +836,9 @@ public actor MiniCPMDemoBackend {
             await engine.interrupt()
             pendingFinalize = false
             activeResponseID = nil
-            continuationLeadUnits = 0
+            responseAudioSentSeconds = 0
+            responseFirstAudioAtNS = nil
+            syntheticStreak = 0
             var payload: [String: MiniCPMJSONValue] = [
                 "state": .string(state.rawValue),
                 "reason": .string("interrupt"),
@@ -765,14 +863,18 @@ public actor MiniCPMDemoBackend {
                 try await engine.initialize(mode: mode, parameters: lastInitializeParameters)
                 pendingFinalize = false
                 activeResponseID = nil
-                continuationLeadUnits = 0
+                responseAudioSentSeconds = 0
+                responseFirstAudioAtNS = nil
+            syntheticStreak = 0
                 state = .active
                 return [emit("backend.state", payload: ["state": .string(state.rawValue), "reason": .string("reset")])]
             } catch {
                 state = .error
                 pendingFinalize = false
                 activeResponseID = nil
-                continuationLeadUnits = 0
+                responseAudioSentSeconds = 0
+                responseFirstAudioAtNS = nil
+            syntheticStreak = 0
                 await engine.stop()
                 return [errorEvent(code: "backend_error", message: "reset failed: \(error.localizedDescription)")]
             }
@@ -793,7 +895,9 @@ public actor MiniCPMDemoBackend {
         pendingFinalize = false
         await engine.close()
         activeResponseID = nil
-        continuationLeadUnits = 0
+        responseAudioSentSeconds = 0
+        responseFirstAudioAtNS = nil
+            syntheticStreak = 0
         state = .closed
         let events = [
             emit("backend.closed", payload: ["reason": .string(reason)]),

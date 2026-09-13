@@ -180,3 +180,51 @@
 - 不执行 `git reset --hard` / `git checkout --` / 清理未跟踪文件；
   不 push 到远端，除非用户明确要求。
 - 重型 build/test 与模型服务严格串行；不要仅凭历史 PID 停进程。
+
+## 10. 追加修复（2026-09-13）：浏览器真实会话仍断续的第二轮根因
+
+第一轮修复后探针全绿，但用户真实浏览器测试仍断续（会话
+`sess_D4B8F11F1B4A`）。取证发现两个探针路径掩盖不了的问题：
+
+1. **浏览器静音包不走 continuation**。前端只在自身
+   `modelState === 'speaking'` 启发式成立时给零包加 `continuation_tick`
+   （`audio-duplex-app.js` 的 `zeroFilled && modelState === 'speaking'`），
+   turn 边界之后、以及任何启发式失配的窗口里，静音包按真实零音频处理，
+   每包付出 350–440ms 的完整音频编码器 prefill → 服务端周期 ≥1.0s，
+   永远追不上 1.0s 的包节奏 → 队列常驻非空。
+2. **驱动循环的"队列非空即让出"门禁因此从未触发**（整个会话 0 个
+   `cont_*` 单元），修复形同虚设；且"领先预算按合成/真实包计数"的机制
+   本身约束不住客户端缓冲增长（每包回补 1 个预算时，2 unit/包 的产出率
+   会让缓冲无界增长）。用模拟浏览器 wire 行为的客户端完整复现。
+
+第二轮修复：
+
+- **服务端零包自动 promotion**（`MiniCPMDemoBackend.append`）：双工模式下
+  解码后的输入若为纯零 Float32 音频（无 text/frames），由服务端直接注入
+  `continuation_tick`，完全不信任客户端 flag；引擎侧全部前置校验
+  （turn 打开、全零、无 frames/text）保持不变，listening 阶段
+  （turn 已结束）的静音仍走真实编码路径以维持模型的时间感。
+  `normalizeObject` 会把 base64 PCM 解码成数字数组，检测两种表示都支持。
+- **播放缓冲上限取代包计数预算**（`maxBufferedAudioSeconds = 3`）：
+  每个 open response 记录首块音频的发出时刻与已发送音频秒数；
+  `已发送 − 距首块墙钟时间 ≥ 3s` 即停止驱动。浏览器以 1x 实时播放，
+  该差值就是客户端未播放缓冲——barge-in 丢弃上限与尖峰吸收缓冲二合一，
+  且无论 unit 由真实包还是驱动产生都成立。另保留
+  `maxConsecutiveSyntheticUnits = 4` 连发上限，覆盖不产音频的纯文本
+  response，防止缓冲上限永不触发。
+- worker 的"队列非空让出"保留：真实包优先被模型听见，压低 barge-in
+  决策延迟；静音包 promotion 后服务端周期 ~0.73–0.79s < 1.0s，队列会
+  排空，驱动在空窗内自动补位。
+
+回归（2026-09-13）：`MiniCPMDemoBackendTests` 55/55（新增
+`testContinueResponseStopsAtPlaybackCushionBound`、
+`testContinueResponseStopsAtSyntheticStreakCapAndRealInputResumes`、
+`testSilentDuplexPacketsArePromotedToContinuationTicks`）；
+`MiniCPMDuplexRuntimeTests` 33/33。模拟浏览器客户端（1.0s 包节奏、
+浏览器 continuation 启发式、不等 ack）：回答阶段每 1.0s 音频块
+0.73–0.79s 到达、缓冲填充至 ~3s 后正确节流；探针 normal 5/5（回答内部
+stall 0.000s）、barge-in 3/3。
+
+剩余已知断续来源（非本轮范围）：每次回答/分句首块的听→说转换开销
+（~1.3–3.4s，对应已知首音延迟问题）；用户持续说话期间真实语音 prefill
+（~0.4s/包）造成的轻微赤字（≤0.3s/块，播放器启动缓冲可部分掩盖）。
