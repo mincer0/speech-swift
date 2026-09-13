@@ -261,6 +261,12 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
     private var diagnosticGenerationExitedAtNS: UInt64?
     private var diagnosticCancelReturnedAtNS: UInt64?
     private let stageTimingEnabled: Bool
+    /// Qwen3-backbone reasoning markers. The duplex sampler must never emit
+    /// them: they are plain (non-special) tokens in this vocabulary, so
+    /// `skipSpecialTokens` does not hide them, and a sampled `<think>` both
+    /// corrupts the spoken text and leaks garbage into the semantic-TTS
+    /// condition ("unknown speech" artifacts).
+    private var reasoningForbiddenTokenIDs: [Int] = []
     private var latestAudioEncoderMS: Double?
     private var latestAudioBridgeMS: Double?
     private var latestLLMPrefillMS: Double?
@@ -273,6 +279,9 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
 
     public init(models: MiniCPMNativeModels, stageTimingEnabled: Bool? = nil) {
         self.models = models
+        self.reasoningForbiddenTokenIDs = ["<think>", "</think>"].compactMap {
+            models.tokenizer.tokenId($0)
+        }
         self.stageTimingEnabled = stageTimingEnabled
             ?? Self.stageTimingRequestedFromEnvironment()
         languageSession = MiniCPMSession(model: models.llm)
@@ -883,6 +892,10 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
                         forbidden.append(special)
                     }
                     if !allowsListen { forbidden.append(ids.listen) }
+                    for marker in reasoningForbiddenTokenIDs
+                        where !forbidden.contains(marker) {
+                        forbidden.append(marker)
+                    }
                     var stepSampling = sampling
                     if index == 0, allowsListen, !forceListenGeneration {
                         switch responseStarvationGuard.intervention(

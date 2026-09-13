@@ -228,3 +228,46 @@ stall 0.000s）、barge-in 3/3。
 剩余已知断续来源（非本轮范围）：每次回答/分句首块的听→说转换开销
 （~1.3–3.4s，对应已知首音延迟问题）；用户持续说话期间真实语音 prefill
 （~0.4s/包）造成的轻微赤字（≤0.3s/块，播放器启动缓冲可部分掩盖）。
+
+## 11. 追加修复（2026-09-13）：语音怪异与长输出中断的第三轮根因
+
+断续修复后用户实测：语音含未知语音、中文不准、长输出无法完成。取证
+（长故事探针 + `MINICPM_DUPLEX_LOGIT_TRACE_TOPK` 逐步采样 trace + 会话
+audio/text delta 对账）定位两个确定性问题：
+
+1. **`<think>` 泄漏**：Qwen3 骨架的推理标记在本词表里不是 special token，
+   双工采样没有禁令；用户会话文本里出现字面 `<think>`，TTS 直接念出垃圾
+   （"未知语音"）。
+2. **协议 token 混入 TTS 条件**：旧收集规则是 `index != 0`——假设 unit 的
+   第 0 步一定是 `<|speak|>`/`<|tts_bos|>` 引导 token。trace 显示模型在
+   unit 开头经常连续采样多个 `<|listen|>`（被 coerce 成 tts_bos）或
+   `[listen, speak]`，于是协议 token 落在第 ≥1 步、被原样收进
+   `buildCondition`。只含协议 token 的 unit（generated 非空但无文本）会用
+   退化条件跑满 25 个语音码 → 一整秒无法辨认的语音（用户会话
+   `client_in_00000005` 即此类）；夹在文本中的协议 token embedding 则污染
+   相邻发音。另有一条独立确认：unit 第 0 步采样出纯文本时（约 2/40），
+   index!=0 规则会把它丢掉——这正是"叫朵|它呀""这|美丽的森林"类开头丢字。
+
+BF16 对照实验：模型根目录换挂 `MiniCPM-o-4_5-llm-mlx-bf16`（parity 已
+验证的 bundle），RTF 3.1、首音 30s——本机不可用，且文本乱在 BF16 下同样
+出现 → 乱字与量化无关，是跨单元上下文构造 + 协议 token 处理问题。
+
+修复：
+
+- `MiniCPMNativeDuplexEngine`：init 时解析 `<think>`/`</think>` 并加入每步
+  forbidden 列表（`reasoningForbiddenTokenIDs`）。
+- `MiniCPMNativeDuplexProtocol.consume`：收集规则改为 **只收集非协议
+  token**（listen/speak/ttsBOS/turnEOS/chunkEOS/chunkTTSEOS/eos/unitEnd
+  一律不进 TTS 条件与文本序列），不再依赖 step 下标启发式。协议 token
+  仍照常进 KV（shouldFeed 行为不变，KV/logit parity 不受影响）；
+  纯协议 unit 现在 generated 为空 → 不跑 TTS、不发垃圾音频。
+
+回归：Swift 88/88（更新 2 个固定旧行为的协议 trace 测试）、前端 15/15；
+长故事探针：**81.28s 完整长故事**（修复前 5–15s 即断）、RTF 0.663、
+think 泄漏 0；normal 5/5、barge-in 3/3、回答内播放模拟最差 stall ≤1.1s
+（模型在句子间主动让话的 turn 边界，属全双工自然行为）。
+
+遗留边界：8-bit 模型在 unit 边界偶发单字重复/缺失（"小刺猬猬"、
+"阳光明[媚的]早晨"）——这是量化模型跨单元采样的质量天花板；BF16 在本机
+RTF 3.1 不可用，group-32 重量化需要重做 golden parity（上游 demo 检出
+`/tmp/MiniCPM-o-Demo` 已被系统清理），留待后续决策。
