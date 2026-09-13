@@ -1014,7 +1014,11 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
             latestLLMDecodeMS = elapsedMS(since: llmDecodeStart)
         }
         var waveform: [Float]?
-        if !isListen && !generated.isEmpty && config.generateAudio,
+        // Gate the vocoder on speakable text: a unit whose collected tokens
+        // are all protocol markers (e.g. a bare <|speak|> stutter) would hand
+        // the semantic TTS a condition with no speech-start content and come
+        // out as a full unit of unrecognizable noise.
+        if !isListen && !text.isEmpty && config.generateAudio,
            let semantic = models.ttsSemantic,
            let ttsSession,
            let token2wav,

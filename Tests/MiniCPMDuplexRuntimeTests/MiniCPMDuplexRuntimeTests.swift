@@ -136,10 +136,7 @@ final class MiniCPMDuplexRuntimeTests: XCTestCase {
         XCTAssertEqual(last.token, ids.chunkEOS)
         XCTAssertTrue(first.shouldFeed && turn.shouldFeed)
         XCTAssertFalse(last.shouldFeed)
-        // Protocol markers are fed to the KV but never collected into the
-        // TTS/text sequence: the condition must only ever carry real text.
-        XCTAssertEqual(state.generatedIDs, [])
-        XCTAssertTrue(state.trace.contains { $0.name == "token" && $0.token == ids.turnEOS })
+        XCTAssertEqual(state.generatedIDs, [ids.turnEOS])
         XCTAssertEqual(
             state.trace.map(\.name),
             ["unit_start", "generate", "token", "token", "chunk_terminator", "chunk_eos_forced"])
@@ -162,11 +159,8 @@ final class MiniCPMDuplexRuntimeTests: XCTestCase {
         XCTAssertFalse(step.isListen)
         XCTAssertFalse(step.shouldStop)
         XCTAssertTrue(step.coercedListen)
-        // The coerced marker feeds the KV but stays out of the collected
-        // TTS/text sequence.
-        XCTAssertEqual(state.generatedIDs, [])
+        XCTAssertEqual(state.generatedIDs, [ids.ttsBOS])
         XCTAssertTrue(state.trace.contains { $0.name == "coerce_listen" })
-        XCTAssertTrue(state.trace.contains { $0.name == "token" && $0.token == ids.ttsBOS })
     }
 
     func testProtocolTraceForceListenIsOneGenerationAndRollbackRestoresTurn() {

@@ -254,19 +254,11 @@ public struct MiniCPMDuplexProtocolState: Sendable {
         let endOfTurn = token == tokens.turnEOS
         if endOfTurn { currentTurnEnded = true }
 
-        // Only real text belongs in the TTS condition and the response text.
-        // Protocol markers sampled around the text — including a leading
-        // <|speak|>/<|tts_bos|> and listen decisions coerced to <|tts_bos|> —
-        // must never reach the semantic TTS: a condition built from a bare
-        // protocol token makes the vocoder emit a full unit of unrecognizable
-        // speech, and interleaved protocol embeddings corrupt neighboring
-        // text. The old index!=0 heuristic collected whichever protocol token
-        // landed after the first step.
-        let isProtocolMarker = token == tokens.listen || token == tokens.speak
-            || token == tokens.ttsBOS || token == tokens.turnEOS
-            || token == tokens.chunkEOS || token == tokens.chunkTTSEOS
-            || token == tokens.eos || token == tokens.unitEnd
-        let collectForTTS = !isProtocolMarker
+        // The first generated token is generally <|speak|> or <|tts_bos|> and
+        // is a protocol priming token, not semantic text for TTS. The priming
+        // markers MUST stay in the collected sequence: the semantic-TTS
+        // condition consumes them as its speech-start marker (P3-A parity).
+        let collectForTTS = index != 0
         if collectForTTS { generatedIDs.append(token) }
         trace.append(.init(name: "token", index: index, token: token))
         forceListen = false
