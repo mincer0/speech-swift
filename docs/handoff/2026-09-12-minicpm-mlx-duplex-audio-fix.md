@@ -304,3 +304,39 @@ room tone（~1e-4）是否触发待验证。建议后续在 mel 能量下限处�
 
 遗留：GPU 与训练任务共享时，实时性必然劣化 15–20 倍——这不是服务端
 可修复的问题；验收测试必须在无训练负载下进行。
+
+## 13. 音频编码器性能专项（2026-09-13 晚）：定位、修复尝试与结论
+
+用户要求排查 MPS→MLX 移植的编码器 bug 与优化空间。分阶段基准
+（`E2EMiniCPMAudioTests/testStageTimingBenchmark`，env-gated）结论：
+
+- mel 提取（CPU vDSP 双精度稠密 DFT）：**6ms**/秒音频——非瓶颈。
+- `acceptAudio` 流式路径、**同形状重复调用**：**15.7ms**——非瓶颈。
+- 长 streaming 会话第 2 块起：**400–430ms/块**（MPSGraph 变体）/ ~950ms
+  （native 变体），与 KV 增长量无关、恒定——**每个新 KV 张量形状触发
+  一次 MPSGraph plan 重编译/MLX 内核重特化**。流式 cache 逐块变长，形状
+  永不重复，故每块都付一次编译税。
+- 每 call 固定地板 ~125ms 为 Swift 侧懒图构建（帧数=16 的 forward
+  graph-build-only ≈ 124ms，GPU 实算仅 ~2.6ms）。
+- 机器噪声警告：GPU 训练任务并行时绝对数值不可比（RTF 0.7→14）；同一次
+  运行内的相对比较才有效。
+
+修复尝试（桶式 KV 补零 + 加性掩码，掩码值从 -inf 改为有限 -10000 以绕开
+MPSGraph 的 BF16 加法精度提升）：**数值上不可行**。24 层 BF16 递归编码器
+把 softmax 归约分段的 1-ULP 变化放大到 encoder states max 0.25 /
+mean 0.0147（密封 gate 容差 0.05/0.01），136 项断言失败。该现象与
+MiniCPMAudioBF16Attention.swift 头注所述"layer 7 放大"一致。重封存该
+gate 需要官方 oracle（pinned upstream `/tmp/MiniCPM-o-Demo` 已被系统
+清理，需重克隆后重建 golden fixture）。
+
+已回退全部桶式/掩码改动，`E2EMiniCPMAudioGoldenTests` 重新通过
+（6 tests, 0 failures）——生产音频路径保持钉死的比特等价状态。
+
+生产影响评估：桶式优化只对"真实静音/真实语音 packet"的编码成本有意义
+（每包 ~400ms → ~16ms）；当前生产路径的静音包已走 continuation
+promotion（~1ms），真实语音包的 0.4s 编码是模型前向的固有成本。后续
+若要落地：①重克隆 pinned demo 并重建 golden；②桶式补零 + 掩码按本文档
+实现（BF16Attention 掩码占位符走 FP32 加法后回 BF16）；③以相同 gate
+重新密封。另有稳健性待办：denormal 级输入样本会经 mel 的 log 产生 NaN
+并沿编码器→LLM→TTS 链路传播（诊断探针实测），建议在 mel 能量下限处
+clamp。
