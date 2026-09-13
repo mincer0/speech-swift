@@ -362,3 +362,33 @@ blob WAV 为 16-bit PCM，脚本按 float32 误读。修正采样宽度解读后
 所有历史会话的音频都是真实语音电平（RMS 0.02–0.13），v7 构建的模拟
 浏览器会话 31 块全部为连续真实语音（RMS 0.06–0.13）、TTS 码连续推进
 （25→650）。23:19 会话（v5）本身就有 91 块完整长故事音频。
+
+## 15. 官方源码对照（2026-09-13 深夜，/tmp/MiniCPM-o-Demo 已重克隆至 pinned commit）
+
+逐 token 对照 `MiniCPMO45/modeling_minicpmo_unified.py` 的
+`streaming_generate` 循环与我们的 `MiniCPMNativeDuplexEngine.generate`：
+
+- listen→tts_bos 强制转换（turn 未结束时）：一致 ✓
+- 收集规则 `j != 0`（含被 coerce 的 tts_bos、speak、turn_eos；index-0 的
+  文本 token 被丢弃不收集）：一致 ✓（已恢复钉死规则）
+- 28 字符上限在 j!=0 时拒绝越界 token 并强制 chunk_eos：一致 ✓
+- chunk_eos 不可被采样（forbidden），20 步上限强制注入：一致 ✓
+- 终止符延迟与 </unit> 合并 feed：一致 ✓
+
+**确认的结构性差异**：官方 `streaming_prefill` 对 AUDIO/OMNI 模式的每个
+unit 都要求并携带真实音频 embeddings（`has_audio` 必需，无 continuation
+旁路）——即官方上下文是 [audio_emb][<unit>][generate] 连续音频时间线；
+我们的 continuation promotion 则喂 [<unit>] 无音频。这解释了模型在
+unit 开头采样 <|listen|>（被 coerce）、句中 yield、边界断字的倾向：
+模型对"上一秒发生了什么"失去听觉上下文。
+
+落地真实音频上下文的前置条件与路径：
+1. 音频编码器桶式补零（本文档第 13 节已实现并验证 ~16ms/块，但与官方
+   golden 的 1-ULP 放大偏差 0.25 超出密封容差）——需要先重建 golden
+   基线并产品化决策"接受实现级偏差换上下文正确性"；
+2. 或优化编码器每形状重编译（MPSGraph plan 桶化需掩码占位符，受
+   BF16 加法精度提升限制；MLX 侧可用 compile(shapeless:) 但需逐层验证）；
+3. 或混合策略：每 N 块插入一次真实静音编码，折衷成本与上下文。
+
+对照实验遗留：官方 PyTorch/MPS 路线（backend=mps）对无 Origin 头的
+WebSocket 探针返回 403，探针对照实验需加 Origin 头或改用浏览器。
