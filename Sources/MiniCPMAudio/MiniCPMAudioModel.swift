@@ -7,10 +7,18 @@ import MLXNN
 public final class MiniCPMAudioLayerCache {
     public let keys: MLXArray
     public let values: MLXArray
+    /// Real (unpadded) key positions. Equal to `keys.dim(2)` when the cache
+    /// carries no bucket padding.
+    public let realLength: Int
 
-    public init(keys: MLXArray, values: MLXArray) {
+    public convenience init(keys: MLXArray, values: MLXArray) {
+        self.init(keys: keys, values: values, realLength: keys.dim(2))
+    }
+
+    public init(keys: MLXArray, values: MLXArray, realLength: Int) {
         self.keys = keys
         self.values = values
+        self.realLength = realLength
     }
 
     public var length: Int { keys.dim(2) }
@@ -23,7 +31,8 @@ public final class MiniCPMAudioCache {
         self.layers = layers
     }
 
-    public var length: Int { layers.first?.length ?? 0 }
+    /// Real (unpadded) key positions across the streaming cache.
+    public var length: Int { layers.first?.realLength ?? 0 }
 }
 
 public struct MiniCPMAudioEncoding {
@@ -49,6 +58,13 @@ final class MiniCPMEncoderAttention: Module {
     let heads: Int
     let headDimension: Int
     let scale: Float
+
+    /// Streaming KV caches pad the key length to multiples of this bucket so
+    /// attention tensor shapes repeat within a session and the compiled
+    /// graph plans / Metal kernels are reused instead of re-planned per
+    /// chunk (~400ms per new shape). Must match the golden oracle's
+    /// KV_BUCKET_POSITIONS.
+    static let keyBucketLength = 256
 
 
     @ModuleInfo(key: "q_proj") var queryProjection: Linear
@@ -100,14 +116,65 @@ final class MiniCPMEncoderAttention: Module {
             .contiguous()
         if let tracePrefix { trace?(tracePrefix + "value", currentValues) }
 
-        let keys: MLXArray
-        let values: MLXArray
+        var keys = currentKeys
+        var values = currentValues
+        var totalRealLength = length
+        var additiveMask: MLXArray?
         if let cache {
             keys = concatenated([cache.keys, currentKeys], axis: 2)
             values = concatenated([cache.values, currentValues], axis: 2)
-        } else {
-            keys = currentKeys
-            values = currentValues
+            totalRealLength = cache.realLength + length
+        }
+        if useCache {
+            // Static-shape bucket layout shared with the golden oracle:
+            // keys are laid out [real_past | zeros | current] with a constant
+            // total of keyBucketLength positions, and the additive mask
+            // exposes only the real positions. Padded rows are zero and
+            // receive -10000; exp(-10000 - max) underflows to exactly +0 in
+            // the softmax, so the layout is mathematically transparent while
+            // attention shapes (and compiled plans) never change.
+            let pastReal = totalRealLength - length
+            let headPad = Self.keyBucketLength - totalRealLength
+            // Session longer than one bucket: fall back to exact unpadded
+            // attention (the cache reset path resets state well before 1500
+            // positions, so this is defensive only).
+            if headPad >= 0 {
+                if let cache {
+                    // [zeros(headPad) | real_past | current]
+                    let headKeys = MLXArray.zeros(
+                        [keys.dim(0), keys.dim(1), headPad, keys.dim(3)],
+                        dtype: keys.dtype)
+                    let headValues = MLXArray.zeros(
+                        [values.dim(0), values.dim(1), headPad, values.dim(3)],
+                        dtype: values.dtype)
+                    keys = concatenated([headKeys, cache.keys, currentKeys], axis: 2)
+                    values = concatenated([headValues, cache.values, currentValues], axis: 2)
+                } else {
+                    // First chunk: [zeros(headPad) | current]
+                    let headKeys = MLXArray.zeros(
+                        [keys.dim(0), keys.dim(1), headPad, keys.dim(3)],
+                        dtype: keys.dtype)
+                    let headValues = MLXArray.zeros(
+                        [values.dim(0), values.dim(1), headPad, values.dim(3)],
+                        dtype: values.dtype)
+                    keys = concatenated([headKeys, currentKeys], axis: 2)
+                    values = concatenated([headValues, currentValues], axis: 2)
+                }
+                // Mask: -10000 for the head zero block, 0 for the real tail.
+                var rowMask = MLXArray(
+                    [Float](repeating: -10_000.0,
+                            count: keys.dim(0) * length * headPad))
+                    .reshaped(keys.dim(0), 1, length, headPad)
+                    .asType(keys.dtype)
+                rowMask = concatenated([
+                    rowMask,
+                    MLXArray.zeros(
+                        [keys.dim(0), 1, length, pastReal + length],
+                        dtype: keys.dtype),
+                ], axis: 3)
+                additiveMask = tiled(rowMask, repetitions: [1, heads, 1, 1])
+                    .contiguous()
+            }
         }
 
         // MiniCPM passes an all-zero additive mask for streaming calls: every
@@ -139,7 +206,7 @@ final class MiniCPMEncoderAttention: Module {
                 query: query,
                 key: keys,
                 value: values,
-                neutralMask: useCache,
+                additiveMask: additiveMask,
                 captureIntermediates: tracePrefix != nil
             )
             scores = result.scores
@@ -148,13 +215,11 @@ final class MiniCPMEncoderAttention: Module {
         } else {
             var mlxScores = matmul(
                 query, keys.transposed(0, 1, 3, 2).contiguous())
-            if useCache {
-                // The official mask is [B, 1, Q, K] and broadcasts over
-                // heads. Materialize the neutral add because PyTorch
-                // performs it even when every entry is zero.
-                let zeroMask = MLXArray.zeros(
-                    [batch, 1, length, keys.dim(2)], dtype: query.dtype)
-                mlxScores = mlxScores + zeroMask
+            if let additiveMask {
+                // Bucketed streaming mask (0 real / -10000 padded tail).
+                // Elementwise, so reduction boundaries are identical to the
+                // pinned neutral-mask add.
+                mlxScores = mlxScores + additiveMask
             }
             scores = mlxScores
             if scores.dtype == .bfloat16 {
@@ -195,9 +260,20 @@ final class MiniCPMEncoderAttention: Module {
         if let tracePrefix {
             trace?(tracePrefix + "attention_context_merged", attended)
         }
-        let next = useCache
-            ? MiniCPMAudioLayerCache(keys: keys, values: values)
-            : nil
+        let next: MiniCPMAudioLayerCache?
+        if useCache {
+            let cacheKeys = keys.dim(2) > totalRealLength
+                ? keys[0..., 0..., ..<totalRealLength, 0...].contiguous()
+                : keys
+            let cacheValues = values.dim(2) > totalRealLength
+                ? values[0..., 0..., ..<totalRealLength, 0...].contiguous()
+                : values
+            next = MiniCPMAudioLayerCache(
+                keys: cacheKeys, values: cacheValues,
+                realLength: totalRealLength)
+        } else {
+            next = nil
+        }
         let output = audioLinear(outputProjection, attended)
         if let tracePrefix {
             trace?(tracePrefix + "attention_output", output)

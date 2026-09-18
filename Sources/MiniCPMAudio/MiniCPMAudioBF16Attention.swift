@@ -64,6 +64,7 @@ public enum MiniCPMAudioBF16Attention {
         let query: MPSGraphTensor
         let key: MPSGraphTensor
         let value: MPSGraphTensor
+        let mask: MPSGraphTensor?
         let scores: MPSGraphTensor
         let probabilities: MPSGraphTensor
         let context: MPSGraphTensor
@@ -73,6 +74,7 @@ public enum MiniCPMAudioBF16Attention {
             query: MPSGraphTensor,
             key: MPSGraphTensor,
             value: MPSGraphTensor,
+            mask: MPSGraphTensor?,
             scores: MPSGraphTensor,
             probabilities: MPSGraphTensor,
             context: MPSGraphTensor
@@ -81,6 +83,7 @@ public enum MiniCPMAudioBF16Attention {
             self.query = query
             self.key = key
             self.value = value
+            self.mask = mask
             self.scores = scores
             self.probabilities = probabilities
             self.context = context
@@ -102,21 +105,26 @@ public enum MiniCPMAudioBF16Attention {
         query: MLXArray,
         key: MLXArray,
         value: MLXArray,
-        neutralMask: Bool,
+        additiveMask: MLXArray?,
         captureIntermediates: Bool
     ) -> Result {
         validate(query: query, key: key, value: value)
         let q = rowContiguous(query)
         let k = rowContiguous(key)
         let v = rowContiguous(value)
+        var m: MLXArray?
+        if let additiveMask {
+            m = rowContiguous(additiveMask)
+        }
         let keyID = PlanKey(
             queryShape: q.shape,
             keyShape: k.shape,
             valueShape: v.shape,
-            hasNeutralMask: neutralMask)
+            hasNeutralMask: m != nil)
 
         planLock.lock()
         let plan: Plan
+        var maskPlaceholderRef: MPSGraphTensor?
         if let cached = plans[keyID] {
             plan = cached
         } else {
@@ -144,20 +152,32 @@ public enum MiniCPMAudioBF16Attention {
             precondition(
                 scoreTensor.dataType == .bFloat16,
                 "MiniCPM audio attention scores must remain BF16")
-            if neutralMask {
-                // The streaming mask is all zeros but PyTorch still executes
-                // the BF16 addition.  Use a full [B,H,Q,K] constant so the
-                // graph has the same broadcast-free operation boundary as the
-                // official MPS trace.
-                let zero = graph.constant(
-                    0.0,
-                    shape: [q.dim(0), q.dim(1), q.dim(2), k.dim(2)]
-                        .map(NSNumber.init),
-                    dataType: .bFloat16)
-                scoreTensor = graph.addition(
-                    scoreTensor,
-                    zero,
+            if let maskTensor = m {
+                // Streaming bucket mask: 0 for real key positions, -10000
+                // for the padded tail (exp(-10000 - max) underflows to exact
+                // +0 in FP32 softmax). MPSGraph rejects BF16 placeholder
+                // adds, so run the elementwise add in FP32 — BF16 scores and
+                // mask values convert losslessly and the cast back to BF16
+                // restores the pinned boundary. Elementwise casts add no
+                // reduction boundary, matching the oracle's mask add.
+                let maskPlaceholder = graph.placeholder(
+                    shape: maskTensor.shape.map(NSNumber.init),
+                    dataType: .bFloat16,
+                    name: "minicpm_audio_attention_mask")
+                let scoreFP32 = graph.cast(
+                    scoreTensor, to: .float32,
+                    name: "minicpm_audio_attention_score_f32")
+                let maskFP32 = graph.cast(
+                    maskPlaceholder, to: .float32,
+                    name: "minicpm_audio_attention_mask_f32")
+                let masked = graph.addition(
+                    scoreFP32,
+                    maskFP32,
                     name: "minicpm_audio_attention_neutral_mask")
+                scoreTensor = graph.cast(
+                    masked, to: .bFloat16,
+                    name: "minicpm_audio_attention_mask_cast")
+                maskPlaceholderRef = maskPlaceholder
             }
             precondition(
                 scoreTensor.dataType == .bFloat16,
@@ -181,6 +201,7 @@ public enum MiniCPMAudioBF16Attention {
                 query: queryTensor,
                 key: keyTensor,
                 value: valueTensor,
+                mask: maskPlaceholderRef,
                 scores: scoreTensor,
                 probabilities: probabilityTensor,
                 context: contextTensor)
@@ -231,6 +252,17 @@ public enum MiniCPMAudioBF16Attention {
         var resultDictionary: [MPSGraphTensor: MPSGraphTensorData] = [
             plan.context: contextData,
         ]
+        var feeds: [MPSGraphTensor: MPSGraphTensorData] = [
+            plan.query: queryData,
+            plan.key: keyData,
+            plan.value: valueData,
+        ]
+        if let planMask = plan.mask, let m {
+            feeds[planMask] = MPSGraphTensorData(
+                noCopyBuffer(m, device: device, label: "mask"),
+                shape: m.shape.map(NSNumber.init),
+                dataType: .bFloat16)
+        }
         if captureIntermediates {
             let scoreBuffer = noCopyBuffer(scores, device: device, label: "scores")
             let probabilityBuffer = noCopyBuffer(
@@ -249,11 +281,7 @@ public enum MiniCPMAudioBF16Attention {
         defer { execution.lock.unlock() }
         plan.graph.run(
             with: execution.commandQueue,
-            feeds: [
-                plan.query: queryData,
-                plan.key: keyData,
-                plan.value: valueData,
-            ],
+            feeds: feeds,
             targetOperations: nil,
             resultsDictionary: resultDictionary)
         if captureIntermediates {

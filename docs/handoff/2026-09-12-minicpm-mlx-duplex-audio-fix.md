@@ -392,3 +392,67 @@ unit 开头采样 <|listen|>（被 coerce）、句中 yield、边界断字的倾
 
 对照实验遗留：官方 PyTorch/MPS 路线（backend=mps）对无 Origin 头的
 WebSocket 探针返回 403，探针对照实验需加 Origin 头或改用浏览器。
+
+## 16. 接缝断字修复进行中 + 工具链事件（2026-09-14 凌晨）
+
+按用户确认启动"接缝断字"修复（第 15 节路线）。进展与发现：
+
+### 16.1 已完成
+- 官方 demo 再次重克隆（/tmp/MiniCPM-o-Demo @ ba7fa9c；/tmp 产物会被系统清理，用前需重克隆）。
+- oracle 导出脚本（scripts/export_minicpm_o_audio_golden.py）加入 KV 桶式
+  补零模式（KV_BUCKET_POSITIONS=256，bucket_pad 参数，默认 False=官方语义）。
+  三次迭代结论见 16.2。
+- Swift 侧（未提交 WIP，工作树）：MiniCPMAudioLayerCache/Cache 增加
+  realLength；注意力加静态桶布局（[zeros|real_past|current]，K 恒等于
+  256）+ 加性掩码（-10000 有限值，头零块掩蔽、真实尾段放行）；
+  MiniCPMAudioBF16Attention 支持 additiveMask 占位符（BF16 占位符加法在
+  MPSGraph 中会提升精度 → 用 FP32 cast 相加后回投 BF16，逐元素无归约
+  边界）；cache 只存真实位置；encode() 位置编码按真实长度
+  （cache.length=realLength）。
+- Python 环境修复：scipy 1.15.3 的 wheel 在 macOS 27 上 dlopen 失败
+  （__thread_bss zero-fill 段），降级 scipy==1.13.1 解决。
+
+### 16.2 关键技术发现：官方 encoder 位置编码按 cache 长度索引
+pinned `MiniCPMWhisperEncoder.forward`：
+`past_key_values_length = cache.get_usable_length(...)`，
+`embed_pos[past_key_values_length : ...+current]`。因此：
+- 零块放在真实 KV **之前**（head 布局）会把真实内容的位置整体后移
+  （实测 oracle 输出偏差 max 32.8）——不可用；
+- 零块放在 real_past 与 current 之间（tail-middle 布局）会把 current 的
+  位置移到 bucket-current 起——同样破坏位置；
+- **正确设计**（已实现于 Swift WIP）：KV 张量含补零但位置编码按真实长度
+  计算。数学上补零 + 掩码在 FP32 精确透明，仅剩 BF16 归约边界差异。
+- oracle 若要桶式必须 patch 位置计算（偏离"官方实现"原则）——尚未做。
+
+### 16.3 工具链事件：Xcode 27.0 自动升级（Swift 6.3.3→6.4，SDK 26.5→27.0）
+会话中途（约 00:45）Xcode 自动升级，后果：
+1. **所有已密封 golden gate 失效**：用新工具链编译的钉死代码对未变的
+   官方 oracle 离线偏差 0.78125（原容差 0.05）——新 swiftc 优化改变了
+   MLX Swift 层的 BF16 算子边界。音频/LLM/TTS/Token2Wav 各 gate 都需在
+   新工具链下重新测量并重新密封（需 oracle 重导出 + 容差重定 + 全套
+   回归），是一项独立的全量工作。
+2. swift build --build-tests / swift test 在所有 scratch 报 clang
+   dependency scanning failure + `_NumericsShims`/CNIOLLHTTP 模块解析
+   失败（含全新 scratch）；清共享 clang 缓存无效。`swift build
+   --product X`（非 test）在默认 scratch 尚可用（09-13 的 release 产物
+   仍可复现构建）。测试需等显式模块构建问题解决或降级 Xcode。
+3. 正在运行的 v7 服务二进制是旧工具链构建的密封产物，不受影响，继续
+   生产使用；**在 gate 重新密封前不要用新工具链重建服务**。
+4. 验证方法学注意：直接 `xcrun xctest <bundle>` 与 `swift test` 的内核
+   加载/bundle 环境不同，数值结论必须在统一方式下采集。
+
+### 16.4 当前状态与下一步
+- 服务：v7 密封二进制运行中（7861，backend=swift_mlx）。
+- 工作树：桶式 WIP 未提交（MiniCPMAudio 两文件 + oracle 脚本 bucket 模式
+  + export5 已产出的 bucket-v1 fixture〔该 fixture 是 head 布局错误版，
+  不可用〕）。
+- 下一步（按序）：
+  1. 解决新工具链的 test 构建（或装回 Xcode 26.x）；
+  2. 在新工具链下重导出官方 oracle（PyTorch MPS 侧数值未变，预期
+     fixture 不变）并重测钉死代码偏差 → 重新密封四组 gate；
+  3. 恢复桶式 WIP 的验证：Swift 桶式 vs 官方 oracle（位置按真实长度，
+     补零透明）→ 预期偏差与 16.2 一致仅 BF16 边界级 → 密封新容差；
+  4. 引擎接回真实静音上下文（continuation 改为携带真实静音 embeddings，
+     ~16ms/块）→ 端到端验证接缝断字是否消除；
+  5. 前端 Length Penalty 默认值 1.05 → 1.2（audio_duplex.html 的
+     duplexLengthPenalty 与 audio-duplex-app.js:1077 fallback）。
