@@ -631,7 +631,10 @@ final class MiniCPMDuplexRuntimeTests: XCTestCase {
     }
 
     func testContinuationOnlyAcceptsOnlyZeroAudioDuringOpenSpokenTurn() {
-        XCTAssertTrue(MiniCPMNativeDuplexEngine.shouldUseContinuationOnly(
+        // Official semantics retired the zero-silence shortcut: every unit
+        // carries real audio embeddings so the model hears the time axis
+        // (unit-boundary coherence). All requests now take the encode path.
+        XCTAssertFalse(MiniCPMNativeDuplexEngine.shouldUseContinuationOnly(
             requested: true,
             currentTurnEnded: false,
             audio: [0, 0, 0],

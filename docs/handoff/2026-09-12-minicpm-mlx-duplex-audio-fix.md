@@ -456,3 +456,38 @@ pinned `MiniCPMWhisperEncoder.forward`：
      ~16ms/块）→ 端到端验证接缝断字是否消除；
   5. 前端 Length Penalty 默认值 1.05 → 1.2（audio_duplex.html 的
      duplexLengthPenalty 与 audio-duplex-app.js:1077 fallback）。
+
+## 17. 彻底修复完成（2026-09-19）：桶式密封 + 官方音频上下文 + turn 决策回归
+
+用户确认留在 Xcode 27 路线后完成。关键结论与验证：
+
+1. **工具链重密封成立**：同一干净 scratch（.build-base27）下，钉死代码
+   （57fe8cd）与桶式代码对官方 oracle 的离线偏差**完全一致**
+   （0.78125，Swift 6.4 优化器改变 MLX BF16 算子边界所致）——桶式补零
+   数值透明性得到对照实验证实。缓存切片 bug（head 布局真实位置在尾部，
+   原切片取头部导致 1217 失败）修复后，桶式流式档案 77 项失败、
+   **零 cosine 失败**（0.999 契约守住）。
+2. **音频 gate 在 Xcode 27 下重新密封**：max 1.5/mean 0.05（states/
+   embeddings）、cache max 1.0/mean 0.05，cosine floor 0.999 不变；
+   容差依据（实测档案 + 语义等价）已写入测试注释。构建方法学：
+   `swift build --build-tests` + `codesign --force` + 直接 `xcrun xctest`
+   （swift test 的 clang 扫描在中文路径下故障；同 scratch 重建需重新
+   codesign——向 bundle 手动拷 metallib 会破坏签名）。
+3. **接缝修复（本项工作的目标）**：引擎恢复官方语义——每个 unit 携带
+   真实音频 embeddings（shouldUseContinuationOnly 恒 false，零静音捷径
+   退役；桶式后编码成本 ~13-14ms/块）。模型重新听到连续时间轴。
+   **效果**：长故事文本从碎片化（"阳光明早晨…装满了和水壶蹦蹦跳跳"）
+   质变为近流畅（"森林里有高大的茂密的树木……和朋友们一起捉迷藏、
+   采果子、听故事"），99.6s 完整叙事。
+4. **lengthPenalty 回归官方 1.1**（服务端默认 + 前端默认 + fallback）：
+   真实上下文下模型自己做出正确的 turn 决策；1.2 压制 turn_eos 导致
+   无法收口（runaway 74s 答案 + 复读）。
+5. 回归：normal 5/5（回答自然收口 5-18s，无 runaway）、barge-in 3/3、
+   story 3/3、Backend 37/37、Runtime 33/33、Audio 全套、前端 15/15；
+   长回答播放零停顿；RTF 0.5-0.65。
+6. 遗留：超短回答（2 块）的缓冲建立期可能出现一次 ≤0.9s 停顿（自适应
+   启动延迟可覆盖但边际）；encoder cache 路径每块 ~390ms 的真实成本
+   （非 plan 重编译，疑为 BF16Attention 每层 noCopyBuffer 的 GPU 同步
+   串行化）——1s/块的预算内可负担，优化列为后续；LLM/TTS/Token2Wav
+   三组 gate 的 Xcode 27 重密封待做（本次仅音频 gate）；重复计数 2 的
+   轻微重复（"第二种"类自然复述）属模型行为。

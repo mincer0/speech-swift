@@ -1432,10 +1432,18 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         hasFrames: Bool,
         hasText: Bool
     ) -> Bool {
-        guard requested, !currentTurnEnded, !hasFrames, !hasText,
-              let audio, !audio.isEmpty
-        else { return false }
-        return audio.allSatisfy { $0 == 0 && $0.isFinite }
+        // Official MiniCPM duplex semantics: EVERY prefill unit carries real
+        // audio embeddings - the model hears the continuous time axis, which
+        // is what keeps unit-boundary text coherent. The former zero-silence
+        // skip (continuation shortcut) starved the model of that context and
+        // caused boundary garbling; with the bucketed KV cache the encoder
+        // costs ~16ms per chunk, so the shortcut is retired outright.
+        _ = requested
+        _ = currentTurnEnded
+        _ = audio
+        _ = hasFrames
+        _ = hasText
+        return false
     }
 
     private static func parseIntList(_ value: String?) -> [Int]? {

@@ -421,12 +421,12 @@ public final class MiniCPMDuplexRuntimeEngineAdapter: MiniCPMDemoBackendEngine, 
             config["text_repetition_penalty"]?.numberValue
                 ?? config["repetition_penalty"]?.numberValue
                 ?? 1.05)
-        // The official duplex default is 1.1. The browser talks over the
-        // model constantly, and at 1.1 the quantized model yields mid-sentence
-        // every couple of units, which fragments answers, resets the
-        // semantic-TTS turn, and leaves dangling fragments that the vocoder
-        // then under-speaks (audible holes). Hold the turn open harder.
-        let lengthPenalty = Float(config["length_penalty"]?.numberValue ?? 1.2)
+        // Official duplex default. Mid-sentence yield fragmentation is now
+        // solved at the source - every unit carries real audio embeddings
+        // (bucketed encoder), so the model makes turn decisions with full
+        // context; holding turn_eos down (1.2) with real context made it
+        // unable to close turns at all (runaway chattiness + repeats).
+        let lengthPenalty = Float(config["length_penalty"]?.numberValue ?? 1.1)
         let ttsTemperature = Float(config["tts_temperature"]?.numberValue ?? 0.8)
         let ttsRepetitionPenalty = Float(config["tts_repetition_penalty"]?.numberValue ?? 1.05)
         let generateAudio = config["generate_audio"]?.boolValue

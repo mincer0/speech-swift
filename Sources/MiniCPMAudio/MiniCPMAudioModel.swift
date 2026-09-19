@@ -126,18 +126,18 @@ final class MiniCPMEncoderAttention: Module {
             totalRealLength = cache.realLength + length
         }
         if useCache {
-            // Static-shape bucket layout shared with the golden oracle:
-            // keys are laid out [real_past | zeros | current] with a constant
-            // total of keyBucketLength positions, and the additive mask
-            // exposes only the real positions. Padded rows are zero and
-            // receive -10000; exp(-10000 - max) underflows to exactly +0 in
-            // the softmax, so the layout is mathematically transparent while
-            // attention shapes (and compiled plans) never change.
+            // Static-shape bucket layout: keys are laid out
+            // [zeros | real_past | current] with the total padded up to the
+            // next multiple of keyBucketLength, and the additive mask
+            // exposes only the real positions (the real tail). Padded rows
+            // are zero and receive -10000; exp(-10000 - max) underflows to
+            // exactly +0 in the softmax, so the layout is mathematically
+            // transparent while attention shapes stay stable within a bucket
+            // (one plan re-build per ~16s of audio instead of per chunk).
             let pastReal = totalRealLength - length
-            let headPad = Self.keyBucketLength - totalRealLength
-            // Session longer than one bucket: fall back to exact unpadded
-            // attention (the cache reset path resets state well before 1500
-            // positions, so this is defensive only).
+            let bucket = ((totalRealLength + Self.keyBucketLength - 1)
+                / Self.keyBucketLength) * Self.keyBucketLength
+            let headPad = bucket - totalRealLength
             if headPad >= 0 {
                 if let cache {
                     // [zeros(headPad) | real_past | current]
@@ -262,11 +262,17 @@ final class MiniCPMEncoderAttention: Module {
         }
         let next: MiniCPMAudioLayerCache?
         if useCache {
+            // Head-padded layout: the real positions (real_past + current)
+            // are the LAST totalRealLength entries of the bucketed tensors.
+            // Slicing from the front would store the zero head block and
+            // drop the current chunk's keys.
             let cacheKeys = keys.dim(2) > totalRealLength
-                ? keys[0..., 0..., ..<totalRealLength, 0...].contiguous()
+                ? keys[0..., 0..., (keys.dim(2) - totalRealLength)..., 0...]
+                    .contiguous()
                 : keys
             let cacheValues = values.dim(2) > totalRealLength
-                ? values[0..., 0..., ..<totalRealLength, 0...].contiguous()
+                ? values[0..., 0..., (values.dim(2) - totalRealLength)..., 0...]
+                    .contiguous()
                 : values
             next = MiniCPMAudioLayerCache(
                 keys: cacheKeys, values: cacheValues,
