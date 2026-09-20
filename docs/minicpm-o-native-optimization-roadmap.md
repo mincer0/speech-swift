@@ -115,6 +115,108 @@ ANE 后：ANE [编码 ~20] ∥ GPU [LLM 282][TTS+token2wav 389] ≈ 671ms
 
 ---
 
+## 第二轮方案（含调研与实测，2026-09-21）
+
+### 0. 先结掉一桩悬案：首音频延迟已达标 ✅
+
+P7 交接文档记录的首音频延迟是 **6.1–6.4s（最差 12.89s）**。本轮优化后重测
+（文本 turn 场景，纯响应延迟）：
+
+| 会话 | 首音频 | 首文本 |
+|---|---|---|
+| sess_29081E37DB16 | **0.55s** | 6.21s |
+| sess_5AA2079F31CD | 0.73s | 2.12s |
+| sess_870BEF97D7DD | 0.81s | 2.26s |
+| sess_CAFC7D2AE996 | 0.85s | 2.29s |
+| sess_ABD075833B50 | 1.01s | 7.46s |
+
+**典型 0.55–1.0s，比 P7 记录快约 7 倍**（浏览器会话的 2.55s 含用户说话时间，不是纯响应）。
+人类对话轮换间隔约 0.5–1s，**P7 的阈值争议可以按"已达标"结案**。
+
+### 1. TTS 采样循环上 `MLX.compile` ⭐⭐
+
+**调研**：MLX 的 `MLX.compile` 把多算子融合成单个 Metal kernel，消除逐算子启动开销，
+对"循环内反复调用的同形状函数"收益最大（Apple WWDC 2025 材料 + MLX 官方最佳实践）。
+**本仓库已有先例**：`SourceSeparation/OpenUnmixModel.swift:261` 就是把逐步函数
+`MLX.compile` 掉了，注释写着"Fuses the matmul/bias/slice/activation"。
+
+**适用点**：`MiniCPMTTSSemantic` 的 26 步采样循环 —— 每步形状完全相同，
+每步 7ms 里含大量小算子启动（RMSNorm/QKV/ROPE/FFN 各是独立 kernel）。
+**预期**：`semantic_tts` 183ms 的启动开销部分可省，保守估 20–40ms。
+
+**测试**：把一个 decode step 包成 `MLX.compile`，用 `duplex_ab_listen.py` 对比
+`semantic_tts_ms`，并跑 `duplex_understand_test.py` 确认输出未变。
+
+### 2. TTS / token2wav 从 F16 量化到 8-bit ⭐⭐⭐
+
+**调研**：MLX 社区实践结论 —— **8-bit + `group_size=128` 是精度/速度的最佳平衡点**；
+M2 Max 的统一内存带宽是这些小组件的瓶颈（TTS 1.16GB、flow 458MB、HiFT 83MB，
+全部 F16）。**量化直接把权重读取量减半。**
+
+**现状**：LLM 已是 8-bit，但这三个语音组件仍是 F16 —— 从未量化过。
+`scripts/convert_minicpm_o_tts_to_mlx.py` / `..._flow_to_mlx.py` / `..._hift_to_mlx.py`
+是现成的转换入口（需确认是否已支持 `bits`/`group_size` 参数）。
+
+**预期**：`semantic_tts` 183 → ~120ms，`flow` 170 → ~110ms，合计省 ~120ms
+—— **这是继 ANE 之后最大的剩余杠杆**。
+
+**风险**：flow-matching 解码器对数值敏感，量化可能影响音质（尤其气声/齿音）。
+**测试**：转换后先跑 `duplex_understand_test.py`（理解不变）+ 人工听感对比，
+失败则只量化 TTS（它比 flow 更稳定）。
+
+### 3. `asyncEval` 让 CPU 侧工作与 GPU 重叠 ⭐
+
+**调研**：MLX Swift 有 `asyncEval()` —— 提交后立即返回，调用线程可以继续。
+**本仓库其他模型已在用**（`HiggsTTSModel.swift:195`、`MossMLXRuntime.swift:556`），
+但 MiniCPM 热路径全部用阻塞式 `eval()`。
+
+**适用点**：引擎在阶段边界（尤其 `STAGE_TIMING` 下）做阻塞同步；之后 CPU 还要做
+base64 编码、JSON 组装、WebSocket 发送。改成 `asyncEval` 可让这些 CPU 工作与
+GPU 计算重叠。
+**预期**：数十 ms 量级（保守）。**成本**：低。**风险**：需小心与 `evalLock` 的交互。
+
+### 4. 音频编码器上 ANE / CoreML ⭐⭐（见上文第 2 项）
+
+**调研补充**：CoreML 首次加载需编译（社区报告 3B 模型在 M2 上 15–45s）。
+我们的音频编码器小得多（24 层/1024），但**必须实测启动耗时**，避免把服务冷启动变慢。
+另注：搜索材料指出 **MLX 在 M 系列上通常优于 CoreML**（无编译步骤、无 ANE 调度开销），
+所以这一项的收益必须实测确认，不能假设 ANE 一定更快。
+
+### 5. 客户端自适应播放速率（抖动缓冲）⭐⭐
+
+**调研**：macOS 自带 **`AVAudioUnitTimePitch`**（`rate` 1/32→32、音高独立、`overlap` 3–32
+可调，macOS 10.10+），**不需要第三方 DSP**。但它属于 AVFoundation，**浏览器客户端用不上**
+（Web Audio 不提供时域压缩；`<audio>` 元素的 `preservesPitch` + `playbackRate` 可用，
+但我们的客户端是 PCM 排播，不是媒体元素）。
+
+**两条落法**：
+- 服务端：用 `AVAudioUnitTimePitch` 离线模式对 PCM 做微压缩（1.0→1.05×）再下发
+- 客户端：JS 里实现一个小 WSOLA（约 100 行），或改用媒体元素播放
+
+**诚实评估**：它只能平滑**欠载（underrun）导致**的硬切，**不能消除模型自身的
+韵律停顿**（见第 4 项变长块的结论）。而当前 wall_clock 已低于实时，欠载已基本消失
+→ **收益存疑，优先级低**。
+
+### 6. 多 unit 流水线（双缓冲）⭐⭐
+
+让 unit N 的 TTS+vocoder 与 unit N+1 的音频编码+LLM 解码重叠。
+GPU 仍会串行化，但依赖等待与 CPU 段可以重叠。
+**预期**：中等（理论 wall_clock → max(前半段, 后半段) ≈ 400ms），**成本高**
+（要重构引擎主循环），风险是打乱现有已验证的时序。**建议缓行。**
+
+---
+
+## 本轮代码审计：两处"疑似大鱼"已排除
+
+| 审计对象 | 结论 |
+|---|---|
+| `MiniCPMLLM` 的注意力是否走了慢路径 | ✅ **已是融合路径**：单 token 解码（热路径）走 `SDPA.attendAndMerge`（MLXFast）；MPSGraph 的 `MiniCPMExactBF16SDPA` 只在多 token prefill / 上下文重建时使用 |
+| `MiniCPMToken2Wav` / `MiniCPMTTSSemantic` 是否有手写标量 kernel | ✅ 干净（详见上文第 4 项） |
+
+→ `llm_decode` 的 282ms 是**真实的 8-bit 权重带宽成本**，不是实现缺陷。
+
+---
+
 ## 搁置项
 
 ### LLM 4-bit 量化（用户决定保持 8-bit）
