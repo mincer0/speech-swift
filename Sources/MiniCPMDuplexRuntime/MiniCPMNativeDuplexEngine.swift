@@ -261,6 +261,10 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
     private var diagnosticGenerationExitedAtNS: UInt64?
     private var diagnosticCancelReturnedAtNS: UInt64?
     private let stageTimingEnabled: Bool
+    /// Opt-in variable-length audio blocks (`MINICPM_DUPLEX_VARIABLE_BLOCKS=1`):
+    /// stop padding a sub-1 s speak block up to 24 000 samples. See the
+    /// padding site below for the measured motivation.
+    private let variableBlocksEnabled: Bool
     /// Qwen3-backbone reasoning markers. The duplex sampler must never emit
     /// them: they are plain (non-special) tokens in this vocabulary, so
     /// `skipSpecialTokens` does not hide them, and a sampled `<think>` both
@@ -284,6 +288,11 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         }
         self.stageTimingEnabled = stageTimingEnabled
             ?? Self.stageTimingRequestedFromEnvironment()
+        self.variableBlocksEnabled = ProcessInfo.processInfo.environment[
+            "MINICPM_DUPLEX_VARIABLE_BLOCKS"
+        ]?.lowercased() == "1" || ProcessInfo.processInfo.environment[
+            "MINICPM_DUPLEX_VARIABLE_BLOCKS"
+        ]?.lowercased() == "true"
         languageSession = MiniCPMSession(model: models.llm)
         audioSession = MiniCPMAudioStreamingSession(model: models.audio)
         ttsSession = models.ttsSemantic?.makeSession()
@@ -1157,9 +1166,21 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         // A listen boundary always returns a real one-second silence payload;
         // this keeps downstream playback and capture clocks aligned. Listen
         // markers are not sent to the speaker, so they have no trim metadata.
+        //
+        // The 1.00 s padding below only ever fires for a unit that produced
+        // fewer than 25 speech codes while the turn stays open - in practice
+        // the first chunk of a turn, whose EOS is allowed immediately. The
+        // padding is PREPENDED, so the voice onset is delayed by whatever the
+        // fill is (up to 0.6 s) relative to when the client starts playing the
+        // block. The official implementation does not pad these blocks: its
+        // measured blocks run 0.32-1.12 s, and every short one is a turn
+        // boundary. `MINICPM_DUPLEX_VARIABLE_BLOCKS=1` matches that behaviour;
+        // middle chunks are unaffected because they always carry the full
+        // 26/25 look-ahead contract.
         if isListen {
             waveform = [Float](repeating: 0, count: 24_000)
-        } else if !endOfTurn, let currentWaveform = waveform,
+        } else if !endOfTurn, !variableBlocksEnabled,
+                  let currentWaveform = waveform,
                   currentWaveform.count < 24_000 {
             let padding = 24_000 - currentWaveform.count
             audioPaddingSamples = padding
