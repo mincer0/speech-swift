@@ -361,14 +361,24 @@ public final class MiniCPMDuplexRuntimeEngineAdapter: MiniCPMDemoBackendEngine, 
             ?? parameters["sampling"]?.objectValue
             ?? parameters["duplex"]?.objectValue
             ?? parameters
+        // Per-unit LLM decode budget. Lowering this to 12 was measured and had
+        // **no effect** (`llm_decode_ms` 271.8 -> 290.7 ms, i.e. within noise):
+        // the unit normally ends on the sampler's natural `chunk_eos` probe
+        // after 1-5 visible characters, so the 20-token budget was never the
+        // binding constraint. Keep 20 rather than 12 - a punctuation-heavy unit
+        // could genuinely need more than 12 steps, and truncating it would
+        // silently drop text.
         let maxTokens = Int(
             config["max_new_speak_tokens_per_chunk"]?.numberValue
                 ?? config["max_new_tokens"]?.numberValue
                 ?? config["maxNewTokens"]?.numberValue
                 ?? 20)
-        let temperature = Float(config["temperature"]?.numberValue ?? 0.7)
+        // Official `generation_config.json` values (OpenBMB/MiniCPM-o-4_5).
+        // The old 0.7 / 0.8 pair was hotter *and* narrower than upstream, which
+        // pushed probability mass onto fewer, more random tail candidates.
+        let temperature = Float(config["temperature"]?.numberValue ?? 0.6)
         let topK = Int(config["top_k"]?.numberValue ?? config["topK"]?.numberValue ?? 20)
-        let topP = Float(config["top_p"]?.numberValue ?? config["topP"]?.numberValue ?? 0.8)
+        let topP = Float(config["top_p"]?.numberValue ?? config["topP"]?.numberValue ?? 0.95)
         let window = config["sliding_window_tokens"]?.numberValue.map(Int.init)
         let windowMode = config["sliding_window_mode"]?.stringValue
             ?? config["slidingWindowMode"]?.stringValue
@@ -399,6 +409,20 @@ public final class MiniCPMDuplexRuntimeEngineAdapter: MiniCPMDemoBackendEngine, 
             config["force_listen_count"]?.numberValue
                 ?? config["forceListenCount"]?.numberValue
                 ?? 0)
+        // Listen-probability scale. **Keep the official 1.0.**
+        //
+        // An A/B harness (`tools/duplex_ab_listen.py`) measured this knob on a
+        // "user is silent, tell me a long story" scenario and it did NOT hold
+        // up:
+        //   scale 0.5 -> 9 units, 35 chars, listen 11%
+        //   scale 1.0 -> 31 units, 102 chars, listen 6%
+        // i.e. 1.0 produced the longer, more coherent answer with a *lower*
+        // listen ratio. The high listen share seen in real browser sessions
+        // (43% in `sess_B657A96A17DB`) is driven by the user's own speech being
+        // present in the input, which is correct duplex behaviour - not by this
+        // knob.
+        //
+        // Pass `listen_prob_scale` per-session if you ever want to bias it.
         let listenScale = Float(
             config["listen_prob_scale"]?.numberValue
                 ?? config["listen_probability_scale"]?.numberValue

@@ -59,3 +59,8 @@ benchmark-results/
 .claude/scheduled_tasks.lock
 /.idea/*
 .e2e-logs/
+
+# SwiftPM build trees (each can be tens of GB)
+.build*/
+# Golden fixtures / recorded outputs (150M+ of wav)
+test-output/

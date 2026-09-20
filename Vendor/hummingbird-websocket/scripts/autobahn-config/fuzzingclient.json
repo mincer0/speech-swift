@@ -1,0 +1,13 @@
+{
+    "servers": [
+        {"url": "ws://host.docker.internal:9001", "agent": "HB"}
+    ],
+    "outdir": "./reports/server",
+    "cases": ["*"],
+    "exclude-cases": [
+        "9.*",
+        "12.*",
+        "13.*"
+    ],
+    "exclude-agent-cases": {}
+}

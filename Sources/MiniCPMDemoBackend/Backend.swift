@@ -648,6 +648,28 @@ public actor MiniCPMDemoBackend {
             }
             if output.kind == "listen" {
                 let metrics = mergedMetrics(output.metrics, wallClockStart: wallClockStart)
+                // The duplex engine already produced a one-second silence
+                // payload for a listen boundary ("this keeps downstream
+                // playback and capture clocks aligned"). Emit it: dropping it
+                // here leaves a one-second hole in the client's playback
+                // timeline, which is exactly what the Ahead/buffer indicator
+                // reports as a dry queue even when the model is legitimately
+                // listening. `silent` lets a client that prefers the old
+                // behaviour skip the block without guessing from the samples.
+                if let audio = output.audio {
+                    audioParts.append(EncodedAudioPart(
+                        format: output.format,
+                        sampleRate: output.sampleRate,
+                        data: audio))
+                    events.append(emit("response.output.delta", payload: [
+                        "kind": .string("audio"),
+                        "audio": .string(audio),
+                        "format": .string(output.format),
+                        "sample_rate": .number(Double(output.sampleRate)),
+                        "silent": .bool(true),
+                        "metrics": .object(metrics),
+                    ], responseID: responseID, inputID: inputID))
+                }
                 events.append(emit("response.output.delta", payload: ["kind": .string("listen"), "reason": .string(output.reason ?? "model_listen"), "metrics": .object(metrics)], responseID: responseID, inputID: inputID))
                 if output.needsFinalize { pendingFinalize = true }
                 // A listen marker closes the currently spoken response.

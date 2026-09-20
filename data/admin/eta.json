@@ -1,0 +1,1 @@
+{"config":{"ema_alpha":0.3,"ema_min_samples":3,"eta_audio_duplex_s":120,"eta_chat_s":15,"eta_half_duplex_s":180,"eta_omni_duplex_s":90},"ema":{},"samples":{}}

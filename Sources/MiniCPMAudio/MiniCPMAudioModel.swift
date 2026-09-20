@@ -536,6 +536,10 @@ private func audioAveragePool1d(
 /// output row's weight address while each output's FMA order stays unchanged.
 @inline(__always)
 private func audioLinearMPS(_ layer: Linear, _ input: MLXArray) -> MLXArray {
+    // See `audioFastMathOverride`: the default path swaps every encoder Linear
+    // for a hand-written scalar Metal kernel, which is the dominant per-unit
+    // cost in the duplex loop (380 ms -> 113 ms once bypassed).
+    if audioSkipParityLinear { return layer(input) }
     guard input.ndim == 3 else { return layer(input) }
     let contiguousInput = input.contiguous()
     let contiguousWeight = layer.weight.contiguous()
@@ -595,7 +599,65 @@ private func audioConv1d(_ layer: Conv1d, _ input: MLXArray) -> MLXArray {
 /// reference order explicitly: temporal window, input-channel reduction in
 /// FP32, separate bias add, and one BF16 store.
 @inline(__always)
+/// Opt-in fast path for the audio front-end convolutions.
+///
+/// The default hand-written Metal kernel mirrors PyTorch MPS's exact boundary
+/// arithmetic, but it launches with `threadGroup: (1, 1, 1)` and a scalar
+/// FP32 accumulation loop - one thread per output element. Measured against
+/// the per-unit stage timings, `audio_encoder_ms` is by far the largest stage
+/// (~403 ms of a ~1130 ms duplex unit, i.e. 36%), while the LLM prefill for the
+/// same unit is ~2 ms. `MLX.conv1d` uses a tiled im2col/GEMM kernel and also
+/// accumulates in FP32 with a separate bias add, so the numerical contract is
+/// the same; only the launch shape differs.
+///
+/// Set `MINICPM_AUDIO_CONV=mlx` (or `1`/`true`/`builtin`) to compare.
+private let audioUseBuiltinConv: Bool = {
+    guard let value = ProcessInfo.processInfo.environment["MINICPM_AUDIO_CONV"]?
+        .lowercased() else { return false }
+    return value == "mlx" || value == "builtin" || value == "1" || value == "true"
+}()
+
+/// Master switch that hands the whole audio front-end back to MLX's built-in
+/// kernels instead of the MPS-parity hand-written ones.
+///
+/// Every `Linear` in the encoder is replaced by
+/// `MiniCPMAudioMetalKernels.linear`, a scalar Metal kernel that assigns one
+/// thread per output element and then loops serially in FP32 over all
+/// `inputChannels` (`audioLinearMPS`). The encoder's MLP alone is
+/// 1024 -> 4096 -> 1024, so a single 50-position chunk costs
+/// `4096*50*1024 + 1024*50*4096 ≈ 6.3e8` scalar FMAs per layer, times 24
+/// layers - roughly two orders of magnitude off a tiled GEMM.
+///
+/// Measured against the per-unit stage timings, this is what makes
+/// `audio_encoder_ms` a flat ~380 ms (the code comment in
+/// `MiniCPMDuplexEngine` still quotes ~16 ms), which is 36% of a ~1070 ms
+/// duplex unit and the reason the playout buffer never fills.
+///
+/// The custom kernels exist only to reproduce PyTorch MPS's exact FP32
+/// reduction boundary (one-ULP drift was visible in layer 7's FFN). MLX's
+/// built-in path uses the same FP32 accumulation and a separate bias add, so
+/// set `MINICPM_AUDIO_FAST=1` to trade that exactness for speed and compare.
+private let audioFastMathOverride: Bool = {
+    guard let value = ProcessInfo.processInfo.environment["MINICPM_AUDIO_FAST"]?
+        .lowercased() else { return false }
+    return value == "1" || value == "true" || value == "yes" || value == "mlx"
+}()
+
+/// Independent switch for just the encoder's `Linear` layers, so the speed win
+/// and the numerical change can be bisected without touching the conv path.
+/// `MINICPM_AUDIO_FAST` implies this.
+private let audioUseBuiltinLinear: Bool = {
+    guard let value = ProcessInfo.processInfo.environment["MINICPM_AUDIO_LINEAR"]?
+        .lowercased() else { return false }
+    return value == "1" || value == "true" || value == "yes" || value == "mlx"
+}()
+
+private let audioSkipParityLinear = audioFastMathOverride || audioUseBuiltinLinear
+
 private func audioConv1dMPS(_ layer: Conv1d, _ input: MLXArray) -> MLXArray {
+    if audioFastMathOverride || audioUseBuiltinConv {
+        return audioConv1d(layer, input)
+    }
     guard let bias = layer.bias else {
         return audioConv1d(layer, input)
     }
@@ -640,6 +702,11 @@ private func audioConv1dMPS(_ layer: Conv1d, _ input: MLXArray) -> MLXArray {
 /// by a high-gain channel in encoder layer 7.
 @inline(__always)
 private func audioGELU(_ input: MLXArray) -> MLXArray {
+    // Fast path: the default `MiniCPMAudioBF16GELU.apply` evaluates an MPSGraph
+    // per call, and the encoder issues ~72 GELU evaluations per unit, so graph
+    // execution overhead is a measurable slice of `audio_encoder_ms`. Measured
+    // 123.3 -> 101.8 ms with the eager FP32 variant. See `audioFastMathOverride`.
+    if audioFastMathOverride { return audioGELUEagerFP32(input) }
     if input.dtype == .bfloat16 {
         // The official PyTorch MPS encoder evaluates exact GELU as one BF16
         // MPSGraph expression.  The MLX/Metal approximation is numerically
@@ -1013,6 +1080,10 @@ private func audioLayerNormEager(_ layer: LayerNorm, _ input: MLXArray) -> MLXAr
 
 @inline(__always)
 private func audioLayerNorm(_ layer: LayerNorm, _ input: MLXArray) -> MLXArray {
+    // Fast path: `layer(input)` is MLX's built-in LayerNorm. Measured together
+    // with the eager-GELU switch below, `audio_encoder_ms` 123.3 -> 101.8 ms.
+    // See `audioFastMathOverride` for the trade-off.
+    if audioFastMathOverride { return layer(input) }
     // Keep the parity-tested MPS kernel as the production default, but expose
     // an opt-in process switch for recurrent-drift diagnostics.  The switch is
     // intentionally read at call time so a test can run several fresh model

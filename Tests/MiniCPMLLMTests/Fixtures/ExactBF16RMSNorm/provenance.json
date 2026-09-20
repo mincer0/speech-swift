@@ -1,0 +1,99 @@
+{
+  "device": "mps",
+  "execution_mode": "torch.inference_mode (no_grad)",
+  "files": {
+    "input.f32": {
+      "bytes": 512,
+      "dtype": "float32-serialized BF16 values",
+      "sha256": "467043a2f0687d2974e8f6fcbc7757b006498b353e784f96f8e00e2fb1a360f4",
+      "shape": [
+        1,
+        1,
+        128
+      ]
+    },
+    "output.f32": {
+      "bytes": 512,
+      "dtype": "float32-serialized BF16 values",
+      "sha256": "455a65fd8bac2fe80c5c322a70ea60029e18c4727212e750b1c2f8e2f1d71c9a",
+      "shape": [
+        1,
+        1,
+        128
+      ]
+    },
+    "weight.f32": {
+      "bytes": 512,
+      "dtype": "float32-serialized BF16 values",
+      "sha256": "3ccfa551146ffe77d28a3f33138f0c65d71822ad56a70b422b31558ec3e0d8eb",
+      "shape": [
+        128
+      ]
+    }
+  },
+  "fixture_shapes": {
+    "input": [
+      1,
+      1,
+      128
+    ],
+    "output": [
+      1,
+      1,
+      128
+    ],
+    "weight": [
+      128
+    ]
+  },
+  "generator": "targeted layer16 no-grad extraction",
+  "input_dtype": "torch.bfloat16",
+  "input_source": {
+    "path": "/tmp/minicpm-python-layer16-nograd-v2/layer_16_q_proj.f32",
+    "shape": [
+      1,
+      4,
+      32,
+      128
+    ],
+    "slice": {
+      "batch": 0,
+      "head": 3,
+      "token": 2
+    }
+  },
+  "operation": "model.layers.16.self_attn.q_norm",
+  "output_dtype": "torch.bfloat16",
+  "output_source": {
+    "path": "/tmp/minicpm-python-layer16-nograd-v2/layer_16_q.f32",
+    "shape": [
+      1,
+      32,
+      4,
+      128
+    ],
+    "slice": {
+      "batch": 0,
+      "head": 3,
+      "token": 2
+    }
+  },
+  "source_sha256": {
+    "model.safetensors": "77499b8ce6686b5dc00613c3aa660ef01e21b7aca2b526bb3267bfd4c91f913d",
+    "trace_q.f32": "b9cb1d8c7d2492acd92e112930a56b351df3364733fc0c662a6b78a309841326",
+    "trace_q_proj.f32": "c8d261e0ead83d57813c89c3216c06f88380a09d2a83539a49470d79037d9894"
+  },
+  "weight_dtype": "torch.bfloat16",
+  "weight_source": {
+    "header_data_offsets": [
+      9415575808,
+      9415576064
+    ],
+    "path": "/Users/mincer/\u9879\u76ee/s2s/models/MiniCPM-o-4_5-llm-mlx-bf16/model.safetensors",
+    "safetensors_dtype": "BF16",
+    "shape": [
+      128
+    ],
+    "tensor": "model.layers.16.self_attn.q_norm.weight"
+  }
+}

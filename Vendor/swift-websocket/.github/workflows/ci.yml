@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches:
+    - main
+    paths:
+    - '**.swift'
+    - '**.yml'
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-ci
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FUZZING_SERVER: autobahn
+jobs:
+  macOS:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+    - name: Select appropriate Xcode version
+      uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+      with:
+        xcode-version: latest-stable
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+    - name: SPM tests
+      run: swift test --enable-code-coverage
+    - name: Convert coverage files
+      run: |
+        xcrun llvm-cov export -format "lcov" \
+          .build/debug/swift-websocketPackageTests.xctest/Contents/MacOs/swift-websocketPackageTests \
+          -ignore-filename-regex="\/Tests\/" \
+          -ignore-filename-regex="\/Benchmarks\/" \
+          -instr-profile=.build/debug/codecov/default.profdata > info.lcov
+    - name: Upload to codecov.io
+      uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 #v4.6.0
+      with:
+        files: info.lcov
+        token: ${{ secrets.CODECOV_TOKEN }}
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        image: ["swift:6.1", "swift:6.2", "swift:6.3"]
+    container:
+      image: ${{ matrix.image }}
+    services:
+      autobahn:
+        image: crossbario/autobahn-testsuite
+        options: --name fuzzingserver
+        ports:
+          - 9001:9001
+        volumes:
+          - ${{ github.workspace }}/scripts/autobahn-config:/config
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+    - name: Restart Autobahn
+      # The autobahn service container is started *before* swift-websocket is checked
+      # out. Restarting the container after the checkout step is needed for the
+      # container to see volumes populated from the checked out workspace.
+      uses: docker://docker
+      with:
+        args: docker restart fuzzingserver
+
+    - name: Test
+      run: |
+        swift test --enable-code-coverage
+    - name: Convert coverage files
+      run: |
+        llvm-cov export -format="lcov" \
+          .build/debug/swift-websocketPackageTests.xctest \
+          -ignore-filename-regex="\/Tests\/" \
+          -ignore-filename-regex="\/Benchmarks\/" \
+          -instr-profile .build/debug/codecov/default.profdata > info.lcov
+    - name: Upload to codecov.io
+      uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 #v4.6.0
+      with:
+        files: info.lcov
+        token: ${{ secrets.CODECOV_TOKEN }}

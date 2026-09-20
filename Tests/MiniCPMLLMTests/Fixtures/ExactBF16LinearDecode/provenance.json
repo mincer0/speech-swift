@@ -1,0 +1,77 @@
+{
+  "device": "mps",
+  "execution_mode": "torch.inference_mode (no_grad)",
+  "files": {
+    "input_t1.f32": {
+      "bytes": 16384,
+      "dtype": "float32-serialized BF16 values",
+      "sha256": "96b8157be8bdcd148a81189aa0ed68fac163c78a313fc7682eedff90f542ece5",
+      "shape": [
+        1,
+        4096
+      ]
+    },
+    "input_t2.f32": {
+      "bytes": 32768,
+      "dtype": "float32-serialized BF16 values",
+      "sha256": "44b027b4520b9ccef4672bc9f8f8d6b38502b257fb7e22efd257a99df3c61854",
+      "shape": [
+        2,
+        4096
+      ]
+    },
+    "output_t1.f32": {
+      "bytes": 32,
+      "dtype": "float32-serialized BF16 values",
+      "sha256": "3219fd119a7f370c138fd00d31eb5e2feb4fb70e1194edaf292ad06a763c95d1",
+      "shape": [
+        1,
+        8
+      ]
+    },
+    "output_t2.f32": {
+      "bytes": 64,
+      "dtype": "float32-serialized BF16 values",
+      "sha256": "2f1080e797649b9a91b01820b0974ed78cb88f8a75e89daf8071e32bba5f0995",
+      "shape": [
+        2,
+        8
+      ]
+    },
+    "weight.f32": {
+      "bytes": 131072,
+      "dtype": "float32-serialized BF16 values",
+      "sha256": "1d6f015323997caffeed2baf680612199d74047f3610f92ee8898e8d11b25fcd",
+      "shape": [
+        8,
+        4096
+      ]
+    }
+  },
+  "generator": "PyTorch",
+  "input_dtype": "torch.bfloat16",
+  "input_t1_shape": [
+    1,
+    4096
+  ],
+  "input_t2_shape": [
+    2,
+    4096
+  ],
+  "operation": "torch.nn.functional.linear",
+  "output_t1_shape": [
+    1,
+    8
+  ],
+  "output_t2_shape": [
+    2,
+    8
+  ],
+  "seed": 20260805,
+  "torch_version": "2.8.0",
+  "weight_dtype": "torch.bfloat16",
+  "weight_shape": [
+    8,
+    4096
+  ]
+}

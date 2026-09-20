@@ -1,0 +1,91 @@
+{
+  "special_tokens": {
+    "<|im_start|>": 151644,
+    "<|im_end|>": 151645,
+    "<|endoftext|>": 151643,
+    "<unk>": 128244,
+    "<unit>": 151683,
+    "</unit>": 151684,
+    "<|listen|>": 151705,
+    "<|speak|>": 151706,
+    "<|interrupt|>": 151707,
+    "<|tts_bos|>": 151703,
+    "<|tts_eos|>": 151704,
+    "<|tts_pad|>": 151722,
+    "<|turn_bos|>": 151716,
+    "<|turn_eos|>": 151717,
+    "<|chunk_bos|>": 151719,
+    "<|chunk_eos|>": 151718,
+    "<|chunk_tts_bos|>": 151720,
+    "<|chunk_tts_eos|>": 151721,
+    "<|audio_start|>": 151697,
+    "<|audio|>": 151698,
+    "<|audio_end|>": 151699,
+    "<|spk_bos|>": 151700,
+    "<|spk|>": 151701,
+    "<|spk_eos|>": 151702,
+    "<|vad_start|>": 151708,
+    "<|vad_end|>": 151709,
+    "<|vision_start|>": 151652,
+    "<|vision_end|>": 151653,
+    "<image>": 151669,
+    "</image>": 151670,
+    "<|image_pad|>": 151655,
+    "<slice>": 151679,
+    "</slice>": 151680
+  },
+  "texts": [
+    {
+      "text": "Hello world",
+      "ids": [9707, 1879],
+      "decoded": "Hello world",
+      "skip_special": "Hello world"
+    },
+    {
+      "text": "你好，世界！",
+      "ids": [108386, 3837, 99489, 6313],
+      "decoded": "你好，世界！",
+      "skip_special": "你好，世界！"
+    },
+    {
+      "text": "emoji 🥳🎵 café é",
+      "ids": [37523, 11162, 98, 111, 145202, 51950, 3958],
+      "decoded": "emoji 🥳🎵 café é",
+      "skip_special": "emoji 🥳🎵 café é"
+    },
+    {
+      "text": "<|listen|>前缀 <|tts_bos|> 后缀",
+      "ids": [151705, 24562, 103630, 220, 151703, 38433, 236, 103630],
+      "decoded": "<|listen|>前缀 <|tts_bos|> 后缀",
+      "skip_special": "前缀  后缀"
+    },
+    {
+      "text": "混合<|chunk_eos|>emoji🥳",
+      "ids": [105063, 151718, 37523, 145863],
+      "decoded": "混合<|chunk_eos|>emoji🥳",
+      "skip_special": "混合emoji🥳"
+    }
+  ],
+  "chat": [
+    {
+      "options": {},
+      "ids": [151644, 872, 198, 108386, 11162, 98, 111, 151645, 198, 151644, 77091, 198],
+      "decoded": "<|im_start|>user\n你好 🥳<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "options": {"enable_thinking": false},
+      "ids": [151644, 872, 198, 108386, 11162, 98, 111, 151645, 198, 151644, 77091, 198, 151667, 271, 151668, 271],
+      "decoded": "<|im_start|>user\n你好 🥳<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "options": {"use_tts_template": true},
+      "ids": [151644, 872, 198, 108386, 11162, 98, 111, 151645, 198, 151644, 77091, 198, 151703],
+      "decoded": "<|im_start|>user\n你好 🥳<|im_end|>\n<|im_start|>assistant\n<|tts_bos|>"
+    },
+    {
+      "options": {"enable_thinking": false, "use_tts_template": true},
+      "ids": [151644, 872, 198, 108386, 11162, 98, 111, 151645, 198, 151644, 77091, 198, 151667, 271, 151668, 271, 151703],
+      "decoded": "<|im_start|>user\n你好 🥳<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<|tts_bos|>"
+    }
+  ]
+}

@@ -1,0 +1,307 @@
+{
+  "format": 1,
+  "source": {
+    "model_dir": "MiniCPM-o-4_5",
+    "weights_root": "<models>/MiniCPM-o-4_5",
+    "config_sha256": "b0c03cf9f0cfc1178ade50e4ba62727ca7a77aa6a6a71eda6668d8f289e96c1d",
+    "upstream_repo": "OpenBMB/MiniCPM-o-Demo",
+    "upstream_commit": "ba7fa9cc6ad63c894f1bd5e5afac28466953519d",
+    "modeling_sha256": "877f20cea7282bb0d05684393a1580646d1f264a2299a42f82467fd99f4028af",
+    "unified_modeling_sha256": "9fceb75f969cfafc6381adf2b59255529be7fb34d64ad784b8417d224ffbabb9",
+    "configuration_sha256": "b0c56c192d4aa57d3dc358338a4a93413b8b68e7c7a7c5b82a5af35afab1d86a",
+    "condition_helper": "MiniCPMO._convert_results_to_tts_input",
+    "condition_verified_with_fixed_source": true,
+    "tts_bundle_sha256": "9114d30b56c0ef1e556ecdb479eb8c5a0e7dc9cdcd04af0acd753f75aa1e66c4",
+    "logits_oracle_backend": "minicpm_mlx.tts.MLXMiniCPMTTS",
+    "logits_oracle_dtype": "bfloat16",
+    "oracle_backend": "official_pytorch"
+  },
+  "condition_file": "minicpm-tts-condition-oracle.safetensors",
+  "cases": {
+    "empty": {
+      "tokens": [],
+      "raw_tokens": [],
+      "hidden_key": null,
+      "expected_key": "empty.expected",
+      "condition_shape": [
+        1,
+        1,
+        768
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    "filtered": {
+      "tokens": [
+        22,
+        33,
+        44
+      ],
+      "raw_tokens": [
+        151706,
+        22,
+        33,
+        44
+      ],
+      "hidden_key": "filtered.hidden",
+      "expected_key": "filtered.expected",
+      "condition_shape": [
+        1,
+        4,
+        768
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    "control": {
+      "tokens": [
+        55,
+        151717
+      ],
+      "raw_tokens": [
+        55,
+        151717
+      ],
+      "hidden_key": "control.hidden",
+      "expected_key": "control.expected",
+      "condition_shape": [
+        1,
+        3,
+        768
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    "chunk0": {
+      "tokens": [
+        22,
+        33,
+        44
+      ],
+      "raw_tokens": [
+        22,
+        33,
+        44
+      ],
+      "hidden_key": "chunk0.hidden",
+      "expected_key": "chunk0.expected",
+      "condition_shape": [
+        1,
+        4,
+        768
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    "chunk1": {
+      "tokens": [
+        55,
+        66,
+        77,
+        88
+      ],
+      "raw_tokens": [
+        55,
+        66,
+        77,
+        88
+      ],
+      "hidden_key": "chunk1.hidden",
+      "expected_key": "chunk1.expected",
+      "condition_shape": [
+        1,
+        5,
+        768
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    "chunk2": {
+      "tokens": [
+        99,
+        151717
+      ],
+      "raw_tokens": [
+        99,
+        151717
+      ],
+      "hidden_key": "chunk2.hidden",
+      "expected_key": "chunk2.expected",
+      "condition_shape": [
+        1,
+        3,
+        768
+      ],
+      "dtype": "torch.bfloat16"
+    }
+  },
+  "chunks": [
+    {
+      "name": "chunk0",
+      "tokens": [
+        22,
+        33,
+        44
+      ],
+      "hidden_key": "chunk0.hidden",
+      "expected_key": "chunk0.expected"
+    },
+    {
+      "name": "chunk1",
+      "tokens": [
+        55,
+        66,
+        77,
+        88
+      ],
+      "hidden_key": "chunk1.hidden",
+      "expected_key": "chunk1.expected"
+    },
+    {
+      "name": "chunk2",
+      "tokens": [
+        99,
+        151717
+      ],
+      "hidden_key": "chunk2.hidden",
+      "expected_key": "chunk2.expected"
+    }
+  ],
+  "trace": [
+    {
+      "index": 0,
+      "condition_length": 4,
+      "text_start": 0,
+      "next_text_start": 29,
+      "sampled_count": 26,
+      "stable_prefix": [1736, 5650, 4676, 4678],
+      "committed": [
+        1736,
+        5650,
+        4676,
+        4678,
+        4650,
+        5668,
+        5019,
+        4614,
+        2166,
+        1431,
+        4564,
+        2219,
+        1477,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727
+      ],
+      "pending": 1727,
+      "cache_offset": 29,
+      "is_first": true,
+      "is_final": false,
+      "force_flush": true,
+      "ended_by_eos": false
+    },
+    {
+      "index": 1,
+      "condition_length": 5,
+      "text_start": 29,
+      "next_text_start": 59,
+      "sampled_count": 26,
+      "stable_prefix": [],
+      "committed": [
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727
+      ],
+      "pending": 1727,
+      "cache_offset": 60,
+      "is_first": false,
+      "is_final": false,
+      "force_flush": true,
+      "ended_by_eos": false
+    },
+    {
+      "index": 2,
+      "condition_length": 3,
+      "text_start": 59,
+      "next_text_start": 87,
+      "sampled_count": 26,
+      "stable_prefix": [],
+      "committed": [
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727,
+        1727
+      ],
+      "pending": 1727,
+      "cache_offset": 89,
+      "is_first": false,
+      "is_final": true,
+      "force_flush": true,
+      "ended_by_eos": false
+    }
+  ],
+  "trace_contract": {
+    "max_new_token": 26,
+    "middle_min_new_tokens": 26,
+    "committed_per_full_chunk": 25,
+    "pending_per_full_chunk": 1,
+    "token_identity": "stable_prefix_only_after_bf16_argmax_tie",
+    "logits_oracle_file": "minicpm-tts-logits-oracle.safetensors",
+    "logits_oracle_key": "chunk0.first_logits",
+    "first_protocol_token_filtered": true,
+    "condition_special_tokens": ["audio_bos"],
+    "optional_condition_special_tokens": ["text_eos"],
+    "force_flush_cadence": "first_middle_final",
+    "eos_token": 6561,
+    "reset_after_final": "explicit session.finishTurn() after token2wav flush",
+    "force_no_stop": true,
+    "repetition_penalty": 1.0
+  }
+}

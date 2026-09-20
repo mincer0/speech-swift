@@ -3,10 +3,11 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/build_mlx_metallib.sh [debug|release]
+Usage: scripts/build_mlx_metallib.sh [debug|release] [--force] [--scratch-path PATH]
 
 Builds MLX's Metal shader library (mlx.metallib) and places it next to the
 SwiftPM-built executable output (e.g. .build/release/mlx.metallib).
+Use --scratch-path when swift build used a non-default scratch directory.
 
 If you see: "missing Metal Toolchain", run:
   xcodebuild -downloadComponent MetalToolchain
@@ -14,20 +15,47 @@ EOF
 }
 
 FORCE=0
-CONFIG="${1:-release}"
-if [[ "$CONFIG" == "--force" ]]; then
-  FORCE=1
-  CONFIG="${2:-release}"
-elif [[ "${2:-}" == "--force" ]]; then
-  FORCE=1
-fi
+CONFIG="release"
+SCRATCH_PATH=""
+CONFIG_SET=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    debug|release)
+      if [[ "$CONFIG_SET" == "1" ]]; then usage; exit 2; fi
+      CONFIG="$1"
+      CONFIG_SET=1
+      shift
+      ;;
+    --force)
+      FORCE=1
+      shift
+      ;;
+    --scratch-path)
+      if [[ $# -lt 2 || -z "$2" ]]; then usage; exit 2; fi
+      SCRATCH_PATH="$2"
+      shift 2
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
 if [[ "$CONFIG" != "release" && "$CONFIG" != "debug" ]]; then
   usage
   exit 2
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${BUILD_DIR:-$ROOT/.build}"
+if [[ -n "$SCRATCH_PATH" ]]; then
+  if [[ "$SCRATCH_PATH" = /* ]]; then
+    BUILD_DIR="$SCRATCH_PATH"
+  else
+    BUILD_DIR="$ROOT/$SCRATCH_PATH"
+  fi
+else
+  BUILD_DIR="${BUILD_DIR:-$ROOT/.build}"
+fi
 
 if [[ ! -d "$BUILD_DIR" ]]; then
   echo "error: $BUILD_DIR not found (run swift build first)" >&2

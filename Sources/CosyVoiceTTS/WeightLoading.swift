@@ -367,9 +367,9 @@ public enum CosyVoiceWeightLoader {
         let weights = try CommonWeightLoader.loadSafetensors(url: url)
 
         CommonWeightLoader.applyConv1dWeights(
-            to: tokenizer.encoder.conv1, prefix: "encoder.conv1", from: weights, transpose: false)
+            to: tokenizer.encoder.conv1, prefix: "encoder.conv1", from: weights, transpose: true)
         CommonWeightLoader.applyConv1dWeights(
-            to: tokenizer.encoder.conv2, prefix: "encoder.conv2", from: weights, transpose: false)
+            to: tokenizer.encoder.conv2, prefix: "encoder.conv2", from: weights, transpose: true)
 
         for (i, block) in tokenizer.encoder.blocks.enumerated() {
             let p = "encoder.blocks.\(i)"
@@ -385,7 +385,7 @@ public enum CosyVoiceWeightLoader {
 
             CommonWeightLoader.applyConv1dWeights(
                 to: block.attn.fsmnBlock, prefix: "\(p).attn.fsmn_block",
-                from: weights, transpose: false)
+                from: weights, transpose: true)
 
             CommonWeightLoader.applyLayerNormWeights(
                 to: block.attnLN, prefix: "\(p).attn_ln", from: weights)

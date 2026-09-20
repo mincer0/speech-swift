@@ -18,6 +18,15 @@ public struct SpeechTokenizerConfig: Sendable {
     public var subsampleStride2: Int = 2       // conv2 stride (→ 25 Hz at 16 kHz/160-hop input)
     public var ropeBase: Float = 10_000
     public var ropeMaxSeqLen: Int = 2_048
+    /// LayerNorm epsilon used by the attention pre-norm.  CosyVoice/S3 v3
+    /// uses 1e-5; the MiniCPM-o bundled S3Tokenizer-v2 ONNX graph uses 1e-6
+    /// for `attn_ln` while retaining 1e-5 for `mlp_ln`.
+    public var attentionLayerNormEpsilon: Float = 1e-5
+    /// FSQ v2 maps tanh outputs through an affine [-1,1] → [0,L-1] range
+    /// after clamping.  v3's historical port uses the equivalent
+    /// `round(tanh(x) * 0.999) + 1` path; keep that behavior by default.
+    public var fsqUsesAffineMapping = false
+    public var fsqClampEpsilon: Float = 0.001
 
     public var headDim: Int { nAudioState / nAudioHead }       // 64
     public var totalSubsample: Int { subsampleStride1 * subsampleStride2 }  // 4
@@ -29,6 +38,18 @@ public struct SpeechTokenizerConfig: Sendable {
     public var mlpDim: Int { nAudioState * 4 }                  // 5120
 
     public init() {}
+
+    /// Configuration for MiniCPM-o 4.5's six-block S3Tokenizer-v2 ONNX
+    /// sidecar.  Keeping this constructor explicit prevents v2 epsilon and
+    /// quantizer semantics from leaking into CosyVoice v3 callers.
+    public static var miniCPMV2: SpeechTokenizerConfig {
+        var config = SpeechTokenizerConfig()
+        config.nAudioLayer = 6
+        config.attentionLayerNormEpsilon = 1e-6
+        config.fsqUsesAffineMapping = true
+        config.fsqClampEpsilon = 1e-6
+        return config
+    }
 }
 
 // MARK: - FSQ vector quantizer (inference-only)
@@ -58,10 +79,14 @@ public class FSQCodebook: Module {
     @ModuleInfo(key: "project_down") var projectDown: Linear
     let level: Int
     let channels: Int
+    let usesAffineMapping: Bool
+    let clampEpsilon: Float
 
     public init(config: SpeechTokenizerConfig) {
         self.level = config.codebookLevels
         self.channels = config.codebookChannels
+        self.usesAffineMapping = config.fsqUsesAffineMapping
+        self.clampEpsilon = config.fsqClampEpsilon
         self._projectDown.wrappedValue = Linear(config.nAudioState, config.codebookChannels)
         super.init()
     }
@@ -74,10 +99,23 @@ public class FSQCodebook: Module {
         // Project down to FSQ channels and convert to fp32 for the rounding stage —
         // bf16 can land integers ±1 off when the pre-round value sits exactly on a
         // half-integer, which would shift the entire base-3 index.
-        var h = projectDown(x).asType(.float32)    // [B, T, channels]
-        h = tanh(h)
-        h = h * MLXArray(Float(0.9990000128746033))
-        h = round(h) + MLXArray(Float(1.0))         // values in {0, 1, 2}
+        var h = tanh(projectDown(x).asType(.float32)) // [B, T, channels]
+        if usesAffineMapping {
+            // S3Tokenizer-v2.FSQCodebook.encode:
+            //   clamp(tanh(project_down(x)), -1 + 1e-6, 1 - 1e-6)
+            //   round((h + 1) * (L - 1) / 2)
+            h = clip(
+                h,
+                min: -1 + clampEpsilon,
+                max: 1 - clampEpsilon)
+            h = round((h + MLXArray(Float(1.0))
+                       ) * Float(level - 1) / Float(2.0))
+        } else {
+            // CosyVoice v3's historical path.  Keep its slightly wider
+            // central bin for existing v3 checkpoints.
+            h = h * MLXArray(1 - clampEpsilon)
+            h = round(h) + MLXArray(Float(1.0))
+        }
 
         // Base-`level` packing: idx = sum_k h[..., k] * level^k.
         // powers[k] = level^k, k = 0..<channels.
@@ -149,7 +187,11 @@ public class FSMNMultiHeadAttention: Module {
     ///   - x: `[B, T, n_state]`
     ///   - rope: RoPE module (split-half, 64-dim)
     /// - Returns: `[B, T, n_state]`
-    public func callAsFunction(_ x: MLXArray, rope: MLXNN.RoPE) -> MLXArray {
+    public func callAsFunction(
+        _ x: MLXArray,
+        rope: MLXNN.RoPE,
+        validMask: MLXArray? = nil
+    ) -> MLXArray {
         let B = x.dim(0)
         let T = x.dim(1)
         let D = x.dim(2)
@@ -162,12 +204,15 @@ public class FSMNMultiHeadAttention: Module {
         // 2. FSMN over v (NLC -> NCL -> manual constant pad -> depthwise conv -> NLC -> residual).
         // Upstream applies pad_fn then conv (which expects channels-first). Our MLX Conv1d
         // operates in NLC so we keep things in NLC and pad along the time axis.
-        var fsm = v0                                          // [B, T, D]
+        // `validMask` is [B, T, 1].  It is nil for the ordinary v3 path and
+        // supplied by the v2 encoder when a padded mel batch is present.
+        let maskNLC = validMask ?? MLXArray.ones([B, T, 1], dtype: v0.dtype)
+        var fsm = v0 * maskNLC                               // [B, T, D]
         let padL = MLXArray.zeros([B, leftPad, D]).asType(fsm.dtype)
         let padR = MLXArray.zeros([B, rightPad, D]).asType(fsm.dtype)
         fsm = concatenated([padL, fsm, padR], axis: 1)        // [B, T + 30, D]
         fsm = fsmnBlock(fsm)                                  // [B, T, D] (groups=D depthwise)
-        let fsmMemory = fsm + v0                              // residual
+        let fsmMemory = (fsm + v0) * maskNLC                  // residual
 
         // 3. RoPE + multi-head attention (per-head shape: [B, n_head, T, head_dim]).
         let qHeads = q0.reshaped([B, T, nHead, headDim])
@@ -185,17 +230,26 @@ public class FSMNMultiHeadAttention: Module {
         let kRot = rope(kFlat).reshaped([B, nHead, T, headDim])
 
         // 4. Scaled dot-product attention (MLXFast fused kernel).
+        // Mask invalid key positions before the fused attention.  The
+        // original v2 implementation builds a large negative bias from
+        // `mask_to_bias`; this broadcast shape is equivalent and leaves the
+        // valid-query path bit-for-bit independent of padded tails.
+        let keyMask = maskNLC.transposed(0, 2, 1).expandedDimensions(axis: 2)
+        let attentionMask = MLX.where(
+            keyMask .> MLXArray(Float(0.5)),
+            MLXArray(Float(0)),
+            MLXArray(Float(-1e9))).asType(qRot.dtype)
         let attn = MLXFast.scaledDotProductAttention(
             queries: qRot,
             keys: kRot,
             values: vHeads,
             scale: scale,
-            mask: nil as MLXArray?
+            mask: validMask == nil ? nil : attentionMask
         )                                                       // [B, n_head, T, head_dim]
 
         // 5. Merge heads + out projection + FSMN residual.
         let merged = attn.transposed(0, 2, 1, 3).reshaped([B, T, D])
-        return out(merged) + fsmMemory
+        return (out(merged) + fsmMemory) * maskNLC
     }
 }
 
@@ -219,7 +273,9 @@ public class ResidualAttentionBlockV3: Module {
 
     public init(config: SpeechTokenizerConfig) {
         self._attn.wrappedValue = FSMNMultiHeadAttention(config: config)
-        self._attnLN.wrappedValue = LayerNorm(dimensions: config.nAudioState, eps: 1e-5)
+        self._attnLN.wrappedValue = LayerNorm(
+            dimensions: config.nAudioState,
+            eps: config.attentionLayerNormEpsilon)
         self._mlpFc1.wrappedValue = Linear(config.nAudioState, config.mlpDim)
         self._mlpFc2.wrappedValue = Linear(config.mlpDim, config.nAudioState)
         self._mlpLN.wrappedValue = LayerNorm(dimensions: config.nAudioState, eps: 1e-5)
@@ -227,8 +283,12 @@ public class ResidualAttentionBlockV3: Module {
         super.init()
     }
 
-    public func callAsFunction(_ x: MLXArray, rope: MLXNN.RoPE) -> MLXArray {
-        var h = x + attn(attnLN(x), rope: rope)
+    public func callAsFunction(
+        _ x: MLXArray,
+        rope: MLXNN.RoPE,
+        validMask: MLXArray? = nil
+    ) -> MLXArray {
+        var h = x + attn(attnLN(x), rope: rope, validMask: validMask)
         h = h + mlpFc2(gelu(mlpFc1(mlpLN(h))))
         return h
     }
@@ -275,14 +335,56 @@ public class AudioEncoderV3: Module {
     }
 
     /// - Parameter mel: `[B, n_mels, T]` log-mel spectrogram (Whisper conventions, T at 100 Hz).
+    /// - Parameter melLengths: optional valid frame counts.  MiniCPM's v2
+    ///   ONNX graph receives this length explicitly and masks padded frames
+    ///   before each strided convolution/attention block; v3 callers can
+    ///   leave it nil for the historical unmasked path.
     /// - Returns: `[B, T / 4, n_state]` hidden states at 25 Hz.
-    public func callAsFunction(_ mel: MLXArray) -> MLXArray {
-        // MLX Conv1d wants NLC. Upstream's input is NCL, transpose once on the way in.
-        var h = mel.transposed(0, 2, 1)                  // [B, T, n_mels]
-        h = gelu(conv1(h))                                // [B, T / s1, n_state]
-        h = gelu(conv2(h))                                // [B, T / s1 / s2, n_state]
-        for block in blocks {
-            h = block(h, rope: rope)
+    public func callAsFunction(
+        _ mel: MLXArray,
+        melLengths: MLXArray? = nil
+    ) -> MLXArray {
+        precondition(mel.ndim == 3 && mel.dim(1) == config.nMels)
+        let batch = mel.dim(0)
+        let inputFrames = mel.dim(2)
+
+        func frameMask(_ lengths: MLXArray, _ frames: Int, _ dtype: DType) -> MLXArray {
+            let positions = MLXArray((0 ..< frames).map(Int32.init))
+                .reshaped([1, 1, frames])
+            let bounded = minimum(
+                maximum(lengths.asType(.int32), MLXArray(Int32(0))),
+                MLXArray(Int32(frames)))
+            return (positions .< bounded.reshaped([batch, 1, 1]))
+                .asType(dtype)
+        }
+
+        // Mask the NCL mel before feeding MLX's NLC Conv1d.  For a single
+        // unpadded prompt this is all ones and is exactly the old path.
+        var input = mel
+        var lengths = melLengths
+        if let melLengths {
+            input = input * frameMask(melLengths, inputFrames, input.dtype)
+        }
+        var h = gelu(conv1(input.transposed(0, 2, 1)))
+        if let melLengths {
+            let next = (melLengths.asType(.int32) + MLXArray(Int32(1))) / MLXArray(Int32(2))
+            lengths = next
+            h = h * frameMask(next, h.dim(1), h.dtype).transposed(0, 2, 1)
+        }
+
+        h = gelu(conv2(h))
+        if let lengths {
+            let next = (lengths.asType(.int32) + MLXArray(Int32(1))) / MLXArray(Int32(2))
+            let maskNCL = frameMask(next, h.dim(1), h.dtype)
+            h = h * maskNCL.transposed(0, 2, 1)
+            let validMask = maskNCL.transposed(0, 2, 1)
+            for block in blocks {
+                h = block(h, rope: rope, validMask: validMask)
+            }
+        } else {
+            for block in blocks {
+                h = block(h, rope: rope)
+            }
         }
         return h
     }
@@ -309,8 +411,8 @@ public final class SpeechTokenizerModel: Module {
     /// Encode a log-mel spectrogram to FSQ codes.
     /// - Parameter mel: `[B, n_mels=128, T_mel]` Whisper-style log-mel
     /// - Returns: `[B, T_mel / 4]` integer FSQ codes in `[0, 6561)` (25 Hz at 16 kHz / 160-hop input)
-    public func encode(mel: MLXArray) -> MLXArray {
-        let hidden = encoder(mel)              // [B, T/4, n_state]
+    public func encode(mel: MLXArray, melLengths: MLXArray? = nil) -> MLXArray {
+        let hidden = encoder(mel, melLengths: melLengths) // [B, T/4, n_state]
         return quantizer.encode(hidden)         // [B, T/4]
     }
 

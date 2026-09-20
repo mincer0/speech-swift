@@ -387,6 +387,27 @@ final class MetallibScriptTests: XCTestCase {
         XCTAssertEqual(process.terminationStatus, 2, "Should exit 2 for invalid config argument")
     }
 
+    func testScriptAcceptsScratchPathBeforeValidatingDirectory() throws {
+        let scriptPath = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("scripts/build_mlx_metallib.sh")
+        let missing = FileManager.default.temporaryDirectory
+            .appendingPathComponent("missing-metallib-scratch-\(UUID().uuidString)")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [scriptPath.path, "release", "--scratch-path", missing.path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        process.waitUntilExit()
+        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        XCTAssertEqual(process.terminationStatus, 1)
+        XCTAssertTrue(output.contains(missing.path), "Script should resolve the supplied scratch path")
+    }
+
     func testScriptHasProperShebang() throws {
         let scriptPath = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

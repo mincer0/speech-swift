@@ -109,6 +109,34 @@ let package = Package(
             targets: ["MossTranscribe"]
         ),
         .library(
+            name: "MiniCPMAudio",
+            targets: ["MiniCPMAudio"]
+        ),
+        .library(
+            name: "MiniCPMToken2Wav",
+            targets: ["MiniCPMToken2Wav"]
+        ),
+        .library(
+            name: "MiniCPMLLM",
+            targets: ["MiniCPMLLM"]
+        ),
+        .library(
+            name: "MiniCPMVision",
+            targets: ["MiniCPMVision"]
+        ),
+        .library(
+            name: "MiniCPMTTSSemantic",
+            targets: ["MiniCPMTTSSemantic"]
+        ),
+        .library(
+            name: "MiniCPMDuplexRuntime",
+            targets: ["MiniCPMDuplexRuntime"]
+        ),
+        .library(
+            name: "MiniCPMDemoBackend",
+            targets: ["MiniCPMDemoBackend"]
+        ),
+        .library(
             name: "VibeVoiceTTS",
             targets: ["VibeVoiceTTS"]
         ),
@@ -188,6 +216,34 @@ let package = Package(
             name: "speech-server",
             targets: ["AudioServerCLI"]
         ),
+        .executable(
+            name: "minicpm-audio-parity",
+            targets: ["MiniCPMAudioParity"]
+        ),
+        .executable(
+            name: "minicpm-audio-helper",
+            targets: ["MiniCPMAudioHelper"]
+        ),
+        .executable(
+            name: "minicpm-hift-parity",
+            targets: ["MiniCPMHiFTParity"]
+        ),
+        .executable(
+            name: "minicpm-flow-parity",
+            targets: ["MiniCPMFlowParity"]
+        ),
+        .executable(
+            name: "minicpm-token2wav-smoke",
+            targets: ["MiniCPMToken2WavSmoke"]
+        ),
+        .executable(
+            name: "minicpm-token2wav-helper",
+            targets: ["MiniCPMToken2WavHelper"]
+        ),
+        .executable(
+            name: "minicpm-mlx-server",
+            targets: ["MiniCPMMLXServer"]
+        ),
         // Deprecated aliases — kept for one release cycle. Will be removed in a future version.
         .executable(
             name: "audio",
@@ -219,11 +275,9 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.5.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", "2.5.0"..<"2.17.0"),
-        .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", "2.6.0"..<"2.7.0"),
-        // Pin swift-websocket to 1.5.x — 1.6.0 added `import NIOSSL` in WSCore/WebSocketHandler.swift
-        // without declaring swift-nio-ssl as a target dependency, so the module is unresolvable
-        // on a clean checkout. https://github.com/hummingbird-project/swift-websocket
-        .package(url: "https://github.com/hummingbird-project/swift-websocket.git", "1.5.0"..<"1.6.0"),
+        // Vendored hummingbird-websocket 2.6.0 is wired to the patched
+        // swift-websocket copy in Vendor/swift-websocket.
+        .package(path: "Vendor/hummingbird-websocket"),
         // WhisperKit (Argmax) — retained for benchmark comparison against the native WhisperASR runtime.
         .package(url: "https://github.com/argmaxinc/WhisperKit", from: "1.0.0")
     ],
@@ -659,6 +713,135 @@ let package = Package(
             ]
         ),
         .target(
+            name: "MiniCPMAudio",
+            dependencies: [
+                "MLXCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift")
+            ]
+        ),
+        .target(
+            name: "MiniCPMToken2Wav",
+            dependencies: [
+                "CosyVoiceTTS",
+                "MLXCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift")
+            ]
+        ),
+        // Native MiniCPM-o components.  The language model, vision tower and
+        // semantic TTS are deliberately separate targets so the duplex
+        // coordinator can load/release their weights independently.
+        .target(
+            name: "MiniCPMLLM",
+            dependencies: [
+                "MLXCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "Hub", package: "swift-transformers")
+            ]
+        ),
+        .target(
+            name: "MiniCPMVision",
+            dependencies: [
+                "MLXCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift")
+            ]
+        ),
+        .target(
+            name: "MiniCPMTTSSemantic",
+            dependencies: [
+                "MiniCPMLLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift")
+            ]
+        ),
+        .target(
+            name: "MiniCPMDuplexRuntime",
+            dependencies: [
+                "MiniCPMLLM",
+                "MiniCPMAudio",
+                "MiniCPMToken2Wav",
+                "MiniCPMVision",
+                "MiniCPMTTSSemantic",
+                .product(name: "MLX", package: "mlx-swift")
+            ]
+        ),
+        .target(
+            name: "MiniCPMDemoBackend",
+            dependencies: [
+                "MiniCPMDuplexRuntime",
+                .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket")
+            ],
+            resources: [
+                // Preserve the vendored Web directory hierarchy. Processing
+                // flattens same-named localized FAQ/index files and makes
+                // SwiftPM reject the target with duplicate resource names.
+                .copy("Resources/Web")
+            ]
+        ),
+        .executableTarget(
+            name: "MiniCPMMLXServer",
+            dependencies: [
+                "MiniCPMDemoBackend",
+                "MiniCPMDuplexRuntime",
+                "MiniCPMToken2Wav",
+                "SpeechVAD",
+                "AudioCommon"
+            ]
+        ),
+        .executableTarget(
+            name: "MiniCPMAudioParity",
+            dependencies: [
+                "MiniCPMAudio",
+                .product(name: "MLX", package: "mlx-swift")
+            ]
+        ),
+        .executableTarget(
+            name: "MiniCPMAudioHelper",
+            dependencies: [
+                "MiniCPMAudio",
+                .product(name: "MLX", package: "mlx-swift")
+            ]
+        ),
+        .executableTarget(
+            name: "MiniCPMHiFTParity",
+            dependencies: [
+                "MiniCPMToken2Wav",
+                .product(name: "MLX", package: "mlx-swift")
+            ]
+        ),
+        .executableTarget(
+            name: "MiniCPMFlowParity",
+            dependencies: [
+                "MiniCPMToken2Wav",
+                .product(name: "MLX", package: "mlx-swift")
+            ]
+        ),
+        .executableTarget(
+            name: "MiniCPMToken2WavSmoke",
+            dependencies: [
+                "MiniCPMToken2Wav",
+                .product(name: "MLX", package: "mlx-swift")
+            ]
+        ),
+        .executableTarget(
+            name: "MiniCPMToken2WavHelper",
+            dependencies: [
+                "MiniCPMToken2Wav",
+                .product(name: "MLX", package: "mlx-swift")
+            ]
+        ),
+        .target(
             name: "Audio2Face3D",
             dependencies: [
                 "AudioCommon",
@@ -781,11 +964,7 @@ let package = Package(
                 "StableAudio3MusicGen",
                 "AudioCommon",
                 .product(name: "Hummingbird", package: "hummingbird"),
-                .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket"),
-                // Pulled in via hummingbird-websocket but we keep the explicit
-                // pin (see top-level deps) so 1.6.0+ can't slip in; reference
-                // it here so SwiftPM doesn't warn that the pin is unused.
-                .product(name: "WSCore", package: "swift-websocket")
+                .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket")
             ]
         ),
         .executableTarget(
@@ -850,6 +1029,65 @@ let package = Package(
                 "MossTranscribe",
                 "AudioCommon",
                 .product(name: "Tokenizers", package: "swift-transformers")
+            ]
+        ),
+        .testTarget(
+            name: "MiniCPMAudioTests",
+            dependencies: [
+                "MiniCPMAudio",
+                .product(name: "MLX", package: "mlx-swift")
+            ],
+            exclude: ["helper_process_smoke.py"]
+        ),
+        .testTarget(
+            name: "MiniCPMToken2WavTests",
+            dependencies: [
+                "MiniCPMToken2Wav",
+                .product(name: "MLX", package: "mlx-swift")
+            ]
+        ),
+        .testTarget(
+            name: "MiniCPMLLMTests",
+            dependencies: [
+                "MiniCPMLLM",
+                .product(name: "MLX", package: "mlx-swift")
+            ],
+            resources: [
+                .copy("Fixtures")
+            ]
+        ),
+        .testTarget(
+            name: "MiniCPMVisionTests",
+            dependencies: [
+                "MiniCPMVision",
+                .product(name: "MLX", package: "mlx-swift")
+            ]
+        ),
+        .testTarget(
+            name: "MiniCPMTTSSemanticTests",
+            dependencies: [
+                "MiniCPMTTSSemantic",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift")
+            ],
+            resources: [
+                .copy("Fixtures")
+            ]
+        ),
+        .testTarget(
+            name: "MiniCPMDuplexRuntimeTests",
+            dependencies: [
+                "MiniCPMDuplexRuntime"
+            ]
+        ),
+        .testTarget(
+            name: "MiniCPMDemoBackendTests",
+            dependencies: [
+                "MiniCPMDemoBackend",
+                .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "HummingbirdTesting", package: "hummingbird"),
+                .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket"),
+                .product(name: "HummingbirdWSTesting", package: "hummingbird-websocket")
             ]
         ),
         .testTarget(

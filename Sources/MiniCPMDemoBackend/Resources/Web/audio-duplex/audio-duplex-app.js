@@ -469,6 +469,24 @@ class FileAudioProvider {
 
     _feedNext() {
         if (!this.running || this.paused) return;
+        // Cadence probe. The duplex contract needs a 1 Hz input feed, and the
+        // self-correcting timer below (`CHUNK_MS - elapsed`) should hold it.
+        // Server-side stage timings are flat (~762 ms/unit) while the measured
+        // gap between the server's audio deltas grows to ~1.4 s late in a
+        // session, so the surplus has to be browser-side. This logs only
+        // actual slips, at most one line every 3 s, so the cause can be
+        // attributed instead of guessed at.
+        const probeNow = performance.now();
+        if (this._lastFeedAt != null) {
+            const delta = probeNow - this._lastFeedAt;
+            if (delta > 1200 && probeNow - (this._lastFeedLogAt || 0) > 3000) {
+                this._lastFeedLogAt = probeNow;
+                addSystemLog(
+                    `Feed cadence slip: ${delta.toFixed(0)} ms between input chunks (target 1000 ms).`,
+                );
+            }
+        }
+        this._lastFeedAt = probeNow;
         if (this._chunkIdx >= this._grandTotal) {
             if (this._continueResponseDrain()) {
                 const t0 = performance.now();

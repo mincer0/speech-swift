@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Session Viewer — MiniCPMO45</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Noto Sans SC', sans-serif;
+            background: #f5f5f0; color: #2d2d2d;
+            height: 100vh; display: flex; flex-direction: column;
+        }
+        .header {
+            background: #fff; padding: 12px 24px;
+            display: flex; justify-content: space-between; align-items: center;
+            border-bottom: 1px solid #e5e5e0; flex-shrink: 0;
+        }
+        .header-left { display: flex; align-items: center; gap: 16px; }
+        .header h1 { font-size: 16px; font-weight: 600; letter-spacing: -0.3px; }
+        .nav-links { display: flex; gap: 6px; }
+        .nav-links a {
+            font-size: 13px; padding: 4px 12px; border-radius: 6px;
+            text-decoration: none; color: #666; transition: all 0.15s;
+        }
+        .nav-links a:hover { background: #f0f0eb; }
+        .main-content {
+            flex: 1; overflow-y: auto;
+            max-width: 1040px; width: 100%; margin: 0 auto; padding: 0 16px 40px;
+        }
+
+        /* Area 1: Session info */
+        .session-info { padding: 12px 0; border-bottom: 1px solid #eee; margin-bottom: 8px; }
+        .si-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+        .si-title { font-size: 15px; font-weight: 600; }
+        .si-actions { display: flex; gap: 8px; align-items: center; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; }
+        .badge-streaming { color: #1a7f37; background: #ddf4e4; }
+        .badge-chat { color: #92400e; background: #fef3c7; }
+        .badge-duplex { color: #1e40af; background: #dbeafe; }
+        .dl-btn {
+            font-size: 12px; padding: 3px 10px; border-radius: 6px;
+            background: #f0f0eb; border: 1px solid #e5e5e0; cursor: pointer;
+            color: #555; text-decoration: none; transition: all 0.15s;
+        }
+        .dl-btn:hover { background: #e5e5e0; color: #2d2d2d; }
+        .si-meta { font-size: 12px; color: #999; display: flex; gap: 16px; flex-wrap: wrap; }
+        .si-meta strong { color: #888; font-weight: 500; }
+        .cfg-toggle {
+            display: inline-flex; align-items: center; gap: 4px;
+            font-size: 12px; color: #bbb; cursor: pointer; margin-top: 6px;
+            border: none; background: none;
+        }
+        .cfg-toggle:hover { color: #888; }
+        .cfg-body {
+            display: none; margin-top: 6px; padding: 10px 12px;
+            background: #fafaf8; border-radius: 8px; border: 1px solid #eee;
+            font-size: 11px; font-family: 'SF Mono', Menlo, monospace;
+            white-space: pre-wrap; word-break: break-all; color: #888;
+            max-height: 200px; overflow-y: auto;
+        }
+        .cfg-body.open { display: block; }
+
+        /* Areas 2 & 3: Replay sections */
+        .area-sec {
+            margin: 14px auto; padding: 14px 16px; max-width: 80%;
+            background: #fff; border: 1px solid #e5e5e0; border-radius: 12px;
+        }
+        .area-hd {
+            font-size: 13px; font-weight: 600; color: #555; margin-bottom: 10px;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .area-hd .sub { color: #bbb; font-weight: 400; font-size: 11px; }
+        .area-sec video { width: 100%; border-radius: 8px; max-height: 384px; background: #000; }
+
+        /* Shared audio ctrl */
+        .audio-ctrl {
+            margin-top: 8px; background: #fff; border: 1px solid #e5e5e0;
+            border-radius: 8px; padding: 6px 12px;
+            display: flex; align-items: center; gap: 8px; user-select: none; font-size: 12px;
+        }
+        .audio-ctrl button {
+            width: 24px; height: 24px; border-radius: 50%; border: none;
+            color: #fff; cursor: pointer; display: flex; align-items: center;
+            justify-content: center; flex-shrink: 0; font-size: 10px;
+            background: #2d2d2d; transition: opacity 0.15s;
+        }
+        .audio-ctrl button:hover { opacity: 0.75; }
+        .audio-ctrl .ac-time {
+            color: #999; white-space: nowrap; min-width: 68px;
+            font-variant-numeric: tabular-nums; font-size: 11px;
+        }
+        .audio-ctrl .ac-bar {
+            flex: 1; height: 3px; background: #e5e5e0; border-radius: 2px;
+            position: relative; cursor: pointer; min-width: 60px;
+        }
+        .audio-ctrl .ac-bar-fill {
+            position: absolute; top: 0; left: 0; height: 100%;
+            background: #2d2d2d; border-radius: 2px; pointer-events: none;
+        }
+        .audio-ctrl .ac-bar-dot {
+            position: absolute; top: -4px; width: 11px; height: 11px;
+            background: #2d2d2d; border: 2px solid #fff; border-radius: 50%;
+            transform: translateX(-50%); box-shadow: 0 0 2px rgba(0,0,0,0.15);
+            pointer-events: none;
+        }
+
+        /* Area 4: Multi-track timeline */
+        .mt-wrap {
+            margin: 14px 0; background: #fff;
+            border: 1px solid #e5e5e0; border-radius: 12px; overflow: hidden;
+        }
+        .mt-ctrl {
+            padding: 8px 16px; background: #fafaf8;
+            border-bottom: 1px solid #e5e5e0;
+            display: flex; align-items: center; gap: 12px;
+        }
+        .mt-pbtn {
+            width: 30px; height: 30px; border-radius: 50%; border: none;
+            background: #2d2d2d; color: #fff; cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 11px; flex-shrink: 0;
+        }
+        .mt-pbtn:hover { opacity: 0.8; }
+        .mt-status { font-size: 12px; color: #999; font-variant-numeric: tabular-nums; }
+        .mt-heading { font-size: 13px; font-weight: 500; color: #555; margin-left: auto; }
+
+        .mt-body { display: flex; }
+        .mt-lbl {
+            flex-shrink: 0; width: 84px;
+            background: #fafaf8; border-right: 1px solid #e5e5e0;
+            position: sticky; left: 0; z-index: 2;
+        }
+        .mt-lbl-cell {
+            padding: 0 6px; font-size: 10px; font-weight: 500; color: #999;
+            display: flex; align-items: center; border-bottom: 1px solid #f0f0eb;
+        }
+        .mt-scroll { flex: 1; overflow-x: auto; }
+        .mt-grid { display: grid; grid-auto-flow: column; }
+        .mt-c {
+            padding: 3px 2px; border-bottom: 1px solid #f0f0eb;
+            border-right: 1px solid #f8f8f5; font-size: 11px;
+            display: flex; align-items: center; justify-content: center;
+            cursor: pointer; transition: background 0.12s; overflow: hidden;
+        }
+        .mt-c:hover { background: #fafaf8; }
+        .mt-c.active { background: rgba(212, 165, 116, 0.15); }
+
+        .mt-thumb { width: 96px; height: 54px; object-fit: cover; border-radius: 3px; border: 1px solid #eee; }
+        .mt-mp {
+            display: inline-flex; align-items: center; gap: 3px; font-size: 10px; color: #999;
+        }
+        .mt-mp .b {
+            width: 18px; height: 18px; border-radius: 50%; border: none;
+            background: #e8e8e3; color: #555; cursor: pointer; font-size: 8px;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .mt-mp .b:hover, .mt-mp .b.on { background: #d4a574; color: #fff; }
+        .mt-tc { flex-direction: column; text-align: center; gap: 1px; }
+        .mt-m { font-size: 10px; font-weight: 600; text-transform: uppercase; }
+        .mt-m.listen { color: #ccc; }
+        .mt-m.speak { color: #d4a574; }
+        .mt-sn { font-size: 9px; color: #666; max-height: 28px; overflow: hidden; line-height: 1.25; word-break: break-all; }
+        .mt-eot { font-size: 9px; color: #aaa; }
+        .mt-dash { color: #ddd; font-size: 10px; }
+        .mt-time { font-size: 11px; color: #999; font-variant-numeric: tabular-nums; white-space: nowrap; }
+        .mt-prog {
+            flex: 1; height: 4px; background: #e5e5e0; border-radius: 2px;
+            cursor: pointer; position: relative; min-width: 80px;
+        }
+        .mt-prog { overflow: hidden; }
+        .mt-prog-fill {
+            height: 100%; background: #d4a574;
+            pointer-events: none; width: 100%;
+            transform-origin: left; transform: scaleX(0);
+            will-change: transform;
+        }
+
+        /* Chunk index header row */
+        .mt-idx { font-size: 9px; color: #bbb; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+        /* Turn-based messages */
+        .messages { padding: 8px 0 24px; }
+        .message { margin-bottom: 20px; display: flex; gap: 12px; }
+        .message .avatar {
+            width: 28px; height: 28px; border-radius: 8px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 14px; flex-shrink: 0; margin-top: 2px;
+        }
+        .message.user .avatar { background: #e8e8e3; }
+        .message.assistant .avatar { background: #d4a574; color: #fff; font-size: 12px; }
+        .message .msg-body { max-width: 85%; min-width: 0; flex: 1; }
+        .message .content {
+            line-height: 1.65; white-space: pre-wrap; word-break: break-word;
+            font-size: 14.5px; color: #2d2d2d;
+        }
+        .message.user .content {
+            background: #fff; border: 1px solid #e5e5e0;
+            border-radius: 12px; padding: 10px 14px;
+        }
+        .message .meta { font-size: 11px; color: #999; margin-top: 6px; }
+        .msg-images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+        .msg-images img { max-width: 200px; max-height: 150px; border-radius: 8px; border: 1px solid #e5e5e0; }
+
+        .center-msg { text-align: center; padding: 60px 20px; font-size: 15px; color: #999; }
+        .error-msg { color: #ef4444; }
+
+        /* Event-stream timeline */
+        .evstream { display: flex; flex-direction: column; gap: 4px; padding: 8px 0; }
+        .ev {
+            display: grid;
+            grid-template-columns: 48px 64px 130px 1fr;
+            align-items: start;
+            gap: 10px;
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 13px;
+            border-left: 3px solid transparent;
+        }
+        .ev-up   { background: #f0f6ff; border-left-color: #3b82f6; }  /* client → backend */
+        .ev-down { background: #f6fff0; border-left-color: #22c55e; }  /* backend → client */
+        .ev-seq  { color: #9ca3af; font-variant-numeric: tabular-nums; }
+        .ev-ts   { color: #9ca3af; font-variant-numeric: tabular-nums; }
+        .ev-label { font-weight: 600; color: #374151; }
+        .ev-body { min-width: 0; word-break: break-word; }
+        .ev-text { white-space: pre-wrap; color: #111827; }
+        .ev-sub  { color: #6b7280; font-size: 12px; }
+        .ev-json { margin: 0; font-size: 11.5px; color: #6b7280; white-space: pre-wrap; word-break: break-all; background: rgba(0,0,0,0.03); padding: 4px 6px; border-radius: 4px; }
+        .ev-frame { max-height: 72px; border-radius: 4px; margin: 4px 4px 0 0; vertical-align: top; }
+        .ev-audio { margin-top: 4px; }
+        .ev-audio .ev-sub { display: block; margin-bottom: 2px; }
+        .init-summary { display: grid; gap: 8px; }
+        .init-row { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+        .init-key { min-width: 108px; color: #6b7280; font-size: 12px; font-weight: 600; }
+        .init-val { color: #111827; font-size: 12.5px; }
+        .init-pill {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 2px 8px; border-radius: 999px;
+            background: rgba(17,24,39,0.06); color: #374151; font-size: 12px;
+        }
+        .init-detail summary { cursor: pointer; color: #6b7280; font-size: 12px; }
+        .frontend-replay-empty { color: #9ca3af; font-size: 12px; }
+        @media (max-width: 640px) {
+            .ev { grid-template-columns: 36px 1fr; }
+            .ev-ts, .ev-label { grid-column: 2; }
+        }
+
+        /* User comment block (optional, only rendered when present) */
+        .user-comment {
+            margin: 12px auto 0; padding: 12px 14px;
+            background: #fffbe6; border: 1px solid #f5e6a8; border-radius: 10px;
+            font-size: 13.5px; line-height: 1.55; color: #5b4a00;
+            white-space: pre-wrap; word-break: break-word;
+        }
+        .user-comment .uc-label {
+            display: block; font-size: 11px; font-weight: 600; color: #8a6c00;
+            text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-left">
+            <h1>MiniCPMO45</h1>
+            <nav class="nav-links">
+                <a href="/">Home</a>
+
+            </nav>
+        </div>
+    </div>
+
+    <div class="main-content">
+        <div id="loading" class="center-msg">Loading session...</div>
+        <div id="error" class="center-msg error-msg" style="display:none;"></div>
+        <div id="content" style="display:none;">
+            <div id="session-info" class="session-info"></div>
+            <div id="user-comment-host"></div>
+            <div id="area-backend"></div>
+            <div id="area-frontend"></div>
+            <div id="timeline"></div>
+        </div>
+    </div>
+
+<script>
+(async function() {
+    const SID = window.location.pathname.split('/s/')[1];
+    if (!SID) { showError('No session ID in URL'); return; }
+
+    const $load = document.getElementById('loading');
+    const $err  = document.getElementById('error');
+    const $content = document.getElementById('content');
+
+    function showError(msg) { $load.style.display='none'; $err.textContent=msg; $err.style.display='block'; }
+    function esc(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+    function aUrl(rel) { return `/api/sessions/${SID}/assets/${rel}`; }
+    function fmt(s) { if(!isFinite(s))return'0:00'; const m=Math.floor(s/60),sec=Math.floor(s%60); return `${m}:${sec<10?'0':''}${sec}`; }
+
+    async function assetExists(rel) {
+        try { return (await fetch(aUrl(rel), {method:'HEAD'})).ok; } catch { return false; }
+    }
+
+    /* ── Fetch data ── */
+    try {
+        const recR = await fetch(`/api/sessions/${SID}/recording`);
+        // /recording 返回 {session_id, meta, events};meta 也可单独 GET /api/sessions/{id}
+        let rec = recR.ok ? await recR.json() : null;
+        let meta = (rec && rec.meta) ? rec.meta : null;
+        if (!meta) {
+            const metaR = await fetch(`/api/sessions/${SID}`);
+            if (metaR.ok) meta = await metaR.json();
+        }
+        if (!meta && !rec) { showError(`Session not found: ${SID} (${recR.status})`); return; }
+        meta = meta || {};
+
+        $load.style.display='none';
+        $content.style.display='block';
+        document.title = `${meta.title||SID} — Session Viewer`;
+
+        renderInfo(meta);
+        await renderFrontendReplay();
+        // 用户评语(可选,缺失则不渲染)
+        try {
+            const cr = await fetch(`/api/sessions/${SID}/comment`);
+            if (cr.ok) {
+                const cj = await cr.json();
+                const txt = (cj && typeof cj.comment === 'string') ? cj.comment.trim() : '';
+                if (txt) {
+                    const host = document.getElementById('user-comment-host');
+                    host.innerHTML = `<div class="user-comment"><span class="uc-label">用户评语</span>${esc(txt)}</div>`;
+                }
+            }
+        } catch { /* silent */ }
+
+        if (rec && Array.isArray(rec.events) && rec.events.length) {
+            renderEventStream(rec.events);
+        } else {
+            document.getElementById('timeline').innerHTML =
+                '<div class="center-msg">No recorded events (session may still be active)</div>';
+        }
+    } catch(e) { showError(`Failed to load: ${e.message}`); }
+
+    /* blob 指针(@blob/NNN.ext)→ assets URL;其它相对路径同样可用 */
+    function blobUrl(ref) {
+        if (typeof ref !== 'string' || !ref) return null;
+        return aUrl(ref.startsWith('@') ? ref.slice(1) : ref);
+    }
+
+    async function renderFrontendReplay() {
+        const host = document.getElementById('area-frontend');
+        const candidates = [
+            { rel: 'frontend_replay.webm', type: 'video/webm' },
+            { rel: 'frontend_replay.mp4', type: 'video/mp4' },
+        ];
+        let hit = null;
+        for (const c of candidates) {
+            if (await assetExists(c.rel)) { hit = c; break; }
+        }
+        if (!hit) return;
+        host.innerHTML = `
+            <section class="area-sec">
+                <div class="area-hd">Frontend replay <span class="sub">${esc(hit.rel)}</span></div>
+                <video controls playsinline preload="metadata" src="${aUrl(hit.rel)}" type="${hit.type}"></video>
+            </section>`;
+    }
+
+    /* ══════════════ Area 1: Session info ══════════════ */
+    function renderInfo(m) {
+        const ident = m.identity || {};
+        const t = m.mode || m.app_type || 'unknown';
+        const bc = String(t).includes('duplex')||t==='full_duplex' ? 'badge-duplex' : 'badge-chat';
+        const cr = m.created_at ? new Date(m.created_at*1000).toLocaleString() : '-';
+        const dur = m.duration_s!=null ? `${m.duration_s}s` : 'active';
+        const surface = ident.client_surface || ident.source_channel || '-';
+        const route = ident.page_route || ident.source_path || '-';
+        const wk = m.worker || {};
+        const metaJson = JSON.stringify(m, null, 2);
+        document.getElementById('session-info').innerHTML = `
+            <div class="si-top">
+                <span class="si-title">${esc(m.title||SID)}</span>
+                <div class="si-actions">
+                    <span class="badge ${bc}">${esc(String(t))}</span>
+                    <a class="dl-btn" href="/api/sessions/${SID}/download">⬇ Download</a>
+                </div>
+            </div>
+            <div class="si-meta">
+                <span><strong>ID:</strong> ${SID}</span>
+                <span><strong>Created:</strong> ${cr}</span>
+                <span><strong>Duration:</strong> ${dur}</span>
+                <span><strong>Worker:</strong> ${esc(wk.host||'-')} (GPU ${wk.gpu_id??'-'})</span>
+                <span><strong>Surface:</strong> ${esc(surface)}</span>
+                <span><strong>Route:</strong> ${esc(route)}</span>
+            </div>
+            <button class="cfg-toggle" onclick="this.nextElementSibling.classList.toggle('open')">▸ Meta</button>
+            <div class="cfg-body">${esc(metaJson)}</div>`;
+    }
+
+    /* ══════════════ Event-stream renderer ══════════════
+       忠实事件流:每个协议帧一行,按 dir(up/down)+ type/kind 分样式。
+       text 拼显示、audio/frame 给内联播放/预览、blob 指针转 assets URL。   */
+    function renderEventStream(events) {
+        const el = document.getElementById('timeline');
+        const rows = [];
+        const t0 = events.length ? events[0].ts : 0;
+        for (const ev of events) {
+            const f = ev.frame || {};
+            const type = f.type || '';
+            const kind = f.kind || '';
+            const dir = ev.dir || '';
+            const rel = t0 ? `+${((ev.ts - t0)).toFixed(2)}s` : '';
+            const dirCls = dir === 'up' ? 'ev-up' : 'ev-down';
+
+            let label, body = '';
+            if (type === 'session.init')      { label = 'session.init';  body = renderSessionInit(f.payload || {}); }
+            else if (type === 'session.created') { label = 'session.created'; body = `<code>${esc(f.session_id||'')}</code> <span class="ev-sub">${esc(f.mode||'')}</span>`; }
+            else if (type === 'session.closed')  { label = 'session.closed'; body = `<span class="ev-sub">${esc(f.reason||'')}</span>`; }
+            else if (type === 'input.append') {
+                label = 'input ▲';
+                const inp = f.input || {};
+                if (inp.messages) body += `<div class="ev-text">${esc(summarizeMessages(inp.messages))}</div>`;
+                if (inp.audio)  body += audioChip(blobUrl(inp.audio), 'user audio');
+                if (Array.isArray(inp.video_frames)) {
+                    for (const fr of inp.video_frames) { const u = blobUrl(fr); if (u) body += `<img class="ev-frame" src="${u}" loading="lazy">`; }
+                }
+            }
+            else if (type === 'response.output.delta') {
+                if (kind === 'text')  { label = 'text ▼';  body = `<span class="ev-text">${esc(f.text||'')}</span>`; }
+                else if (kind === 'audio') { label = 'audio ▼'; body = audioChip(blobUrl(f.audio), 'ai audio'); }
+                else if (kind === 'listen') { label = 'listen ▼'; body = '<span class="ev-sub">model listening</span>'; }
+                else { label = 'delta ▼'; body = miniJson(f); }
+            }
+            else if (type === 'response.done') {
+                label = 'response.done ▼';
+                body = `<span class="ev-text">${esc(f.text||'')}</span>`;
+                if (f.audio) body += audioChip(blobUrl(f.audio), 'ai audio');
+            }
+            else { label = type || '(unknown)'; body = miniJson(f); }
+
+            rows.push(`<div class="ev ${dirCls}">
+                <span class="ev-seq">#${ev.seq}</span>
+                <span class="ev-ts">${rel}</span>
+                <span class="ev-label">${esc(label)}</span>
+                <div class="ev-body">${body}</div>
+            </div>`);
+        }
+        el.innerHTML = `<div class="evstream">${rows.join('')}</div>`;
+        initAudioCtrls(el);
+    }
+
+    function audioChip(url, label) {
+        if (!url) return '';
+        return `<div class="ev-audio"><span class="ev-sub">${esc(label||'audio')}</span>${makeAudioCtrl(url)}</div>`;
+    }
+    function miniJson(o) {
+        if (o == null) return '';
+        try { return `<pre class="ev-json">${esc(JSON.stringify(o))}</pre>`; } catch { return ''; }
+    }
+    function approxBytesFromBase64(s) {
+        if (typeof s !== 'string') return 0;
+        const cleanLen = s.replace(/\s/g, '').length;
+        return Math.max(0, Math.floor(cleanLen * 3 / 4));
+    }
+    function humanBytes(n) {
+        if (!Number.isFinite(n) || n <= 0) return '0 B';
+        if (n < 1024) return `${n} B`;
+        if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+        return `${(n / 1024 / 1024).toFixed(1)} MB`;
+    }
+    function audioRefSummary(payload, key) {
+        const v = payload?.[key] ?? payload?.voice?.[key] ?? payload?.defaults?.[key];
+        if (typeof v === 'string' && v) {
+            if (v.startsWith('@')) return `<span class="init-pill">${esc(key)} ${esc(v)}</span>`;
+            return `<span class="init-pill">${esc(key)} inline base64, ${humanBytes(approxBytesFromBase64(v))}</span>`;
+        }
+        return '';
+    }
+    function displayPayload(value, key) {
+        const audioKeys = new Set(['ref_audio_base64', 'tts_ref_audio_base64', 'ref_audio', 'tts_ref_audio']);
+        if (audioKeys.has(key) && typeof value === 'string' && value && !value.startsWith('@')) {
+            return `<inline base64 ${humanBytes(approxBytesFromBase64(value))}>`;
+        }
+        if (Array.isArray(value)) return value.map((v) => displayPayload(v, key));
+        if (value && typeof value === 'object') {
+            const out = {};
+            for (const [k, v] of Object.entries(value)) out[k] = displayPayload(v, k);
+            return out;
+        }
+        return value;
+    }
+    function renderSessionInit(payload) {
+        const systemPrompt = payload.system_prompt || payload.instructions || '';
+        const config = payload.config || payload.duplex || {};
+        const rows = [];
+        if (systemPrompt) {
+            rows.push(`<div class="init-row"><span class="init-key">system</span><span class="init-val">${esc(systemPrompt)}</span></div>`);
+        }
+        rows.push(`<div class="init-row"><span class="init-key">mode</span><span class="init-val">${esc(payload.mode || 'full_duplex')}</span></div>`);
+        if (payload.max_slice_nums != null) {
+            rows.push(`<div class="init-row"><span class="init-key">max slices</span><span class="init-val">${esc(String(payload.max_slice_nums))}</span></div>`);
+        }
+        if (payload.use_tts != null) {
+            rows.push(`<div class="init-row"><span class="init-key">tts</span><span class="init-val">${payload.use_tts ? 'enabled' : 'disabled'}</span></div>`);
+        }
+        const configText = Object.keys(config).length ? JSON.stringify(config) : '';
+        if (configText) {
+            rows.push(`<div class="init-row"><span class="init-key">config</span><span class="init-val">${esc(configText)}</span></div>`);
+        }
+        const audioRefs = [
+            audioRefSummary(payload, 'ref_audio_base64'),
+            audioRefSummary(payload, 'tts_ref_audio_base64'),
+            audioRefSummary(payload, 'ref_audio'),
+            audioRefSummary(payload, 'tts_ref_audio'),
+        ].filter(Boolean);
+        if (audioRefs.length) {
+            rows.push(`<div class="init-row"><span class="init-key">reference audio</span><span class="init-val">${audioRefs.join(' ')}</span></div>`);
+        }
+        rows.push(`<details class="init-detail"><summary>Payload JSON</summary>${miniJson(displayPayload(payload))}</details>`);
+        return `<div class="init-summary">${rows.join('')}</div>`;
+    }
+    function summarizeMessages(messages) {
+        try {
+            return messages.map(m => {
+                const c = m.content;
+                if (typeof c === 'string') return `${m.role}: ${c}`;
+                if (Array.isArray(c)) return `${m.role}: ` + c.map(x => x.text || `[${x.type}]`).join(' ');
+                return `${m.role}: …`;
+            }).join('\n');
+        } catch { return JSON.stringify(messages); }
+    }
+
+    /* ══════════════ Audio control helpers ══════════════ */
+    function makeAudioCtrl(src) {
+        return `<div class="audio-ctrl" data-src="${src}">
+            <button class="ac-play">▶</button>
+            <span class="ac-time">0:00 / 0:00</span>
+            <div class="ac-bar"><div class="ac-bar-fill"></div><div class="ac-bar-dot" style="left:0"></div></div>
+        </div>`;
+    }
+    function initAudioCtrls(root) {
+        for (const ctrl of (root||document).querySelectorAll('.audio-ctrl[data-src]')) {
+            const src = ctrl.dataset.src; delete ctrl.dataset.src;
+            const audio = new Audio(); audio.preload='metadata'; audio.src=src;
+            const playBtn=ctrl.querySelector('.ac-play'), timeEl=ctrl.querySelector('.ac-time');
+            const bar=ctrl.querySelector('.ac-bar'), fill=ctrl.querySelector('.ac-bar-fill'), dot=ctrl.querySelector('.ac-bar-dot');
+            function upd() {
+                const p=audio.duration?(audio.currentTime/audio.duration*100):0;
+                fill.style.width=p+'%'; dot.style.left=p+'%';
+                timeEl.textContent=`${fmt(audio.currentTime)} / ${fmt(audio.duration)}`;
+            }
+            audio.addEventListener('loadedmetadata',upd);
+            audio.addEventListener('timeupdate',upd);
+            audio.addEventListener('ended',()=>{ playBtn.textContent='▶'; });
+            playBtn.addEventListener('click',()=>{
+                if(audio.paused){audio.play();playBtn.textContent='⏸';}
+                else{audio.pause();playBtn.textContent='▶';}
+            });
+            bar.addEventListener('click',(e)=>{
+                if(!audio.duration)return;
+                const r=bar.getBoundingClientRect();
+                audio.currentTime=((e.clientX-r.left)/r.width)*audio.duration; upd();
+            });
+        }
+    }
+})();
+</script>
+</body>
+</html>

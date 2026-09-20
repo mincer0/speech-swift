@@ -357,6 +357,27 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
     /// Snapshot only scalar state.  This is intentionally callable after a
     /// serialized interrupt/rollback, never from the transport cancellation
     /// thread, so the reported KV/TTS values describe one coherent boundary.
+    /// Visible-text budget for one duplex unit.
+    ///
+    /// Audio is pinned at 25 speech codes per unit (25 codes/s x 40 ms = 1.00 s),
+    /// and natural Mandarin is ~5-6 characters per second, so ~6 characters is
+    /// the largest amount of text one unit can actually speak. Raising this
+    /// (the historical value was 28) lets a dense unit overrun the 26-code TTS
+    /// cap and the utterance gets truncated mid-syllable.
+    private static let maxVisibleCharactersPerUnit = 6
+
+    /// Floor for one duplex unit, the counterpart of `maxVisibleCharactersPerUnit`.
+    ///
+    /// **Currently disabled (0).** Measuring the per-unit stage timings showed
+    /// that suppressing the natural `chunk_eos` probe did NOT raise the text per
+    /// unit at all (still 1-5 characters) but did push the model past its
+    /// trained stop point, producing duplicated and garbled continuations
+    /// ("但她她说", "我还以为是什那") plus audio that no longer matched the
+    /// text. The natural probe is the model's real cadence; the block-internal
+    /// silence it exposes has to be fixed on the audio side instead (let the
+    /// TTS emit only as many codes as the text needs).
+    private static let minVisibleCharactersPerUnit = 0
+
     public func diagnosticSnapshot() -> MiniCPMDuplexEngineDiagnosticSnapshot? {
         let window = languageSession.windowStats()
         let windowConfig = window["config"] as? [String: Any]
@@ -918,6 +939,22 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
                            allowSampledDecision: pendingSampledListenSpeakDecision) {
                         stepSampling.mode = .greedy
                     }
+                    // Keep the text budget and the audio budget in step.
+                    //
+                    // The audio side is pinned at 25 speech codes per duplex unit
+                    // (`MiniCPMToken2WavPipelineConfiguration.chunkTokenCount`),
+                    // i.e. exactly 1.00 s of waveform for ~6 characters of
+                    // Mandarin. The official natural `chunk_eos` probe, however,
+                    // returns the *unmasked* argmax and happily ends a unit after
+                    // 1-3 visible characters. The surplus then renders as silence
+                    // inside the block (measured 0.3-0.98 s per block), which is
+                    // audible as broken-up, choppy speech. Hold the probe back
+                    // until this unit has collected enough visible text; the
+                    // masked sample below still applies the full protocol policy,
+                    // and `turn_eos` / barge-in paths are untouched.
+                    stepSampling.suppressNaturalChunkEOS =
+                        models.tokenizer.decode(generated, skipSpecialTokens: true).count
+                            < Self.minVisibleCharactersPerUnit
                     let tokenArray = languageSession.sample(
                         logits: logits,
                         config: stepSampling,
@@ -956,13 +993,23 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
                     let isChunkTerminator = sampled == ids.listen
                         || sampled == ids.chunkEOS
                         || sampled == ids.chunkTTSEOS
-                    // Upstream bounds one streaming text chunk at 28 visible
-                    // characters. Reject the candidate before feeding it to
-                    // KV and replace it with a deferred chunk_eos marker.
+                    // Per-unit visible-text budget. The audio side is pinned at
+                    // 25 speech codes per duplex unit, i.e. 25 codes/s x 40 ms =
+                    // exactly 1.00 s of waveform, and natural Mandarin runs at
+                    // roughly 5-6 characters per second. A unit therefore must
+                    // not accumulate more than ~6 visible characters: with the
+                    // previous bound of 28 a dense unit produced 7-8 characters
+                    // against a 26-code cap, so the tail of the utterance was
+                    // truncated - audible as swallowed syllables. Official
+                    // MiniCPM-o binds the same ratio from the other side
+                    // (`generate_chunk_size = 10` text tokens per 25-code chunk
+                    // in `modeling_minicpmo.py`). Release the candidate token and
+                    // defer a chunk_eos instead of feeding it to KV.
                     let reachesCharacterLimit = index != 0
                         && !isChunkTerminator
                         && models.tokenizer.decode(
-                            generated + [sampled], skipSpecialTokens: true).count >= 28
+                            generated + [sampled], skipSpecialTokens: true).count
+                            >= Self.maxVisibleCharactersPerUnit
                     if reachesCharacterLimit {
                         step = protocolState.finishAtCharacterLimit(
                             index: index,
@@ -1041,6 +1088,13 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
                     temperature: config.ttsTemperature,
                     repetitionPenalty: config.ttsRepetitionPenalty,
                     eosToken: semantic.configuration.numAudioTokens - 1,
+                    // `false` matches the official duplex loop, which never
+                    // uses `force_no_stop`. Mid-turn EOS is already prevented
+                    // upstream by `generateStreamingChunk` computing
+                    // `minNewTokens = (isFirst || endOfTurn) ? 0 : 26`, and a
+                    // first chunk is *allowed* to stop early ("allow decoding
+                    // <1s audio") without ending the turn - see the note in
+                    // `MiniCPMTTSSemantic.generateStreamingChunk`.
                     forceNoStop: false,
                     maxNewToken: 26,
                     resetAfterEnd: false,
@@ -1055,6 +1109,10 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
                     // Match MiniCPMODuplex: only the first semantic chunk forces
                     // a short-window flush. Middle chunks use the normal 25+3
                     // look-ahead cadence; isFinal drains the remaining window.
+                    // `isFinalChunk` is now exactly `endOfTurn` (see the
+                    // semantic layer), so the teardown below fires only at a
+                    // real turn boundary and stays in sync with the
+                    // finishTurn() contract.
                     forceFlush: tts.isFirstChunk,
                     isFinal: tts.isFinalChunk,
                     shouldCancel: interruptionProbe)
@@ -1072,6 +1130,10 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
                     // Token2Wav has consumed its 25 committed codes.  Re-open
                     // the immutable prompt cache after the final waveform flush
                     // so the next duplex chunk starts a fresh turn.
+                    // Required contract: `generateStreamingChunk` refuses a new
+                    // chunk while a final one is pending, which is why the
+                    // decoder must be stopped from ending the turn itself
+                    // mid-sentence (see `forceNoStop` above).
                     ttsSession.finishTurn()
                     token2wav.resetForNewTurn()
                 }
