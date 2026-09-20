@@ -147,22 +147,30 @@ P7 交接文档记录的首音频延迟是 **6.1–6.4s（最差 12.89s）**。�
 **测试**：把一个 decode step 包成 `MLX.compile`，用 `duplex_ab_listen.py` 对比
 `semantic_tts_ms`，并跑 `duplex_understand_test.py` 确认输出未变。
 
-### 2. TTS / token2wav 从 F16 量化到 8-bit ⭐⭐⭐
+### 2. TTS / token2wav 从 F16 量化到 8-bit —— 已实测误差，**建议搁置**
 
-**调研**：MLX 社区实践结论 —— **8-bit + `group_size=128` 是精度/速度的最佳平衡点**；
-M2 Max 的统一内存带宽是这些小组件的瓶颈（TTS 1.16GB、flow 458MB、HiFT 83MB，
-全部 F16）。**量化直接把权重读取量减半。**
+**实测（`tools/quantization_error_probe.py`，mlx 离线量化后反量化，8-bit / group=64）**：
 
-**现状**：LLM 已是 8-bit，但这三个语音组件仍是 F16 —— 从未量化过。
-`scripts/convert_minicpm_o_tts_to_mlx.py` / `..._flow_to_mlx.py` / `..._hift_to_mlx.py`
-是现成的转换入口（需确认是否已支持 `bits`/`group_size` 参数）。
+| 组件 | 2-D 权重 | 权重相对误差 | 线性层输出误差 | 量化后 |
+|---|---|---|---|---|
+| tts | 639 MB | 平均 0.542% / 最大 0.649% | 平均 0.543% / 最大 0.645% | 170 MB |
+| token2wav | 1201 MB | 平均 0.550% / 最大 0.769% | 平均 0.557% / 最大 1.019% | 261 MB |
 
-**预期**：`semantic_tts` 183 → ~120ms，`flow` 170 → ~110ms，合计省 ~120ms
-—— **这是继 ANE 之后最大的剩余杠杆**。
+**收益重新估算（按带宽而非体积）**：
+- TTS：26 步 × (639→170 MB) ≈ 12.2 GB 少读 → M2 Max ~300 GB/s 实用带宽 → **~40ms**
+- flow：8 步 × (flow 权重 ~450→120 MB) ≈ 2.6 GB → **~10ms**
+- HiFT：单次 × (83→22 MB) → **~1ms**
+- **合计 ≈ 50ms**（wall_clock 646 → ~600ms，7.7%），**远低于最初估的 120ms**
 
-**风险**：flow-matching 解码器对数值敏感，量化可能影响音质（尤其气声/齿音）。
-**测试**：转换后先跑 `duplex_understand_test.py`（理解不变）+ 人工听感对比，
-失败则只量化 TTS（它比 flow 更稳定）。
+**风险（项目内已有前车之鉴）**：`Qwen3TTS/Configuration.swift:276-282` 明确记录
+*"int4 decommissioned for TTS"*、*"the 8-bit bundle was retired
+(synthesis quantization audibly degrades speech)"* —— 本项目已经因为可听劣化撤下过 TTS 的 8-bit 变体。
+
+**成本**：Swift 侧无量化支持（`MiniCPMTTSSemantic` / `MiniCPMToken2Wav` 全是裸 `Linear`），
+需要改 3 个模块的模型构造 + 权重加载 + 配置块 —— 属于"容易静默出错"的改动面。
+
+**结论：50ms 收益 / 中高成本 / 真实音质风险 → 建议搁置**，除非未来需要最后那几十毫秒。
+（注意：本项目 LLM 4-bit 也是因同类风险被用户否决的，标准应保持一致。）
 
 ### 3. `asyncEval` 让 CPU 侧工作与 GPU 重叠 ⭐
 
