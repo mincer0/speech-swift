@@ -18,7 +18,11 @@ public struct MiniCPMFlowConfiguration: Sendable {
     public var decoderMLPRatio = 4
     public var decoderInputChannels = 320
     public var classifierFreeGuidance: Float = 0.7
-    public var odeSteps = 10
+    /// ODE steps for the flow-matching decoder. 10 is the official value.
+    /// Lowering to 8 cut `token2wav`/flow time by ~1/5 with no audible
+    /// complaint in a long-story session; verify by ear before going lower
+    /// (each step is one full DiT forward over the mel frames).
+    public var odeSteps = 8
     public var maximumStreamingFrames = 100
 
     public init() {}
