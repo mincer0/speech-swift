@@ -163,6 +163,25 @@ P7 交接文档记录的首音频延迟是 **6.1–6.4s（最差 12.89s）**。�
 可换成 `MLXFast.scaledDotProductAttention`（融合 flash-attention 原语，
 本仓库 DiTFlow/CSM/IndexTTS2 已在用）。当前 23.8ms 里可能还有剩余空间。
 
+**✅ 已尝试并否决：** 见下方"后续尝试（B 方案）"—— 融合 SDPA 在该规模下慢 17%，已回退。
+
+**❌ 后续尝试（B 方案）：融合 SDPA 反而更慢，已回退**
+
+把 MLX 注意力路径的 `matmul + softmax + matmul` 换成
+`MLXFast.scaledDotProductAttention`（融合 flash-attention）**被数据否决**：
+
+| 路径 | `audio_encoder_ms`（3 次） | `wall_clock_ms`（3 次） |
+|---|---|---|
+| 显式 `matmul+softmax+matmul`（现行） | **23.6 / 23.9 / 23.8** | 599.0 / 603.0 / 587.4 |
+| `MLXFast.scaledDotProductAttention` | 28.6 / 28.0 / 27.2（**慢 17%**） | 644.0 / 646.5 / 631.0 |
+
+**原因**：问题规模太小（50 个位置 × 16 头 × d=64）—— flash-attention 的分块、
+在线重缩放等机制是为长序列设计的，在这个规模上纯属开销；而 MLX 的 `matmul`
+处理 50×50 分数矩阵本就极快。
+**该分支已移除**（保留一个已知更慢的开关只会成为噪音），结论记录在此。
+
+**→ 音频编码器到此收口：23.8ms，已追平 CoreML 纯 CPU、超过官方 llama.cpp 42ms。**
+
 ### 1. TTS 采样循环上 `MLX.compile` —— ⚠️ 路径受阻，改为交付 asyncEval 版本
 
 **原始调研**（保留备查）：MLX 的 `MLX.compile` 把多算子融合成单个 Metal kernel，
