@@ -133,6 +133,36 @@ P7 交接文档记录的首音频延迟是 **6.1–6.4s（最差 12.89s）**。�
 **典型 0.55–1.0s，比 P7 记录快约 7 倍**（浏览器会话的 2.55s 含用户说话时间，不是纯响应）。
 人类对话轮换间隔约 0.5–1s，**P7 的阈值争议可以按"已达标"结案**。
 
+### 0. ✅ 音频编码器的注意力：MPSGraph → MLX（已落地，**-60ms**，并因此否掉 ANE）
+
+**这条是本轮最大的单点收益，而且源于"B 方案"的诊断：为什么我们的 MLX 编码器
+（83.5ms）比 CoreML 的纯 CPU 路径（22.8ms）还慢 3.7 倍？**
+
+答案：`MINICPM_AUDIO_FAST` 当时只覆盖了 Linear / Conv / GELU / LayerNorm，
+**漏掉了注意力** —— 而它默认走 `MiniCPMAudioBF16Attention`，
+即**每次调用都执行一个 MPSGraph**（与音频编码器那个 MPSGraph GELU 同一类问题）。
+
+**实测（仅切到 MLX 注意力路径）**：
+
+| 指标 | 改前 | 改后（3 次重复） |
+|---|---|---|
+| `audio_encoder_ms` | 83.5 | **23.6 / 23.9 / 23.8**（±0.2ms） |
+| `wall_clock_ms` | 646–700 | **599.0 / 603.0 / 587.4**（均值 ≈596ms，历史最好） |
+
+**23.8ms 已追平 CoreML 纯 CPU（22.8ms），并超过官方 llama.cpp（42ms）。**
+理解能力验证通过（`duplex_understand_test.py` 命中 宇航员/火星/土豆/科幻，无负面信号）。
+
+已固化：`useMPSGraphAttention` 增加 `&& !audioFastMathOverride`，
+即 `MINICPM_AUDIO_FAST=1` 现在覆盖 Linear + Conv + GELU + LayerNorm + **Attention** 全部五项。
+
+**⚠️ 这个结果同时否决了 ANE 方案**：ANE 现在只能再省 23.8 → 10.4 = **13.4ms**
+（占 wall_clock 的 2.2%），代价是 583MB 新依赖 + 9.6s 冷启动 + Swift CoreML 集成 +
+投影层接线。**性价比不成立，建议搁置 ANE**（导出脚本与验证脚本保留备查）。
+
+**仍可继续的方向（未做）**：MLX 注意力路径目前是 `matmul + softmax + matmul`，
+可换成 `MLXFast.scaledDotProductAttention`（融合 flash-attention 原语，
+本仓库 DiTFlow/CSM/IndexTTS2 已在用）。当前 23.8ms 里可能还有剩余空间。
+
 ### 1. TTS 采样循环上 `MLX.compile` —— ⚠️ 路径受阻，改为交付 asyncEval 版本
 
 **原始调研**（保留备查）：MLX 的 `MLX.compile` 把多算子融合成单个 Metal kernel，

@@ -194,7 +194,15 @@ final class MiniCPMEncoderAttention: Module {
         let attentionVariant = ProcessInfo.processInfo.environment[
             "MINICPM_AUDIO_ATTENTION_VARIANT"
         ]?.lowercased()
+        // Fast-math mode also drops the per-call MPSGraph attention. Measured
+        // `audio_encoder_ms` 83.5 -> 23.7 ms with the MLX path - the graph
+        // execution dominated the encoder, and 23.7 ms matches CoreML's
+        // CPU-only encoder (22.8 ms) and beats the official llama.cpp 42 ms.
+        // The understanding probe (tools/duplex_understand_test.py) still hits
+        // 宇航员/火星/土豆, so the ULP-level difference the graph was guarding
+        // does not survive to the LLM's comprehension. See `audioFastMathOverride`.
         let useMPSGraphAttention = query.dtype == .bfloat16
+            && !audioFastMathOverride
             && attentionVariant != "native"
             && attentionVariant != "mlx"
 
