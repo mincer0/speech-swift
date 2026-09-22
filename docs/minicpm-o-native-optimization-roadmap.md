@@ -203,12 +203,46 @@ base64 编码、JSON 组装、WebSocket 发送。改成 `asyncEval` 可让这些
 GPU 计算重叠。
 **预期**：数十 ms 量级（保守）。**成本**：低。**风险**：需小心与 `evalLock` 的交互。
 
-### 4. 音频编码器上 ANE / CoreML ⭐⭐（见上文第 2 项）
+### 4. 音频编码器上 ANE / CoreML —— ✅ 转换已跑通，实测 **10.5ms（比 MLX 快 8 倍）**
 
-**调研补充**：CoreML 首次加载需编译（社区报告 3B 模型在 M2 上 15–45s）。
-我们的音频编码器小得多（24 层/1024），但**必须实测启动耗时**，避免把服务冷启动变慢。
-另注：搜索材料指出 **MLX 在 M 系列上通常优于 CoreML**（无编译步骤、无 ANE 调度开销），
-所以这一项的收益必须实测确认，不能假设 ANE 一定更快。
+**实测结果（`scripts/export_minicpm_o_audio_coreml.py`，1 秒音频块 / 100 帧梅尔 → 50 个位置）**：
+
+| 执行路径 | 延迟 | 与 torch 的余弦相似度 | max\|diff\| |
+|---|---|---|---|
+| torch CPU（参考） | 97–102 ms | — | — |
+| CoreML `CPU_ONLY` | 22.8 ms | 0.9922（min 0.9736） | 4.83% of peak |
+| **CoreML `CPU_AND_NE`（ANE）** | **10.5 ms** | **0.9983（min 0.9866）** | 2.82% of peak |
+| 我们现在的 MLX/GPU 实现 | 83.5–91.6 ms | — | — |
+| 官方 llama.cpp-omni（同一 GPU 阶段） | 42.2 ms | — | — |
+
+**→ ANE 版本比我们现在的 MLX 实现快约 8 倍，比官方 llama.cpp 还快 4 倍。**
+更值得注意的是：**连 CoreML 的纯 CPU 路径（22.8ms）都比我们的 MLX GPU 路径快 3.7 倍** ——
+这说明我们的 MLX 编码器实现仍有很大优化空间（官方 GPU 42ms 已是最好的 GPU 对照）。
+
+**过程中解决的四个环境/工具链障碍**（都已固化进脚本）：
+1. `coremltools 6.3.0` 配 `protobuf 7.x` 无法导入 → **升级到 coremltools 9.0**
+2. `torchvision::nms does not exist` → 复用本仓库 `minicpm_duplex/runtime.py` 的
+   `ensure_torchvision_compat()` schema 垫片
+3. `modeling_minicpmo.py` 的相对导入（且目录名 `MiniCPM-o-4_5` 不是合法包名）
+   → 建符号链接临时包，避免加载整个 17GB checkpoint
+4. `torch.jit.trace` 传 lambda 返回 `ScriptFunction`（coremltools 拒收）
+   → 用 `nn.Module` 包装；并显式传 `source="pytorch"`
+
+**权重加载完美**：`loaded 367 tensors; missing=0 unexpected=0` —— 官方 `apm.*`
+张量与 `MiniCPMWhisperEncoder` 逐一对齐；输出形状 `(1, 50, 1024)` 与流水线
+一直观测到的"每 unit 50 个位置"完全一致。
+
+**产物**：`models/MiniCPM-o-4_5-audio-ane/MiniCPM-o-4_5-audio-encoder.mlpackage`（583 MB，fp16）
+
+**⚠️ 尚未完成的部分（下一步）**：
+1. **数值验证**：cos 0.9983（最低 0.9866）属于"大概率可用"，但**必须端到端验证** ——
+   用 `tools/duplex_understand_test.py` 对比 F16 路径与 ANE 路径的理解能力
+2. **Swift 集成**：引擎里加一条 CoreML 执行分支（启动时加载 `.mlpackage`），
+   把音频编码换成 CoreML，并接上 `audio_projection_layer` 投影
+3. **冷启动成本实测**：加载 583MB mlpackage 的首次编译耗时（社区报告大模型
+   首次编译可达 15–45s）—— 需确认不会拖慢服务启动
+4. **并发注意**：ANE 与 GPU 独立，理论上可与 LLM 解码重叠；但当前引擎是串行的，
+   要真正吃到"并行"红利还需流水线改造（见第 6 项）
 
 ### 5. 客户端自适应播放速率（抖动缓冲）⭐⭐
 
