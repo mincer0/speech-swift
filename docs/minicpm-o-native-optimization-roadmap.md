@@ -133,19 +133,39 @@ P7 交接文档记录的首音频延迟是 **6.1–6.4s（最差 12.89s）**。�
 **典型 0.55–1.0s，比 P7 记录快约 7 倍**（浏览器会话的 2.55s 含用户说话时间，不是纯响应）。
 人类对话轮换间隔约 0.5–1s，**P7 的阈值争议可以按"已达标"结案**。
 
-### 1. TTS 采样循环上 `MLX.compile` ⭐⭐
+### 1. TTS 采样循环上 `MLX.compile` —— ⚠️ 路径受阻，改为交付 asyncEval 版本
 
-**调研**：MLX 的 `MLX.compile` 把多算子融合成单个 Metal kernel，消除逐算子启动开销，
-对"循环内反复调用的同形状函数"收益最大（Apple WWDC 2025 材料 + MLX 官方最佳实践）。
-**本仓库已有先例**：`SourceSeparation/OpenUnmixModel.swift:261` 就是把逐步函数
-`MLX.compile` 掉了，注释写着"Fuses the matmul/bias/slice/activation"。
+**原始调研**（保留备查）：MLX 的 `MLX.compile` 把多算子融合成单个 Metal kernel，
+消除逐算子启动开销，对"循环内反复调用的同形状函数"收益最大（WWDC 2025 + MLX 文档）。
+本仓库先例：`SourceSeparation/OpenUnmixModel.swift:261`。
 
-**适用点**：`MiniCPMTTSSemantic` 的 26 步采样循环 —— 每步形状完全相同，
-每步 7ms 里含大量小算子启动（RMSNorm/QKV/ROPE/FFN 各是独立 kernel）。
-**预期**：`semantic_tts` 183ms 的启动开销部分可省，保守估 20–40ms。
+**受阻原因（有代码证据）**：`MiniCPMTTSSemantic.generateChunk` 的 26 步循环里，
+每步的 `decoder(current, caches: session.layerCaches, offset:)` **会就地改写 KV cache**
+（非纯函数），而 `MLX.compile` 要求被编译函数无副作用。要套上 compile 必须把
+decoder / layer / session 全部改成"传参进、返回新 cache"的函数式风格 ——
+那会动到整条已通过数值验证的 TTS 路径，**风险与收益不成比例**。
 
-**测试**：把一个 decode step 包成 `MLX.compile`，用 `duplex_ab_listen.py` 对比
-`semantic_tts_ms`，并跑 `duplex_understand_test.py` 确认输出未变。
+**改用的落点：flow ODE 循环里的逐步阻塞同步**（`DiTFlow.swift:433`）。
+原代码在 `odeSteps` 每次迭代末尾 `eval(value)`，把 8 步严格串行化：
+主机必须等第 N 步完成才提交第 N+1 步，**启动延迟与同步成本被付了 8 次**
+（生成每个音频块都要付一遍）。改为 `asyncEval(value)` —— 仍然物化结果、
+仍然限制图规模与峰值内存，但**不阻塞**，CPU 可以先行、GPU 持续有活干。
+这正是 `HiggsTTSModel` / `MossMLXRuntime` 在本仓库已采用的模式。
+
+**实测（3 次重复，每次 19 个发声 unit）**：
+
+| 指标 | 改前 | 改后（3 次） |
+|---|---|---|
+| `flow_ms` | 131.3 | **125.2 / 125.1 / 125.0**（±0.2ms） |
+| `token2wav_ms` | 166.4 | 160.9 / 160.9 / 160.2 |
+| `wall_clock_ms` | 646.2（单次） | 700.4 / 688.9 / 694.4 |
+
+**诚实结论**：对**本阶段**的收益是确定且可复现的（flow **-6ms**、token2wav **-6ms**，
+方差极小）；但 `wall_clock` 在 646–700ms 之间波动（`llm_decode` 与 `semantic_tts`
+在多次运行里的自然方差就有 ±30ms），**因此不能声称整体提速** —— 那 48ms 的差异
+主要来自其他阶段的运行间波动，不是本次改动。
+
+**改动价值**：语义等价、零风险、可复现的 -6ms，保留。
 
 ### 2. TTS / token2wav 从 F16 量化到 8-bit —— 已实测误差，**建议搁置**
 

@@ -430,7 +430,14 @@ public final class MiniCPMConditionalFlowMatching: Module {
             let velocity = (1 + configuration.classifierFreeGuidance) * conditioned
                 - configuration.classifierFreeGuidance * unconditioned
             value = value + delta * velocity
-            eval(value)
+            // Materialise the step result without draining the GPU pipeline.
+            // A blocking `eval` here serialised all `odeSteps` steps: the host
+            // waited for step N before submitting N+1, so the launch latency
+            // and the sync cost were paid `odeSteps` times per generated block.
+            // `asyncEval` still bounds the graph (and therefore peak memory),
+            // but lets the CPU run ahead and the GPU stay fed - the pattern
+            // already used by HiggsTTS / Moss in this repo.
+            asyncEval(value)
             nextStepCaches.append(result.cache)
         }
         return (value, MiniCPMFlowMatchingCache(
