@@ -4,13 +4,13 @@
 当前修复分支：`fix/minicpm-quality-20261010`，基于 `a2e32ad`
 当前工作区：大量修复WIP，未commit/push；不要按历史记录执行重启或改动旧checkout。
 
-## 当前修复状态（2026-10-17，断续与没声回归）
+## 当前修复状态（2026-10-17，吞吐后续）
 
-权威入口：[本轮HANDOFF](/Users/mincer/项目/s2s/test-output/swift-mps-audit-20261017/HANDOFF.md)。上一轮隐式top5造成误打断，已撤回；默认改为跨包持续声学证据确认、用户说完前保持listen，模型自然结束后排队尾音也可被持续语音打断。最新原30+6输入重放只有input27打断，旧41→42跨包插话仍生效。播放设备恢复会清理旧echo排期参考；录音写入与准确容量遍历已优化，纯读取归档不要求写权限。
+当前修复快照已在分支 `fix/minicpm-quality-20261010`（基线 `2c022d4`）保存并推送。之后移除了无消费者的attention诊断导出，以及输入/输出的重复JSON工作。实现、测量与后续实验见[吞吐优化报告](benchmarks/minicpm-duplex-throughput-2026-10-17.md)。
 
-Node129/129、Swift172/172通过，零token forced-listen及显式cancel真实模型验证通过。最新有声计算RTF1.0395，端到端额外等待中位50.56ms；播放模拟仍有15个短gap、最大103.8ms；长回答、真实设备AEC/主观连续性仍需验收。41个数值源码与上一轮完整78步gate后相同。
+78项相关Swift测试、6项真实权重audio golden（1项可选operator trace跳过）及129项前端测试通过；取消、尾音打断和零token强制listen探针通过。同PCM重放36/36输入提交、零error，额外等待中位50.56→31.98ms。语音内容变化会影响包长和gap，本次出现280ms首包后等待下一包的620.7ms模拟gap，仍未达到任意长度稳定实时。
 
-7862 PID48563、exec38075，日志 `/tmp/s2s-quality-stable-production-20261017.log`；刷新 http://127.0.0.1:7862/audio_duplex 并新建会话。实际操作以实时health和source-state为准。全部WIP保留未提交/推送，旧7861和ComfyUI未动。
+未改变Flow步数、队列上限、录音时序或ACK语义。ComfyUI及旧服务保持运行。具体机器PID、启动器和原始录音仅保留在本地交接证据，操作前重新核对实时health。
 
 ## 历史修复状态（2026-10-10）
 

@@ -209,6 +209,55 @@ final class MiniCPMWhisperFeatureExtractorTests: XCTestCase {
     }
 }
 
+final class MiniCPMAudioAttentionTraceTests: XCTestCase {
+    private func array(_ shape: [Int], phase: Int) -> MLXArray {
+        let values = (0..<shape.reduce(1, *)).map { index in
+            Float((index * 17 + phase) % 97 - 48) / 113
+        }
+        return MLXArray(values, shape).asType(.bfloat16)
+    }
+
+    private func assertTracePreservesContext(keyLength: Int, masked: Bool) throws {
+        // Match the production head/query geometry, including longer streaming
+        // caches where exporting the two intermediate tensors is most costly.
+        let query = array([1, 16, 50, 64], phase: 3)
+        let key = array([1, 16, keyLength, 64], phase: 11)
+        let value = array([1, 16, keyLength, 64], phase: 29)
+        let mask: MLXArray? = masked
+            ? MLXArray.zeros([1, 16, 50, keyLength], dtype: .bfloat16)
+            : nil
+        let ordinary = MiniCPMAudioBF16Attention.apply(
+            query: query, key: key, value: value, additiveMask: mask,
+            captureIntermediates: false)
+        let traced = MiniCPMAudioBF16Attention.apply(
+            query: query, key: key, value: value, additiveMask: mask,
+            captureIntermediates: true)
+
+        XCTAssertNil(ordinary.probabilities)
+        let probabilities = try XCTUnwrap(traced.probabilities)
+        XCTAssertEqual(traced.scores.shape, [1, 16, 50, keyLength])
+        XCTAssertEqual(probabilities.shape, traced.scores.shape)
+        XCTAssertEqual(traced.context.dtype, .bfloat16)
+        XCTAssertEqual(ordinary.context.shape, traced.context.shape)
+        XCTAssertEqual(
+            ordinary.context.asData(access: .copy).data,
+            traced.context.asData(access: .copy).data,
+            "requesting diagnostic tensors must preserve every BF16 context bit")
+        XCTAssertGreaterThan(abs(traced.scores).max().item(Float.self), 0)
+        XCTAssertGreaterThan(probabilities.max().item(Float.self), 0)
+    }
+
+    func testOfflineTraceAndOrdinaryContextMatchBitwise() throws {
+        try assertTracePreservesContext(keyLength: 50, masked: false)
+    }
+
+    func testStreamingTraceAndOrdinaryContextMatchBitwise() throws {
+        for keyLength in [50, 500, 1_450] {
+            try assertTracePreservesContext(keyLength: keyLength, masked: true)
+        }
+    }
+}
+
 final class MiniCPMAudioCacheTests: XCTestCase {
     func testDefaultStreamingAttentionCacheAndMaskHaveNoPaddedPositions() throws {
         guard !MiniCPMEncoderAttention.keyBucketEnabled() else {

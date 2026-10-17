@@ -702,8 +702,8 @@ private func handleMiniCPMDemoWS(
 
             // Record the translated/strict canonical envelope, not an alias
             // frame that the backend will never actually see.
-            let canonicalFrame = try MiniCPMDemoWireRecordingSupport.requestValue(request)
-            await recorderBox.recordInbound(canonicalFrame, timestamp: receivedAt)
+            let canonical = try MiniCPMDemoWireRecordingSupport.requestValueAndEncodedByteCount(request)
+            await recorderBox.recordInbound(canonical.value, timestamp: receivedAt)
 
             if request.type == "session.init" {
                 didInit = true
@@ -739,11 +739,9 @@ private func handleMiniCPMDemoWS(
 
             if request.type == "input.append" {
                 let epoch = await generationEpoch.current()
-                let encodedBytes = try MiniCPMDemoWireRecordingSupport
-                    .requestEncodedByteCount(request)
                 do {
                     try inputQueue.enqueue(.init(
-                        request: request, epoch: epoch, encodedBytes: encodedBytes))
+                        request: request, epoch: epoch, encodedBytes: canonical.encodedBytes))
                 } catch let error as MiniCPMDemoInputQueueError {
                     if allowRealtimeControls,
                        case .full = error {
@@ -993,12 +991,10 @@ private func emitMiniCPMDemoEvents(
             continue
         }
         guard isOfficialMiniCPMDemoEvent(event.type) else { continue }
-        let encoded = try encodeOfficialMiniCPMDemoEvent(event)
-        try await outbound.send(encoded)
+        let encoded = try encodedOfficialMiniCPMDemoEvent(event)
+        try await outbound.send(encoded.wire)
         let sentAt = Date()
-        if let value = try? MiniCPMDemoWireRecordingSupport.jsonValue(encoded) {
-            await recorder.recordOutbound(value, timestamp: sentAt)
-        }
+        await recorder.recordOutbound(encoded.value, timestamp: sentAt)
     }
 }
 
@@ -1098,6 +1094,14 @@ private func writeMiniCPMDemoRealtimeBackpressure(
 }
 
 func encodeOfficialMiniCPMDemoEvent(_ event: MiniCPMDemoEvent) throws -> String {
+    try encodedOfficialMiniCPMDemoEvent(event).wire
+}
+
+/// Share the exact sent envelope with the recorder after transport accepts it.
+/// In particular, server_send_ts is generated once for both representations.
+func encodedOfficialMiniCPMDemoEvent(
+    _ event: MiniCPMDemoEvent
+) throws -> (wire: String, value: MiniCPMJSONValue) {
     var object: [String: MiniCPMJSONValue] = ["type": .string(event.type)]
     if let sessionID = event.sessionID { object["session_id"] = .string(sessionID) }
     if let responseID = event.responseID { object["response_id"] = .string(responseID) }
@@ -1121,11 +1125,12 @@ func encodeOfficialMiniCPMDemoEvent(_ event: MiniCPMDemoEvent) throws -> String 
         object["reason"] = reason
     }
     object["server_send_ts"] = .number(Date().timeIntervalSince1970)
-    let data = try JSONEncoder().encode(MiniCPMJSONValue.object(object))
-    guard let value = String(data: data, encoding: .utf8) else {
+    let value = MiniCPMJSONValue.object(object)
+    let data = try JSONEncoder().encode(value)
+    guard let wire = String(data: data, encoding: .utf8) else {
         throw MiniCPMDemoBackendError.engine("failed to encode backend event")
     }
-    return value
+    return (wire, value)
 }
 
 private func writeMiniCPMDemoError(outbound: MiniCPMDemoOutboundChannel, message: String) async throws {
@@ -1171,15 +1176,7 @@ private extension Data {
     }
 }
 
-private enum MiniCPMDemoWireRecordingSupport {
-    static func requestValue(_ request: MiniCPMDemoRequest) throws -> MiniCPMJSONValue {
-        try requestValueAndEncodedByteCount(request).value
-    }
-
-    static func requestEncodedByteCount(_ request: MiniCPMDemoRequest) throws -> Int {
-        try requestValueAndEncodedByteCount(request).encodedBytes
-    }
-
+enum MiniCPMDemoWireRecordingSupport {
     static func requestValueAndEncodedByteCount(
         _ request: MiniCPMDemoRequest
     ) throws -> (value: MiniCPMJSONValue, encodedBytes: Int) {

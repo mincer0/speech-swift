@@ -232,7 +232,9 @@ final class MiniCPMEncoderAttention: Module {
                 key: keys,
                 value: values,
                 additiveMask: additiveMask,
-                captureIntermediates: tracePrefix != nil
+                // Layers supply their prefix even during ordinary inference.
+                // Only a trace consumer needs the two additional graph outputs.
+                captureIntermediates: tracePrefix != nil && trace != nil
             )
             scores = result.scores
             probabilities = result.probabilities
