@@ -487,6 +487,31 @@ def _safe_event_snapshot(event: Mapping[str, Any]) -> dict[str, Any]:
     return redact(event)
 
 
+def _event_is_silent_audio(event: Mapping[str, Any]) -> bool:
+    """Return the explicit wire marker for clock-only listen PCM."""
+
+    return str(event.get("kind") or "") == "audio" and event.get("silent") is True
+
+
+def _trim_output_padding(payload: bytes, event: Mapping[str, Any]) -> bytes:
+    metrics = event.get("metrics")
+    padding = metrics.get("audio_padding_samples") if isinstance(metrics, Mapping) else None
+    if (
+        not isinstance(padding, (int, float))
+        or isinstance(padding, bool)
+        or not math.isfinite(padding)
+    ):
+        return payload
+    samples = max(0, min(len(payload) // INPUT_SAMPLE_BYTES, int(padding)))
+    return payload[samples * INPUT_SAMPLE_BYTES :]
+
+
+@dataclass(frozen=True)
+class InputOwnership:
+    phase: str
+    turn: TurnResult | None
+
+
 class EventObserver:
     """Protocol/event state machine shared by the network runner and tests."""
 
@@ -505,25 +530,29 @@ class EventObserver:
         self.all_metrics: list[dict[str, Any]] = []
         self.all_kv_cache_lengths: list[int] = []
         self.interrupt_traces: list[dict[str, Any]] = []
-        # The realtime endpoint deliberately does not expose the internal
-        # ``input.accepted``/``input.committed`` events.  Every official
-        # response delta still carries the input_id that caused it, so the
-        # probe can use the first terminal output for that input as a bounded
-        # application-level acknowledgement.  This keeps a slow model from
-        # being flooded by one-second silence packets while preserving the
-        # server's explicit queue-full failure as evidence.
+        # Register ownership before sending: reception time cannot identify a
+        # turn when delayed output arrives after the next question starts.
+        # A response keeps its original owner across different input IDs,
+        # including server-driven continuation units.
+        self._input_ownership: dict[str, InputOwnership] = {}
+        self._response_ownership: dict[str, InputOwnership] = {}
+        self._requires_committed_ids: set[str] = set()
         self._input_ack_events: dict[str, asyncio.Event] = {}
         self._acknowledged_input_ids: set[str] = set()
+        self._committed_input_ids: set[str] = set()
         self.input_acknowledgements: list[dict[str, Any]] = []
         self.input_pacing_fallbacks: list[dict[str, Any]] = []
-        # Full-duplex reality: the model can close the *previous* response
-        # while this window's question is still streaming, and it may keep
-        # speaking (or stream server-driven continuation units) just after a
-        # boundary.  ``last_completed_turn`` lets those deltas attach to the
-        # conversation instead of being misread as stale unsolicited output.
+        # Retained for reporting; ownership is resolved from registered IDs,
+        # never from whichever turn happened to complete most recently.
         self.last_completed_turn: TurnResult | None = None
 
-    def register_input(self, input_id: str) -> asyncio.Event:
+    def register_input(
+        self,
+        input_id: str,
+        *,
+        phase: str | None = None,
+        require_committed: bool = False,
+    ) -> asyncio.Event:
         """Register an input before its frame is sent.
 
         Registration happens before ``send`` because a local WebSocket test
@@ -531,8 +560,18 @@ class EventObserver:
         response before the awaiter is installed.
         """
 
+        phase = phase or ("turn" if self.current is not None else "unrequested")
+        owner = None if phase in {"initial_silence", "post_silence"} else self.current
+        self._input_ownership[input_id] = InputOwnership(phase, owner)
+        if require_committed:
+            self._requires_committed_ids.add(input_id)
         flag = asyncio.Event()
-        if input_id in self._acknowledged_input_ids:
+        acknowledged = (
+            input_id in self._committed_input_ids
+            if require_committed
+            else input_id in self._acknowledged_input_ids
+        )
+        if acknowledged:
             flag.set()
         else:
             self._input_ack_events[input_id] = flag
@@ -544,12 +583,11 @@ class EventObserver:
             return
         event_type = str(event.get("type") or "")
         kind = str(event.get("kind") or "")
-        # ``audio`` is the last normal output delta for the native engine;
-        # ``listen`` is the only delta for a buffered/idle packet and the
-        # explicit end marker for a completed turn.  response.done covers
-        # turn-based adapters.  A text-only adapter has no later marker, so
-        # retain text as a fallback acknowledgement as well.
+        # ``input.committed`` also covers valid inputs with no model delta.
+        # Older endpoints can acknowledge ordinary inputs with their terminal
+        # delta. Text alone is never terminal: audio or a boundary may follow.
         if event_type == "input.committed":
+            self._committed_input_ids.add(input_id)
             self._acknowledged_input_ids.add(input_id)
             flag = self._input_ack_events.pop(input_id, None)
             if flag is not None:
@@ -562,8 +600,10 @@ class EventObserver:
                     "monotonic": round(time.monotonic(), 6),
                 }
             )
-        elif event_type == "response.done" or event_type == "response.output.delta":
-            if kind in {"audio", "listen", "text"} or event_type == "response.done":
+        elif input_id not in self._requires_committed_ids and (
+            event_type == "response.done" or event_type == "response.output.delta"
+        ):
+            if kind in {"audio", "listen"} or event_type == "response.done":
                 self._acknowledged_input_ids.add(input_id)
                 flag = self._input_ack_events.pop(input_id, None)
                 if flag is not None:
@@ -576,6 +616,23 @@ class EventObserver:
                         "monotonic": round(time.monotonic(), 6),
                     }
                 )
+
+    def _output_owner(self, event: Mapping[str, Any]) -> InputOwnership:
+        response_id = event.get("response_id")
+        if isinstance(response_id, str) and response_id in self._response_ownership:
+            return self._response_ownership[response_id]
+        input_id = event.get("input_id")
+        if isinstance(input_id, str) and input_id:
+            owner = self._input_ownership.get(
+                input_id, InputOwnership("unregistered_input", None)
+            )
+        else:
+            # Legacy adapters omit IDs; preserve their single-current-turn
+            # behavior. Explicit unknown IDs never inherit the current turn.
+            owner = InputOwnership("unattributed", self.current)
+        if isinstance(response_id, str) and response_id:
+            self._response_ownership[response_id] = owner
+        return owner
 
     def log(self, direction: str, event: str, **fields: Any) -> None:
         self.timeline.append(
@@ -626,6 +683,12 @@ class EventObserver:
             self.server_mode = str(event.get("mode") or "") or None
             self.session_created.set()
             return
+        if event_type == "input.committed":
+            self._acknowledge_input(event)
+            input_id = str(event.get("input_id") or "")
+            owner = self._input_ownership.get(input_id)
+            self._record_metrics(event, owner.turn if owner is not None else None)
+            return
         if event_type == "session.closed":
             self.session_closed.set()
             if self.current is not None and not self.current.done.is_set():
@@ -667,13 +730,19 @@ class EventObserver:
             return
         if event_type == "response.done":
             self._acknowledge_input(event)
-            turn = self.current
+            owner = self._output_owner(event)
+            turn = owner.turn
             if turn is None:
-                self.unsolicited_outputs.append({"kind": "done", "event": snapshot})
+                self._record_metrics(event, None)
+                self.unsolicited_outputs.append(
+                    {"kind": "done", "phase": owner.phase, "event": snapshot}
+                )
                 return
             self._record_metrics(event, turn)
             turn.end_boundaries.append(snapshot)
             turn.saw_end_boundary = True
+            if turn.done.is_set():
+                return
             turn.completion_reason = "response_done"
             turn.completed_at = time.monotonic()
             turn.done.set()
@@ -684,27 +753,23 @@ class EventObserver:
 
         self._acknowledge_input(event)
 
-        turn = self.current
+        owner = self._output_owner(event)
+        turn = owner.turn
         kind = str(event.get("kind") or "")
         if turn is None:
+            self._record_metrics(event, None)
+            if kind == "audio" and _event_is_silent_audio(event):
+                # Listen PCM is a clock marker. Validate and acknowledge it,
+                # but do not count it as unsolicited speech.
+                try:
+                    self._decode_output_audio(event)
+                except ValueError as exc:
+                    self.unsolicited_outputs.append(
+                        {"kind": kind, "phase": owner.phase, "event": snapshot, "error": str(exc)}
+                    )
+                return
             if kind in {"text", "audio"}:
-                if self.last_completed_turn is not None:
-                    # Trailing model speech after a completed boundary (and
-                    # server-driven cont_* continuation units) is normal
-                    # full-duplex output, not stale/cross-turn leakage.
-                    # Genuine stale repeats are still caught by the
-                    # repeated-text audit below and by the barge-in turns.
-                    last = self.last_completed_turn
-                    last.events.append(snapshot)
-                    if kind == "text" and str(event.get("text") or ""):
-                        last.add_text(str(event.get("text")), event=snapshot)
-                    elif kind == "audio":
-                        try:
-                            last.audio_parts.append(self._decode_output_audio(event))
-                        except ValueError:
-                            pass
-                    return
-                item = {"kind": kind, "event": snapshot}
+                item = {"kind": kind, "phase": owner.phase, "event": snapshot}
                 if kind == "audio":
                     try:
                         item["audio_bytes"] = len(self._decode_output_audio(event))
@@ -732,6 +797,11 @@ class EventObserver:
                 turn.completed_at = time.monotonic()
                 turn.done.set()
                 return
+            if _event_is_silent_audio(event):
+                return
+            audio = _trim_output_padding(audio, event)
+            if not audio:
+                return
             turn.audio_parts.append(audio)
             if turn.first_audio_at is None:
                 turn.first_audio_at = time.monotonic()
@@ -751,6 +821,8 @@ class EventObserver:
                 "end_of_turn",
                 "response_done",
             }:
+                if turn.done.is_set():
+                    return
                 if turn.first_text_at is None and turn.first_audio_at is None:
                     # The boundary closes the *previous* response, which
                     # overlapped into this window while the question was
@@ -779,9 +851,11 @@ class EventObserver:
         if len(payload) % INPUT_SAMPLE_BYTES:
             raise ValueError("audio output Float32 byte length is not divisible by four")
         try:
-            decode_float32_pcm(payload)
+            samples = decode_float32_pcm(payload)
         except ValueError as exc:
             raise ValueError(f"invalid output Float32 PCM: {exc}") from exc
+        if _event_is_silent_audio(event) and any(sample != 0 for sample in samples):
+            raise ValueError("silent audio marker contains nonzero PCM")
         sample_rate = event.get("sample_rate", OUTPUT_RATE)
         if sample_rate != OUTPUT_RATE:
             raise ValueError(f"audio output sample_rate must be {OUTPUT_RATE}, got {sample_rate!r}")
@@ -793,6 +867,17 @@ class EventObserver:
 
 def _acknowledgement_only(text: str) -> bool:
     return normalize_text(text) in {"好的", "好", "收到", "ok", "okay", "明白"}
+
+
+def _persist_turn_artifacts(turn: TurnResult, output: Path) -> None:
+    answer = Path(turn.audio_path) if turn.audio_path else output / f"answer-{turn.number:02d}.wav"
+    # Failed turns still need a readable artifact and a complete JSON report.
+    # The placeholder is not added to turn.audio or counted as model speech.
+    write_float32_wav(answer, turn.audio or encode_float32_pcm([0.0]), OUTPUT_RATE)
+    turn.audio_path = str(answer)
+    (output / f"turn-{turn.number:02d}.json").write_text(
+        json.dumps(turn.summary(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def validate_report(
@@ -982,18 +1067,21 @@ class NativeDuplexProbe:
         timeout: float | None = None,
         speech_active: bool = False,
         continuation_tick: bool = False,
+        phase: str | None = None,
+        require_committed: bool = False,
     ) -> None:
         """Send one packet and wait until the server has consumed it.
 
-        The wire protocol has no separate input acknowledgement.  A matching
-        official output delta is the observable completion point for one
-        backend transaction.  We wait for it for one packet interval, but a
-        legal empty unit may produce no output at all; that case advances only
-        after the same bounded interval and is recorded in the report.
+        The public input.committed event also covers empty model units.
+        Ordinary inputs support terminal output acknowledgements from older
+        endpoints; startup silence requires the explicit commit event so it
+        cannot enter the first question while startup generation is pending.
         """
 
         await self._pace_next_packet()
-        acknowledgement = self.observer.register_input(input_id)
+        acknowledgement = self.observer.register_input(
+            input_id, phase=phase, require_committed=require_committed
+        )
         allow_sampled_decision = self._allow_sampled_decision(speech_active)
         await self.send_json(
             build_input_append(
@@ -1013,7 +1101,7 @@ class NativeDuplexProbe:
         # cross a turn_end boundary and become the first inputs of the next
         # turn.  Keep the wait bounded by the turn deadline, but otherwise use
         # the existing service budget rather than the transport cadence.
-        ack_budget = min(timeout, self.acknowledgement_timeout)
+        ack_budget = timeout if require_committed else min(timeout, self.acknowledgement_timeout)
         try:
             await self.wait_for(
                 acknowledgement,
@@ -1028,17 +1116,19 @@ class NativeDuplexProbe:
             # no budget left and remains a hard failure.
             if self.observer.fatal_error:
                 raise RuntimeError(self.observer.fatal_error)
-            if timeout <= self.packet_seconds + 1e-6:
+            if require_committed or timeout <= self.packet_seconds + 1e-6:
                 self.observer.log(
                     "probe",
                     "input_backpressure_timeout",
                     input_id=input_id,
-                    timeout_seconds=timeout,
+                    phase=phase,
+                    timeout_seconds=ack_budget,
+                    required_event="input.committed" if require_committed else "terminal_output",
                 )
                 raise
             fallback = {
                 "input_id": input_id,
-                "wait_seconds": self.packet_seconds,
+                "wait_seconds": ack_budget,
                 "monotonic": round(time.monotonic(), 6),
             }
             self.observer.input_pacing_fallbacks.append(fallback)
@@ -1048,11 +1138,12 @@ class NativeDuplexProbe:
         # settlement window so finish_turn observes that boundary before it
         # decides to enqueue another silence packet.
         await asyncio.sleep(min(0.05, max(0.0, timeout)))
-        self.observer.log(
-            "probe",
-            "input_acknowledged",
-            input_id=input_id,
-        )
+        if acknowledgement.is_set():
+            self.observer.log(
+                "probe",
+                "input_acknowledged",
+                input_id=input_id,
+            )
 
     async def wait_for(self, flag: asyncio.Event, timeout: float, label: str) -> None:
         try:
@@ -1079,6 +1170,8 @@ class NativeDuplexProbe:
                 input_id=input_id,
                 timeout=timeout,
                 speech_active=speech_active,
+                phase=label,
+                require_committed=label == "initial_silence",
             )
 
     async def finish_turn(
@@ -1117,18 +1210,13 @@ class NativeDuplexProbe:
             turn.completion_reason = "timeout"
             turn.completed_at = time.monotonic()
             turn.done.set()
-        self.last_completed_turn = turn
+        self.observer.last_completed_turn = turn
         if self.observer.fatal_error and not turn.error:
             turn.error = self.observer.fatal_error
             turn.completion_reason = "receiver_error"
         await asyncio.sleep(0.15)
-        answer = self.output / f"answer-{turn.number:02d}.wav"
-        write_float32_wav(answer, turn.audio or encode_float32_pcm([0.0]), OUTPUT_RATE)
-        turn.audio_path = str(answer)
+        _persist_turn_artifacts(turn, self.output)
         summary = turn.summary()
-        (self.output / f"turn-{turn.number:02d}.json").write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
         self.observer.log("probe", "turn_finished", summary=summary)
 
     async def run_turn(self, number: int, question: str, payload: bytes, *, timeout: float) -> TurnResult:
@@ -1165,10 +1253,12 @@ class NativeDuplexProbe:
         packet_index = 0
         while not first.audio_started.is_set() and time.monotonic() < onset_deadline:
             packet_index += 1
+            input_id = f"barge_first_silence_{packet_index:04d}"
+            self.observer.register_input(input_id, phase="barge_first")
             await self.send_json(
                 build_input_append(
                     SILENCE_PACKET,
-                    input_id=f"barge_first_silence_{packet_index:04d}",
+                    input_id=input_id,
                     speech_active=False,
                     allow_sampled_decision=self._allow_sampled_decision(False),
                 )
@@ -1317,6 +1407,7 @@ async def run_probe(args: argparse.Namespace) -> int:
                         encode_float32_pcm([0.0] * int(INPUT_RATE * args.silence_seconds)),
                         label="initial_silence",
                         speech_active=False,
+                        deadline=time.monotonic() + args.turn_timeout,
                     )
                 if args.barge_in:
                     turns.extend(
@@ -1369,6 +1460,12 @@ async def run_probe(args: argparse.Namespace) -> int:
         probe.observer.fatal_error = str(exc)
     finally:
         assert probe is not None
+        # Late continuation deltas can arrive after finish_turn persisted its
+        # first snapshot. Keep the WAV and per-turn JSON aligned with the
+        # final report after the receiver has stopped.
+        for turn in turns:
+            if turn.audio_path:
+                _persist_turn_artifacts(turn, output)
         failures = validate_report(mode, questions, turns, probe.observer)
         if not probe.observer.session_closed.is_set():
             failures.append("missing session.closed")

@@ -1,0 +1,11 @@
+{
+  "oracle_backend": "pytorch_mps_weight_norm",
+  "torch_version": "2.8.0",
+  "torch_git_version": "a1cb3cc05d46d198467bebbb6e8fba50a325d4e7",
+  "direction_shape": [
+    3,
+    768
+  ],
+  "dtype": "bfloat16",
+  "dim": 0
+}

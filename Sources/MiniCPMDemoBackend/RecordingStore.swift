@@ -116,6 +116,7 @@ public actor MiniCPMDemoRecordingService {
 
     private let streamURL: URL
     private let blobsURL: URL
+    private var streamHandle: FileHandle?
     private var nextSequence: Int64 = 0
     private var closed = false
 
@@ -143,6 +144,8 @@ public actor MiniCPMDemoRecordingService {
         }
     }
 
+    deinit { try? streamHandle?.close() }
+
     public func append(
         direction: MiniCPMDemoRecordingDirection,
         frame: MiniCPMJSONValue,
@@ -165,11 +168,21 @@ public actor MiniCPMDemoRecordingService {
         }
         try ensureWriteCapacity(additional: Int64(data.count))
         do {
-            let handle = try FileHandle(forWritingTo: streamURL)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data)
-            try handle.synchronize()
+            // Snapshot readers must not need write permission. Open lazily
+            // on the first append, then retain this actor's single writer.
+            if streamHandle == nil {
+                let handle = try FileHandle(forWritingTo: streamURL)
+                do {
+                    try handle.seekToEnd()
+                } catch {
+                    try? handle.close()
+                    throw error
+                }
+                streamHandle = handle
+            }
+            // Write each complete event before returning. Hardware flushes
+            // belong at close, not between audio packets on the live path.
+            try streamHandle!.write(contentsOf: data)
         } catch {
             throw MiniCPMDemoServiceError.persistence("append stream.jsonl: \(error.localizedDescription)")
         }
@@ -242,7 +255,12 @@ public actor MiniCPMDemoRecordingService {
     }
 
     public func close() throws {
+        guard !closed else { return }
         closed = true
+        let handle = streamHandle
+        streamHandle = nil
+        defer { try? handle?.close() }
+        try handle?.synchronize()
     }
 
     public func isClosed() -> Bool { closed }
@@ -381,12 +399,19 @@ public actor MiniCPMDemoWireRecordingSession {
         _ = try await store.create(metadata)
     }
 
-    public func record(direction: MiniCPMDemoRecordingDirection, frame: MiniCPMJSONValue) async {
+    /// Preserve the transport timestamp even when media externalization or
+    /// recorder attachment happens later.
+    public func record(
+        direction: MiniCPMDemoRecordingDirection,
+        frame: MiniCPMJSONValue,
+        timestamp: Date = Date()
+    ) async {
         guard enabled, !closed else { return }
         do {
             let canonical = try await externalize(
                 frame, sampleRate: direction == .down ? 24_000 : 16_000)
-            _ = try await store.appendEvent(sessionID: sessionID, direction: direction, frame: canonical)
+            _ = try await store.appendEvent(
+                sessionID: sessionID, direction: direction, frame: canonical, timestamp: timestamp)
         } catch {
             // Recorder I/O is deliberately not allowed to tear down a model
             // stream. Disable subsequent writes after a capacity/disk error.

@@ -126,6 +126,9 @@ public struct MiniCPMDemoEvent: Codable, Sendable, Equatable {
     public var audio: String?
     public var format: String?
     public var sampleRate: Int?
+    /// True for transport audio emitted while the model is listening. The
+    /// samples keep the playback clock aligned, but are not spoken output.
+    public var silent: Bool?
     public var reason: String?
     public var metrics: [String: MiniCPMJSONValue]?
     public var state: String?
@@ -142,6 +145,7 @@ public struct MiniCPMDemoEvent: Codable, Sendable, Equatable {
         case inputID = "input_id"
         case kind, text, audio, format
         case sampleRate = "sample_rate"
+        case silent
         case reason, metrics, state, error
     }
 
@@ -158,6 +162,7 @@ public struct MiniCPMDemoEvent: Codable, Sendable, Equatable {
         self.audio = payload["audio"]?.stringValue
         self.format = payload["format"]?.stringValue
         self.sampleRate = payload["sample_rate"]?.numberValue.map(Int.init)
+        self.silent = payload["silent"]?.boolValue
         self.reason = payload["reason"]?.stringValue
         self.metrics = payload["metrics"]?.objectValue
         self.state = payload["state"]?.stringValue

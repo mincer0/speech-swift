@@ -896,15 +896,23 @@ final class E2EMiniCPMLLMGoldenTests: XCTestCase {
             let name = try fixture.stringValue(item, "name")
             let logits = try fixture.floatArray(try fixture.stringValue(item, "logits"))
             let mode = try fixture.stringValue(item, "mode")
+            let policyName = item["repetition_policy"] as? String ?? "hugging_face"
+            guard let policy = MiniCPMSamplingConfig.RepetitionPolicy(rawValue: policyName) else {
+                throw MiniCPMLLMGoldenFixture.FixtureError.invalid(
+                    "unsupported sampler repetition policy \(policyName)")
+            }
             let config = MiniCPMSamplingConfig(
                 mode: mode == "greedy" ? .greedy : .sampling,
                 temperature: try fixture.floatValue(item, "temperature"),
                 topK: try fixture.intValue(item, "top_k"),
                 topP: try fixture.floatValue(item, "top_p"),
                 repetitionPenalty: try fixture.floatValue(item, "repetition_penalty"),
+                repetitionWindowSize: (item["repetition_window_size"] as? NSNumber)?.intValue ?? 512,
+                repetitionPolicy: policy,
                 lengthPenalty: try fixture.floatValue(item, "length_penalty"),
                 listenTopK: try fixture.optionalIntValue(item, "listen_top_k"),
-                listenProbabilityScale: try fixture.floatValue(item, "listen_probability_scale"))
+                listenProbabilityScale: try fixture.floatValue(item, "listen_probability_scale"),
+                suppressNaturalChunkEOS: item["suppress_natural_chunk_eos"] as? Bool ?? false)
             let forbidden = try fixture.intValues(item, "forbidden")
             let previous = try fixture.intValues(item, "previous_tokens")
             let uniforms = try fixture.floatValues(item, "uniforms")

@@ -197,6 +197,8 @@ final class MiniCPMDuplexRuntimeTests: XCTestCase {
         let defaults = MiniCPMDuplexConfig(maxNewTokens: 3)
         XCTAssertEqual(defaults.forceListenCount, 0)
         XCTAssertEqual(defaults.topK, 20)
+        XCTAssertEqual(defaults.temperature, 0.7)
+        XCTAssertEqual(defaults.topP, 0.8)
 
         let ids = protocolIDs()
         let config = MiniCPMDuplexConfig(maxNewTokens: 3, forceListenCount: 3)
@@ -240,6 +242,16 @@ final class MiniCPMDuplexRuntimeTests: XCTestCase {
             currentTurnEnded: false,
             configuredGreedy: true,
             allowSampledDecision: false))
+        XCTAssertTrue(MiniCPMNativeDuplexEngine.shouldUseGreedyListenSpeakDecision(
+            currentTurnEnded: false,
+            configuredGreedy: true,
+            allowSampledDecision: false,
+            speechActive: true))
+        XCTAssertFalse(MiniCPMNativeDuplexEngine.shouldUseGreedyListenSpeakDecision(
+            currentTurnEnded: false,
+            configuredGreedy: true,
+            allowSampledDecision: true,
+            speechActive: true))
     }
 
     func testResponseStarvationGuardIgnoresStartupSilence() {
@@ -429,72 +441,134 @@ final class MiniCPMDuplexRuntimeTests: XCTestCase {
             1)
     }
 
-    func testCancelledMultiUnitTurnRestoresBeforeForcedListenFence() {
+    func testCancelPreservesAcceptedQuestionAndAnswerAcrossMultipleUnits() {
         let ids = protocolIDs()
         let config = MiniCPMDuplexConfig(maxNewTokens: 4, forceListenCount: 0)
         var state = MiniCPMDuplexProtocolState()
-        let turnStart = state
 
-        // A real streamed question may already have several accepted listen
-        // units before the first spoken response becomes provisional.
+        // The accepted question may span several listen units. A normal
+        // cancel must preserve it for a later "continue what you were saying".
         for _ in 0 ..< 3 {
             _ = state.beginUnit()
             _ = state.beginGeneration(config: config)
-            let listen = state.consume(
-                sampledToken: ids.listen,
-                index: 0,
-                tokens: ids,
-                config: config)
-            XCTAssertTrue(listen.isListen)
+            _ = state.consume(sampledToken: ids.listen, index: 0, tokens: ids, config: config)
             state.commitUnit(unitEndID: ids.unitEnd)
         }
-
-        // The response contains an old-turn token, but is not committed when
-        // cancel arrives.  The turn-scope checkpoint must remove both this
-        // provisional response and the earlier accepted input units.
         _ = state.beginUnit()
         _ = state.beginGeneration(config: config)
-        _ = state.consume(
-            sampledToken: ids.speak,
-            index: 0,
-            tokens: ids,
-            config: config)
-        let oldIntent = state.consume(
-            sampledToken: 42,
-            index: 1,
-            tokens: ids,
-            config: config)
-        XCTAssertFalse(oldIntent.isListen)
-        XCTAssertTrue(state.totalIDs.contains(42))
+        _ = state.consume(sampledToken: ids.speak, index: 0, tokens: ids, config: config)
+        _ = state.consume(sampledToken: 42, index: 1, tokens: ids, config: config)
+        _ = state.finishAtLimit(index: 3, tokens: ids, config: config)
+        state.commitUnit(unitEndID: ids.unitEnd)
+        let acceptedIDs = state.totalIDs
+        let acceptedUnitCount = state.unitIndex
 
-        // This is the engine's active-turn restore, not the narrower
-        // per-unit rollback.  No old input or response token may survive.
-        state = turnStart
-        XCTAssertTrue(state.totalIDs.isEmpty)
-        XCTAssertFalse(state.responseIDs.contains(42))
-        XCTAssertEqual(state.generateCount, 0)
+        // Only this unaccepted continuation is rolled back. The last
+        // accepted chunk's terminator is then replaced by a canonical end.
+        _ = state.beginUnit()
+        _ = state.beginGeneration(config: config)
+        _ = state.consume(sampledToken: ids.speak, index: 0, tokens: ids, config: config)
+        _ = state.consume(sampledToken: 43, index: 1, tokens: ids, config: config)
+        XCTAssertTrue(state.rollbackUnit())
+        XCTAssertTrue(state.closeInterruptedTurn(
+            turnEOS: ids.turnEOS, unitEnd: ids.unitEnd, force: true))
+        XCTAssertEqual(state.totalIDs, Array(acceptedIDs.dropLast(2)) + [ids.turnEOS, ids.unitEnd])
+        XCTAssertEqual(state.unitIndex, acceptedUnitCount)
+        XCTAssertTrue(state.responseIDs.contains(42))
+        XCTAssertFalse(state.responseIDs.contains(43))
+        XCTAssertTrue(state.currentTurnEnded)
+        XCTAssertFalse(state.closeInterruptedTurn(
+            turnEOS: ids.turnEOS, unitEnd: ids.unitEnd, force: true))
 
         _ = state.beginUnit()
         _ = state.beginGeneration(config: config, forceListenOverride: true)
-        let fence = state.consume(
-            sampledToken: 42,
-            index: 0,
-            tokens: ids,
-            config: config)
-        XCTAssertTrue(fence.isListen)
+        XCTAssertTrue(state.consume(
+            sampledToken: 43, index: 0, tokens: ids, config: config).isListen)
         state.commitUnit(unitEndID: ids.unitEnd)
+        XCTAssertTrue(state.responseIDs.contains(42))
+        XCTAssertFalse(state.responseIDs.contains(43))
+    }
 
-        // The following input is free to begin a new answer; it must not be
-        // coerced into the cancelled response or inherit its generated IDs.
+    func testQualifiedBargeInPreservesAcceptedHistoryAndClosesBeforeListen() {
+        let ids = protocolIDs()
+        let config = MiniCPMDuplexConfig(maxNewTokens: 4, forceListenCount: 0)
+        var state = MiniCPMDuplexProtocolState()
         _ = state.beginUnit()
         _ = state.beginGeneration(config: config)
-        let next = state.consume(
-            sampledToken: ids.speak,
-            index: 0,
-            tokens: ids,
-            config: config)
-        XCTAssertFalse(next.isListen)
-        XCTAssertFalse(state.generatedIDs.contains(42))
+        _ = state.consume(sampledToken: ids.speak, index: 0, tokens: ids, config: config)
+        _ = state.consume(sampledToken: 42, index: 1, tokens: ids, config: config)
+        _ = state.finishAtLimit(index: 3, tokens: ids, config: config)
+        state.commitUnit(unitEndID: ids.unitEnd)
+        let acceptedIDs = state.totalIDs
+
+        // Qualify an onset independently of model token rank. The encoded
+        // microphone unit and accepted question/answer must survive the cut.
+        var policy = MiniCPMBargeInPolicy()
+        let decision = policy.observe(
+            audio: [Float](repeating: 0.03, count: 16_000),
+            sampleRate: 16_000, answerOpen: !state.currentTurnEnded)
+        XCTAssertTrue(decision.interrupt)
+        _ = state.beginUnit()
+        XCTAssertTrue(state.beginGeneration(config: config, forceListenOverride: decision.forceListen))
+        XCTAssertTrue(state.closeTurnForForcedListen(turnEOS: ids.turnEOS))
+        let listen = state.consume(
+            sampledToken: ids.listen, index: 0, tokens: ids, config: config)
+        XCTAssertTrue(listen.isListen)
+        XCTAssertFalse(listen.collectForTTS)
+        state.commitUnit(unitEndID: ids.unitEnd)
+        XCTAssertEqual(state.totalIDs, acceptedIDs + [ids.turnEOS, ids.listen, ids.unitEnd])
+        XCTAssertTrue(state.currentTurnEnded)
+        XCTAssertTrue(state.responseIDs.contains(42))
+    }
+
+    func testBufferedTailBargeInPreservesEndedTurnWithoutDuplicateTurnEOS() {
+        let ids = protocolIDs()
+        let config = MiniCPMDuplexConfig(maxNewTokens: 4, forceListenCount: 0)
+        var state = MiniCPMDuplexProtocolState()
+        _ = state.beginUnit()
+        _ = state.beginGeneration(config: config)
+        _ = state.consume(sampledToken: ids.speak, index: 0, tokens: ids, config: config)
+        _ = state.consume(sampledToken: 42, index: 1, tokens: ids, config: config)
+        _ = state.consume(sampledToken: ids.turnEOS, index: 2, tokens: ids, config: config)
+        state.commitUnit(unitEndID: ids.unitEnd)
+        XCTAssertTrue(state.currentTurnEnded)
+        let acceptedIDs = state.totalIDs
+        var policy = MiniCPMBargeInPolicy()
+        let decision = policy.observe(
+            audio: [Float](repeating: 0.03, count: 16_000), sampleRate: 16_000,
+            answerOpen: !state.currentTurnEnded, playbackActive: true)
+        XCTAssertTrue(decision.interrupt)
+        _ = state.beginUnit()
+        XCTAssertTrue(state.beginGeneration(config: config, forceListenOverride: decision.forceListen))
+        XCTAssertFalse(state.closeTurnForForcedListen(turnEOS: ids.turnEOS))
+        XCTAssertTrue(state.consume(
+            sampledToken: ids.listen, index: 0, tokens: ids, config: config).isListen)
+        state.commitUnit(unitEndID: ids.unitEnd)
+        XCTAssertEqual(state.totalIDs, acceptedIDs + [ids.listen, ids.unitEnd])
+    }
+
+    func testImplicitListenRankDoesNotCutAnOpenAnswer() {
+        let ids = protocolIDs()
+        let config = MiniCPMDuplexConfig(maxNewTokens: 4, forceListenCount: 0)
+        XCTAssertNil(config.listenTopK)
+        var state = MiniCPMDuplexProtocolState()
+        _ = state.beginUnit()
+        _ = state.beginGeneration(config: config)
+        _ = state.consume(sampledToken: ids.speak, index: 0, tokens: ids, config: config)
+        _ = state.finishAtLimit(index: 3, tokens: ids, config: config)
+        state.commitUnit(unitEndID: ids.unitEnd)
+        // Even a sampled listen cannot erase the answer without qualified
+        // sustained input. A brief activity flag is not that qualification.
+        var policy = MiniCPMBargeInPolicy()
+        let decision = policy.observe(
+            audio: [Float](repeating: 0.004, count: 16_000),
+            sampleRate: 16_000, answerOpen: true)
+        XCTAssertFalse(decision.interrupt)
+        _ = state.beginUnit()
+        _ = state.beginGeneration(config: config, forceListenOverride: decision.forceListen)
+        let step = state.consume(sampledToken: ids.listen, index: 0, tokens: ids, config: config)
+        XCTAssertFalse(step.isListen)
+        XCTAssertFalse(state.currentTurnEnded)
     }
 
     func testCharacterLimitDefersChunkEOSWithoutFeedingIt() {
@@ -756,6 +830,25 @@ final class MiniCPMDuplexRuntimeTests: XCTestCase {
         }
     }
 
+    func testAudioPaddingMetadataSurvivesRuntimeGeneration() async throws {
+        let engine = RecordingEngine()
+        engine.output = MiniCPMDuplexOutput(
+            text: "hello", audio: [0, 0, 0.25, -0.25],
+            audioPaddingSamples: 2, endOfTurn: false,
+            needsFinalize: true, finishReason: "chunk")
+        let runtime = MiniCPMDuplexRuntime(engineFactory: { engine })
+        _ = try await runtime.prepare(sessionID: "padding", mode: .fullDuplex)
+        _ = try await runtime.prefill(
+            MiniCPMDuplexInput(text: "hello"), sessionID: "padding")
+
+        let output = try await runtime.generate(sessionID: "padding")
+        XCTAssertEqual(output.audio, engine.output.audio)
+        XCTAssertEqual(output.audioPaddingSamples, 2)
+        XCTAssertTrue(output.needsFinalize)
+        XCTAssertFalse(output.endOfTurn)
+        try await runtime.finalize(sessionID: "padding")
+    }
+
     func testDeferredFinalizeAndPerSessionKVBoundary() async throws {
         var engines: [RecordingEngine] = []
         let runtime = MiniCPMDuplexRuntime {
@@ -785,6 +878,43 @@ final class MiniCPMDuplexRuntimeTests: XCTestCase {
         _ = try await runtime.prefill(MiniCPMDuplexInput(text: "next"), sessionID: "a")
         XCTAssertEqual(engines.count, 1)
         XCTAssertEqual(engines[0].events, ["prepare:half_duplex", "window:nil", "prefill:half_duplex", "generate:half_duplex", "finalize", "prefill:half_duplex"])
+    }
+
+    func testCancelBetweenGenerateAndFinalizeRejectsStaleAcceptance() async throws {
+        let engine = RecordingEngine()
+        engine.output = MiniCPMDuplexOutput(text: "stale", endOfTurn: false)
+        let runtime = MiniCPMDuplexRuntime(engineFactory: { engine })
+        _ = try await runtime.prepare(sessionID: "acceptance-race", mode: .fullDuplex)
+        _ = try await runtime.prefill(
+            MiniCPMDuplexInput(text: "original question"), sessionID: "acceptance-race")
+        _ = try await runtime.generate(sessionID: "acceptance-race")
+
+        // The transport has returned from generation and is about to accept
+        // it when cancellation arrives through the nonisolated registry.
+        runtime.requestInterrupt(sessionID: "acceptance-race")
+        try await runtime.finalize(sessionID: "acceptance-race")
+        XCTAssertFalse(engine.events.contains("finalize"))
+        XCTAssertEqual(Array(engine.events.suffix(2)), ["interrupt", "rollback"])
+        let cancelled = try await runtime.snapshot(sessionID: "acceptance-race")
+        XCTAssertTrue(cancelled.interrupted)
+        XCTAssertFalse(cancelled.prefetched)
+        XCTAssertFalse(cancelled.needsFinalize)
+        let diagnostic = try await runtime.diagnostics(sessionID: "acceptance-race")
+        XCTAssertEqual(diagnostic.staleOutputDiscardCount, 1)
+        XCTAssertNotNil(diagnostic.cancelRequestedAtNS)
+        XCTAssertNotNil(diagnostic.cancelReturnedAtNS)
+
+        // Repeated transport acceptance is harmless, and a new epoch can
+        // accept fresh input without rebuilding or resetting the session.
+        try await runtime.finalize(sessionID: "acceptance-race")
+        engine.output = MiniCPMDuplexOutput(text: "fresh", endOfTurn: false)
+        _ = try await runtime.prefill(
+            MiniCPMDuplexInput(text: "continue"), sessionID: "acceptance-race")
+        let fresh = try await runtime.generate(sessionID: "acceptance-race")
+        XCTAssertEqual(fresh.text, "fresh")
+        try await runtime.finalize(sessionID: "acceptance-race")
+        XCTAssertEqual(engine.events.filter { $0 == "finalize" }.count, 1)
+        XCTAssertFalse(engine.events.contains("reset"))
     }
 
     func testNonisolatedInterruptSignalStopsSynchronousGenerateAndNewEpochSurvives() async throws {

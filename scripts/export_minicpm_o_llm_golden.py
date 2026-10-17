@@ -499,7 +499,8 @@ def filtered_sample(
     scores = np.asarray(logits, dtype=np.float64) / max(float(temperature), 1e-6)
     order = np.argsort(-scores, kind="stable")
     if top_k > 0:
-        order = order[: min(int(top_k), order.size)]
+        threshold = scores[order[min(int(top_k), order.size) - 1]]
+        order = order[scores[order] >= threshold]
     ranked = scores[order]
     keep = np.ones(order.size, dtype=bool)
     if 0 < float(top_p) < 1:
@@ -524,16 +525,26 @@ def deterministic_sampler_case(
     top_k: int = 20,
     top_p: float = 0.8,
     repetition_penalty: float = 1.05,
+    repetition_policy: str = "hugging_face",
+    repetition_window_size: int = 512,
     length_penalty: float = 1.1,
     listen_top_k: int | None = None,
     listen_probability_scale: float = 1.0,
+    suppress_natural_chunk_eos: bool = False,
 ) -> tuple[int, int]:
-    """Numpy reference for ``MiniCPMSampler``'s two-stage draw order."""
+    """Explicit runtime-policy reference, not an invocation of PyTorch.
+
+    ``official_duplex`` follows the checkpoint's StreamDecoder.decode rules.
+    Its equivalence is checked against that source method in model-free tests.
+    ``hugging_face`` preserves the chat runtime's sign-aware text policy.
+    """
 
     if not uniforms:
         raise ValueError("sampler fixture needs at least one uniform")
+    if repetition_policy not in {"hugging_face", "official_duplex"}:
+        raise ValueError(f"unsupported repetition policy: {repetition_policy}")
     natural = filtered_sample(logits, uniform=uniforms[0], mode=mode, temperature=1, top_k=0, top_p=1)
-    if natural == protocol["chunk_eos"]:
+    if not suppress_natural_chunk_eos and natural == protocol["chunk_eos"]:
         return natural, 1 if mode != "greedy" else 0
 
     scores = np.asarray(logits, dtype=np.float64).copy()
@@ -545,11 +556,20 @@ def deterministic_sampler_case(
         for name in ("listen", "chunk_eos", "chunk_tts_eos", "turn_eos", "speak", "unit_end", "tts_bos")
         if name in protocol
     }
-    for token in set(int(item) for item in previous_tokens):
-        if 0 <= token < scores.size and token not in special and repetition_penalty != 1:
+    history = list(previous_tokens)
+    if repetition_window_size > 0:
+        history = history[-repetition_window_size:]
+    elif repetition_policy != "official_duplex" or repetition_window_size != 0:
+        history = []
+    for token in set(int(item) for item in history):
+        if not 0 <= token < scores.size or repetition_penalty == 1:
+            continue
+        if repetition_policy == "official_duplex":
             scores[token] = scores[token] / repetition_penalty if repetition_penalty > 1 else scores[token] * (1 / repetition_penalty)
+        elif token not in special:
+            scores[token] = scores[token] * repetition_penalty if scores[token] < 0 else scores[token] / repetition_penalty
     turn_eos = protocol["turn_eos"]
-    if length_penalty != 1 and np.isfinite(scores[turn_eos]):
+    if repetition_policy == "hugging_face" and length_penalty != 1 and np.isfinite(scores[turn_eos]):
         scores[turn_eos] = scores[turn_eos] / length_penalty if scores[turn_eos] > 0 else scores[turn_eos] * length_penalty
     listen = protocol["listen"]
     if listen_probability_scale != 1 and np.isfinite(scores[listen]):
@@ -561,6 +581,153 @@ def deterministic_sampler_case(
     final_uniform = uniforms[1] if mode != "greedy" and len(uniforms) > 1 else uniforms[0]
     token = filtered_sample(scores, uniform=final_uniform, mode=mode, temperature=temperature, top_k=top_k, top_p=top_p)
     return token, 2 if mode != "greedy" else 0
+
+
+def make_sampling_cases(writer: ArtifactWriter, ids: Mapping[str, int]) -> list[dict[str, Any]]:
+    """Model-free cases with an explicit chat or official-duplex rule identity."""
+
+    # Protocol-aware deterministic sampler cases.  The arrays are tiny and
+    # intentionally independent of model logits so sampling regressions do not
+    # require loading the 8B bundle in XCTest.
+    sampling_cases: list[dict[str, Any]] = []
+    width = max(32, max(ids.values()) + 1)
+
+    def case(name: str, logits: np.ndarray, **kwargs: Any) -> None:
+        uniforms = list(kwargs.pop("uniforms"))
+        kwargs.setdefault("repetition_policy", "hugging_face")
+        token, draws = deterministic_sampler_case(
+            logits, protocol=ids, uniforms=uniforms, **kwargs
+        )
+        array_name = writer.array(f"sampling_{name}_logits", logits)
+        sampling_cases.append(
+            {
+                "name": name,
+                "logits": array_name,
+                "uniforms": uniforms,
+                "expected_token": token,
+                "draw_count": draws,
+                "reference_backend": "numpy_runtime_policy",
+                "reference_policy": kwargs["repetition_policy"],
+                **kwargs,
+            }
+        )
+
+    base = np.full(width, -10.0, dtype=np.float32)
+    natural = base.copy()
+    natural[ids["chunk_eos"]] = 10
+    case(
+        "natural_chunk_eos",
+        natural,
+        uniforms=[0.2],
+        mode="sampling",
+        temperature=0.7,
+        top_k=20,
+        top_p=0.8,
+        forbidden=[ids["chunk_eos"]],
+        previous_tokens=[],
+        repetition_penalty=1.05,
+        length_penalty=1.1,
+        listen_top_k=None,
+        listen_probability_scale=1.0,
+    )
+    forbidden = base.copy()
+    forbidden[0] = 10
+    forbidden[1] = 9
+    case(
+        "forbidden_after_probe",
+        forbidden,
+        uniforms=[0.1, 0.1],
+        mode="sampling",
+        temperature=1.0,
+        top_k=0,
+        top_p=1.0,
+        forbidden=[0],
+        previous_tokens=[],
+        repetition_penalty=1.0,
+        length_penalty=1.0,
+        listen_top_k=None,
+        listen_probability_scale=1.0,
+    )
+    repetition = base.copy()
+    repetition[20] = 5
+    repetition[21] = 4.9
+    case(
+        "repetition_penalty",
+        repetition,
+        uniforms=[0.2, 0.2],
+        mode="sampling",
+        temperature=1.0,
+        top_k=2,
+        top_p=1.0,
+        forbidden=[],
+        previous_tokens=[20],
+        repetition_penalty=2.0,
+        length_penalty=1.0,
+        listen_top_k=None,
+        listen_probability_scale=1.0,
+    )
+    listen = base.copy()
+    listen[ids["listen"]] = 4.0
+    listen[10] = 3.0
+    case(
+        "listen_rank",
+        listen,
+        uniforms=[0.2, 0.2],
+        mode="sampling",
+        temperature=1.0,
+        top_k=20,
+        top_p=1.0,
+        forbidden=[],
+        previous_tokens=[],
+        repetition_penalty=1.0,
+        length_penalty=1.0,
+        listen_top_k=2,
+        listen_probability_scale=1.0,
+    )
+    top_p = np.full(width, -10.0, dtype=np.float32)
+    top_p[0], top_p[1], top_p[2] = 3.0, 2.0, 1.0
+    case(
+        "top_p_boundary",
+        top_p,
+        uniforms=[0.2, 0.99],
+        mode="sampling",
+        temperature=1.0,
+        top_k=0,
+        top_p=0.5,
+        forbidden=[],
+        previous_tokens=[],
+        repetition_penalty=1.0,
+        length_penalty=1.0,
+        listen_top_k=None,
+        listen_probability_scale=1.0,
+    )
+
+    defaults = dict(mode="greedy", temperature=1.0, top_k=0, top_p=1.0,
+                    forbidden=[], previous_tokens=[], repetition_penalty=1.05,
+                    length_penalty=1.0, listen_top_k=None, listen_probability_scale=1.0)
+    for policy in ("hugging_face", "official_duplex"):
+        negative = np.full(width, -100.0, dtype=np.float32)
+        negative[20], negative[21] = -1.0, -1.02
+        options = {**defaults, "repetition_policy": policy, "previous_tokens": [20]}
+        case(f"negative_repetition_{policy}", negative, uniforms=[0.2, 0.2], **options)
+        special = np.full(width, -100.0, dtype=np.float32)
+        special[ids["listen"]], special[20] = 5.1, 5.0
+        options = {**defaults, "repetition_policy": policy, "previous_tokens": [ids["listen"]]}
+        case(f"special_history_{policy}", special, uniforms=[0.2, 0.2], **options)
+        zero_window = np.full(width, -100.0, dtype=np.float32)
+        zero_window[20], zero_window[21] = 5.1, 5.0
+        options = {**defaults, "repetition_policy": policy, "previous_tokens": [20],
+                   "repetition_window_size": 0}
+        case(f"zero_repetition_window_{policy}", zero_window, uniforms=[0.2, 0.2], **options)
+    length = np.full(width, -100.0, dtype=np.float32)
+    length[ids["turn_eos"]], length[20] = 9.5, 9.0
+    case("official_duplex_ignores_length", length, uniforms=[0.2, 0.2],
+         **{**defaults, "repetition_policy": "official_duplex", "length_penalty": 2.0})
+    suppressed = np.full(width, -100.0, dtype=np.float32)
+    suppressed[ids["chunk_eos"]], suppressed[20] = 100.0, 0.0
+    case("suppressed_natural_chunk_eos", suppressed, uniforms=[0.2, 0.2],
+         **{**defaults, "forbidden": [ids["chunk_eos"]], "suppress_natural_chunk_eos": True})
+    return sampling_cases
 
 
 def ensure_torchvision_compat() -> None:
@@ -1255,118 +1422,7 @@ def main() -> None:
             "cases": bridge_cases,
         }
 
-    # Protocol-aware deterministic sampler cases.  The arrays are tiny and
-    # intentionally independent of model logits so sampling regressions do not
-    # require loading the 8B bundle in XCTest.
-    sampling_cases: list[dict[str, Any]] = []
-    width = max(32, max(ids.values()) + 1)
-
-    def case(name: str, logits: np.ndarray, **kwargs: Any) -> None:
-        uniforms = list(kwargs.pop("uniforms"))
-        token, draws = deterministic_sampler_case(
-            logits, protocol=ids, uniforms=uniforms, **kwargs
-        )
-        array_name = writer.array(f"sampling_{name}_logits", logits)
-        sampling_cases.append(
-            {
-                "name": name,
-                "logits": array_name,
-                "uniforms": uniforms,
-                "expected_token": token,
-                "draw_count": draws,
-                **kwargs,
-            }
-        )
-
-    base = np.full(width, -10.0, dtype=np.float32)
-    natural = base.copy()
-    natural[ids["chunk_eos"]] = 10
-    case(
-        "natural_chunk_eos",
-        natural,
-        uniforms=[0.2],
-        mode="sampling",
-        temperature=0.7,
-        top_k=20,
-        top_p=0.8,
-        forbidden=[ids["chunk_eos"]],
-        previous_tokens=[],
-        repetition_penalty=1.05,
-        length_penalty=1.1,
-        listen_top_k=None,
-        listen_probability_scale=1.0,
-    )
-    forbidden = base.copy()
-    forbidden[0] = 10
-    forbidden[1] = 9
-    case(
-        "forbidden_after_probe",
-        forbidden,
-        uniforms=[0.1, 0.1],
-        mode="sampling",
-        temperature=1.0,
-        top_k=0,
-        top_p=1.0,
-        forbidden=[0],
-        previous_tokens=[],
-        repetition_penalty=1.0,
-        length_penalty=1.0,
-        listen_top_k=None,
-        listen_probability_scale=1.0,
-    )
-    repetition = base.copy()
-    repetition[20] = 5
-    repetition[21] = 4.9
-    case(
-        "repetition_penalty",
-        repetition,
-        uniforms=[0.2, 0.2],
-        mode="sampling",
-        temperature=1.0,
-        top_k=2,
-        top_p=1.0,
-        forbidden=[],
-        previous_tokens=[20],
-        repetition_penalty=2.0,
-        length_penalty=1.0,
-        listen_top_k=None,
-        listen_probability_scale=1.0,
-    )
-    listen = base.copy()
-    listen[ids["listen"]] = 4.0
-    listen[10] = 3.0
-    case(
-        "listen_rank",
-        listen,
-        uniforms=[0.2, 0.2],
-        mode="sampling",
-        temperature=1.0,
-        top_k=20,
-        top_p=1.0,
-        forbidden=[],
-        previous_tokens=[],
-        repetition_penalty=1.0,
-        length_penalty=1.0,
-        listen_top_k=2,
-        listen_probability_scale=1.0,
-    )
-    top_p = np.full(width, -10.0, dtype=np.float32)
-    top_p[0], top_p[1], top_p[2] = 3.0, 2.0, 1.0
-    case(
-        "top_p_boundary",
-        top_p,
-        uniforms=[0.2, 0.99],
-        mode="sampling",
-        temperature=1.0,
-        top_k=0,
-        top_p=0.5,
-        forbidden=[],
-        previous_tokens=[],
-        repetition_penalty=1.0,
-        length_penalty=1.0,
-        listen_top_k=None,
-        listen_probability_scale=1.0,
-    )
+    sampling_cases = make_sampling_cases(writer, ids)
 
     # Persist metadata only after all arrays are written.  JSON is sorted and
     # has no timestamp, so byte-for-byte reruns are possible.

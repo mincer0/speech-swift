@@ -11,10 +11,10 @@ import MLXCommon
 /// session: copying the whole prefix on every token and exposing spare
 /// capacity to SDPA.
 final class MiniCPMKVCacheTests: XCTestCase {
-    private func tinyConfig() -> MiniCPMMLXConfig {
+    private func tinyConfig(layers: Int = 1) -> MiniCPMMLXConfig {
         MiniCPMMLXConfig(
             hiddenSize: 4,
-            numHiddenLayers: 1,
+            numHiddenLayers: layers,
             numAttentionHeads: 1,
             numKeyValueHeads: 1,
             headDim: 4,
@@ -466,6 +466,102 @@ final class MiniCPMKVCacheTests: XCTestCase {
         // replay metadata must replace both with turn_eos + </unit>.
         XCTAssertEqual(session.protocolTokens, [10, 2])
         XCTAssertEqual(session.cacheLength, 4)
+    }
+
+    func testInterruptedTurnCopiesPrefixAndPreservesSnapshotAcrossDecodeAndRestore() throws {
+        let model = MiniCPMLanguageModel(config: tinyConfig(layers: 2))
+        let session = MiniCPMSession(model: model)
+        let system = MLXArray([Float(0.125), -0.5, 0.75, -1], [1, 1, 4])
+            .asType(.bfloat16)
+        session.beginSystemPrompt()
+        _ = session.feed(embeddings: system)
+        session.finishSystemPrompt()
+        for index in 0 ..< 2 {
+            let input = MLXArray(
+                [Float(index + 1) / 4, -0.375, 0.5, -0.625], [1, 1, 4])
+                .asType(.bfloat16)
+            session.beginUnit()
+            _ = session.feed(embeddings: input)
+            _ = session.feed(inputIds: MLXArray([Int32(7 + index), 2]))
+            session.recordProtocolToken(7 + index, special: true)
+            session.recordProtocolToken(2, special: true)
+            session.commitUnit(generatedTokens: [7 + index])
+        }
+        let original = session.snapshot()
+        let oldLength = original.inference.sequenceLength
+        let retainedLength = oldLength - 2
+        let originalCaches = try original.inference.kvCaches.map { try XCTUnwrap($0) }
+        eval(originalCaches.flatMap { [$0.0, $0.1] })
+        let originalBytes = originalCaches.map {
+            ($0.0.asData(access: .copy).data, $0.1.asData(access: .copy).data)
+        }
+        let originalPrefixBytes = originalCaches.map {
+            ($0.0[0..., 0..., 0 ..< retainedLength, 0...].asData(access: .copy).data,
+             $0.1[0..., 0..., 0 ..< retainedLength, 0...].asData(access: .copy).data)
+        }
+
+        // Appending past a snapshot's logical end is safe. Materialize this
+        // baseline before repair so restoring the original snapshot can also
+        // prove that its live storage, rather than only cached views, survived.
+        let followup = model.embed(MLXArray([Int32(11)])).asType(.bfloat16)
+        let expectedNext = model.forward(inputEmbeddings: followup, state: original.inference)
+        eval(expectedNext.logits, expectedNext.hidden)
+        let expectedNextLogits = expectedNext.logits.asData(access: .copy).data
+
+        XCTAssertEqual(session.closeInterruptedTurn(turnEosId: 10, unitEndId: 2), 1)
+        XCTAssertEqual(session.cacheLength, oldLength)
+        XCTAssertEqual(session.state.position, oldLength)
+        XCTAssertEqual(session.protocolTokens, [7, 2, 10, 2])
+        let repairedCaches = try session.state.kvCaches.map { try XCTUnwrap($0) }
+        eval(repairedCaches.flatMap { [$0.0, $0.1] })
+        for index in repairedCaches.indices {
+            XCTAssertEqual(
+                repairedCaches[index].0[0..., 0..., 0 ..< retainedLength, 0...]
+                    .asData(access: .copy).data,
+                originalPrefixBytes[index].0)
+            XCTAssertEqual(
+                repairedCaches[index].1[0..., 0..., 0 ..< retainedLength, 0...]
+                    .asData(access: .copy).data,
+                originalPrefixBytes[index].1)
+            XCTAssertEqual(originalCaches[index].0.asData(access: .copy).data,
+                           originalBytes[index].0)
+            XCTAssertEqual(originalCaches[index].1.asData(access: .copy).data,
+                           originalBytes[index].1)
+        }
+
+        let afterRepair = session.feed(embeddings: followup)
+        eval(afterRepair.logits, afterRepair.hidden)
+        XCTAssertEqual(session.cacheLength, oldLength + 1)
+        for index in originalCaches.indices {
+            XCTAssertEqual(originalCaches[index].0.asData(access: .copy).data,
+                           originalBytes[index].0)
+            XCTAssertEqual(originalCaches[index].1.asData(access: .copy).data,
+                           originalBytes[index].1)
+        }
+
+        session.restore(original)
+        let restoredNext = session.feed(embeddings: followup)
+        eval(restoredNext.logits, restoredNext.hidden)
+        XCTAssertEqual(restoredNext.logits.asData(access: .copy).data, expectedNextLogits)
+        for index in restoredNext.state.kvCaches.indices {
+            let cache = try XCTUnwrap(restoredNext.state.kvCaches[index])
+            XCTAssertEqual(
+                cache.0[0..., 0..., 0 ..< oldLength, 0...].asData(access: .copy).data,
+                originalBytes[index].0,
+                "restored forward must observe every original key, including replaced markers")
+            XCTAssertEqual(
+                cache.1[0..., 0..., 0 ..< oldLength, 0...].asData(access: .copy).data,
+                originalBytes[index].1,
+                "restored forward must observe every original value, including replaced markers")
+        }
+        session.restore(original)
+        XCTAssertEqual(session.cacheLength, oldLength)
+        XCTAssertEqual(session.state.position, oldLength)
+        XCTAssertEqual(session.protocolTokens, original.protocolTokens)
+        XCTAssertEqual(session.generatedTokens, original.generatedTokens)
+        XCTAssertEqual(session.generatedSpecialTokens, original.generatedSpecialTokens)
+        XCTAssertEqual(session.units.map(\.unitID), original.units.map(\.unitID))
+        XCTAssertEqual(session.units.map(\.length), original.units.map(\.length))
     }
 
     func testContextRebuildCopiesTailReindexesAndPreservesSnapshot() throws {

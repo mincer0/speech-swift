@@ -213,6 +213,12 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
     private var pendingInputType = "audio"
     private var pendingForceListenOverride = false
     private var pendingSampledListenSpeakDecision = false
+    /// Transport activity is deliberately more sensitive than interruption
+    /// evidence. A short peak may carry useful input without stopping speech.
+    private var pendingSpeechActivity = false
+    private var bargeInPolicy = MiniCPMBargeInPolicy()
+    private var pendingBargeInPolicySnapshot: MiniCPMBargeInPolicy?
+    private var pendingQualifiedBargeIn = false
     private var responseStarvationGuard = MiniCPMResponseStarvationGuard()
     /// Speech-loop detector over the currently open response.  Tripping it
     /// forces the next generation to close the turn (see generate()).
@@ -239,23 +245,8 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
     private var slidingWindowConfig = MiniCPMSlidingWindowConfig()
     private var protocolState = MiniCPMDuplexProtocolState()
     private var pendingTTSnapshot: MiniCPMTTSSessionSnapshot?
+    private var pendingToken2WavSnapshot: MiniCPMToken2WavPipeline.Snapshot?
     private var pendingTerminatorFed = false
-    /// Conversation checkpoint taken before the first input of the current
-    /// user turn.  A per-unit rollback is not sufficient for barge-in: live
-    /// audio can span several already-committed listen units before the model
-    /// starts speaking.  Keeping the checkpoint at turn scope lets cancel
-    /// remove the whole interrupted question, not just its last response
-    /// fragment.
-    private struct ActiveTurnSnapshot {
-        let language: MiniCPMSessionSnapshot
-        let audio: MiniCPMAudioStreamingSession.Snapshot
-        let tts: MiniCPMTTSSessionSnapshot?
-        let audioHistory: MiniCPMDuplexAudioHistory
-        let streamingAudioBuffer: [Float]
-        let streamingAudioInputStarted: Bool
-        let protocolState: MiniCPMDuplexProtocolState
-    }
-    private var activeTurnSnapshot: ActiveTurnSnapshot?
     private var diagnosticGenerationEpoch: UInt64?
     private var diagnosticGenerationStartedAtNS: UInt64?
     private var diagnosticGenerationExitedAtNS: UInt64?
@@ -366,27 +357,6 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
     /// Snapshot only scalar state.  This is intentionally callable after a
     /// serialized interrupt/rollback, never from the transport cancellation
     /// thread, so the reported KV/TTS values describe one coherent boundary.
-    /// Visible-text budget for one duplex unit.
-    ///
-    /// Audio is pinned at 25 speech codes per unit (25 codes/s x 40 ms = 1.00 s),
-    /// and natural Mandarin is ~5-6 characters per second, so ~6 characters is
-    /// the largest amount of text one unit can actually speak. Raising this
-    /// (the historical value was 28) lets a dense unit overrun the 26-code TTS
-    /// cap and the utterance gets truncated mid-syllable.
-    private static let maxVisibleCharactersPerUnit = 6
-
-    /// Floor for one duplex unit, the counterpart of `maxVisibleCharactersPerUnit`.
-    ///
-    /// **Currently disabled (0).** Measuring the per-unit stage timings showed
-    /// that suppressing the natural `chunk_eos` probe did NOT raise the text per
-    /// unit at all (still 1-5 characters) but did push the model past its
-    /// trained stop point, producing duplicated and garbled continuations
-    /// ("但她她说", "我还以为是什那") plus audio that no longer matched the
-    /// text. The natural probe is the model's real cadence; the block-internal
-    /// silence it exposes has to be fixed on the audio side instead (let the
-    /// TTS emit only as many codes as the text needs).
-    private static let minVisibleCharactersPerUnit = 0
-
     public func diagnosticSnapshot() -> MiniCPMDuplexEngineDiagnosticSnapshot? {
         let window = languageSession.windowStats()
         let windowConfig = window["config"] as? [String: Any]
@@ -455,6 +425,7 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         resetUnitStageTimings()
         responseStarvationGuard.reset()
         responseRepeatGuard.reset()
+        bargeInPolicy.reset()
         // `prepare` starts a new conversation on this engine.  Audio chunks
         // committed by a previous conversation must not be replayed into the
         // new audio frontend (and must not affect a later rollback).
@@ -465,8 +436,8 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         pendingStreamingAudioBufferSnapshot = nil
         pendingStreamingAudioInputStartedSnapshot = nil
         protocolState.reset()
-        activeTurnSnapshot = nil
         pendingTTSnapshot = nil
+        pendingToken2WavSnapshot = nil
         pendingTerminatorFed = false
         languageSession.reset()
         languageSession.configureSlidingWindow(slidingWindowConfig)
@@ -509,11 +480,13 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         let promptSuffix = hasLLMReference
             ? "<|audio_end|><|im_end|>"
             : "<|im_end|>"
+        var preparedLogits: MLXArray?
         languageSession.beginSystemPrompt()
         let prefixIDs = models.tokenizer.encode(
             promptPrefix, addSpecialTokens: false)
         if !prefixIDs.isEmpty {
-            _ = languageSession.feed(inputIds: MLXArray(prefixIDs.map(Int32.init)))
+            preparedLogits = languageSession.feed(
+                inputIds: MLXArray(prefixIDs.map(Int32.init))).logits
         }
         if hasLLMReference, let reference = llmReference {
             // A reference clip is system conditioning, not live-stream audio:
@@ -523,15 +496,22 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
                 reference,
                 from: config.llmReferenceAudioSampleRate)
             let encoded = try audioSession.encodeReferenceAudio(normalized)
-            _ = languageSession.feed(embeddings: encoded.output.embeddings)
+            preparedLogits = languageSession.feed(
+                embeddings: encoded.output.embeddings).logits
         }
         languageSession.markSystemPromptSuffix()
         let suffixIDs = models.tokenizer.encode(
             promptSuffix, addSpecialTokens: false)
         if !suffixIDs.isEmpty {
-            _ = languageSession.feed(inputIds: MLXArray(suffixIDs.map(Int32.init)))
+            preparedLogits = languageSession.feed(
+                inputIds: MLXArray(suffixIDs.map(Int32.init))).logits
         }
         languageSession.finishSystemPrompt()
+        // feed() builds a lazy graph. Complete the system/voice conditioning
+        // before reporting session readiness, so its computation does not
+        // first block a captured live audio packet. This consumes no token
+        // or sampler draw and preserves the prepared KV sequence.
+        if let preparedLogits { eval(preparedLogits) }
         let prompt = hasLLMReference
             ? promptPrefix + "[audio embedding]" + promptSuffix
             : promptPrefix + promptSuffix
@@ -598,20 +578,10 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         }
         resetUnitStageTimings(continuationOnly: continuationOnly)
 
-        if activeTurnSnapshot == nil {
-            activeTurnSnapshot = ActiveTurnSnapshot(
-                language: languageSession.snapshot(),
-                audio: audioSession.snapshot(),
-                tts: ttsSession?.snapshot(),
-                audioHistory: audioHistory,
-                streamingAudioBuffer: streamingAudioBuffer,
-                streamingAudioInputStarted: streamingAudioInputStarted,
-                protocolState: protocolState)
-        }
-
         _ = languageSession.beginUnit()
         _ = protocolState.beginUnit()
         pendingTTSnapshot = ttsSession?.snapshot()
+        pendingToken2WavSnapshot = token2wav?.snapshot()
         pendingAudioSessionSnapshot = audioSession.snapshot()
         pendingStreamingAudioBufferSnapshot = streamingAudioBuffer
         pendingStreamingAudioInputStartedSnapshot = streamingAudioInputStarted
@@ -623,6 +593,8 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         // next call's pending-state clear erase it.
         let inheritedForceListen = pendingForceListenOverride
         let inheritedSampledDecision = pendingSampledListenSpeakDecision
+        let inheritedSpeechActivity = pendingSpeechActivity
+        let inheritedQualifiedBargeIn = pendingQualifiedBargeIn
         let requestedForceListen = input.forceListen
             ?? Self.parseBoolean(input.metadata["force_listen"])
             ?? Self.parseBoolean(input.metadata["forceListen"])
@@ -635,8 +607,18 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
             ?? Self.parseBoolean(input.metadata["speechActive"])
             ?? false
         clearPendingState()
+        pendingBargeInPolicySnapshot = bargeInPolicy
+        let bargeDecision = (mode == .fullDuplex || mode == .omni)
+            ? bargeInPolicy.observe(
+                audio: input.audio ?? [], sampleRate: 16_000,
+                answerOpen: !protocolState.currentTurnEnded,
+                playbackActive: Self.parseBoolean(input.metadata["playback_active"]) ?? false)
+            : MiniCPMBargeInPolicy.Decision(interrupt: false, forceListen: false)
         pendingForceListenOverride = inheritedForceListen || requestedForceListen
+            || bargeDecision.forceListen
         pendingSampledListenSpeakDecision = inheritedSampledDecision || requestedSampledDecision
+        pendingSpeechActivity = inheritedSpeechActivity || (hasAudio && requestedSpeechActivity)
+        pendingQualifiedBargeIn = inheritedQualifiedBargeIn || bargeDecision.interrupt
         responseStarvationGuard.observeSpeechActivity(requestedSpeechActivity)
         pendingInputType = hasAudio && hasFrames ? "omni"
             : hasFrames ? "vision"
@@ -738,6 +720,7 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
                     _ = languageSession.rollbackUnit()
                     _ = protocolState.rollbackUnit()
                     pendingTTSnapshot = nil
+                    pendingToken2WavSnapshot = nil
                     pendingAudioSessionSnapshot = nil
                     // Keep this raw chunk in the frontend tail: the next
                     // accepted chunk completes the same convolution window.
@@ -748,8 +731,12 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
                     // (or an explicit rollback/reset clears all pending
                     // state).
                     pendingForceListenOverride = inheritedForceListen || requestedForceListen
+                        || bargeDecision.forceListen
                     pendingSampledListenSpeakDecision =
                         inheritedSampledDecision || requestedSampledDecision
+                    pendingSpeechActivity = inheritedSpeechActivity || (hasAudio && requestedSpeechActivity)
+                    pendingQualifiedBargeIn = inheritedQualifiedBargeIn || bargeDecision.interrupt
+                    pendingBargeInPolicySnapshot = nil
                     return MiniCPMDuplexPrefillResult(
                         accepted: false, mode: mode, input: input)
                 }
@@ -767,14 +754,19 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
                     _ = languageSession.rollbackUnit()
                     _ = protocolState.rollbackUnit()
                     pendingTTSnapshot = nil
+                    pendingToken2WavSnapshot = nil
                     if let checkpoint = pendingAudioSessionSnapshot {
                         audioSession.restore(checkpoint)
                     }
                     pendingAudioSessionSnapshot = nil
                     audioHistory.preserveTailAfterRejectedUnit()
                     pendingForceListenOverride = inheritedForceListen || requestedForceListen
+                        || bargeDecision.forceListen
                     pendingSampledListenSpeakDecision =
                         inheritedSampledDecision || requestedSampledDecision
+                    pendingSpeechActivity = inheritedSpeechActivity || (hasAudio && requestedSpeechActivity)
+                    pendingQualifiedBargeIn = inheritedQualifiedBargeIn || bargeDecision.interrupt
+                    pendingBargeInPolicySnapshot = nil
                     return MiniCPMDuplexPrefillResult(
                         accepted: false, mode: mode, input: input)
                 }
@@ -815,6 +807,7 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
             _ = languageSession.rollbackUnit()
             _ = protocolState.rollbackUnit()
             pendingTTSnapshot = nil
+            pendingToken2WavSnapshot = nil
             _ = audioHistory.rollbackUnit()
             if let snapshot = pendingStreamingAudioBufferSnapshot {
                 streamingAudioBuffer = snapshot
@@ -828,6 +821,14 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
             pendingAudioSessionSnapshot = nil
             pendingStreamingAudioBufferSnapshot = nil
             pendingStreamingAudioInputStartedSnapshot = nil
+            if let checkpoint = pendingBargeInPolicySnapshot {
+                bargeInPolicy = checkpoint
+            }
+            pendingBargeInPolicySnapshot = nil
+            pendingQualifiedBargeIn = inheritedQualifiedBargeIn
+            pendingForceListenOverride = inheritedForceListen
+            pendingSpeechActivity = inheritedSpeechActivity
+            pendingSampledListenSpeakDecision = inheritedSampledDecision
             throw error
         }
     }
@@ -866,6 +867,7 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
             topP: config.topP,
             repetitionPenalty: config.repetitionPenalty,
             repetitionWindowSize: config.repetitionWindowSize,
+            repetitionPolicy: .officialDuplex,
             lengthPenalty: config.lengthPenalty,
             listenTopK: allowsListen ? config.listenTopK : nil,
             listenProbabilityScale: allowsListen ? config.listenProbabilityScale : 0)
@@ -877,6 +879,10 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         // guard re-armable for a later loop within the same session.
         let repeatForcedListen = responseRepeatGuard.tripped
         if repeatForcedListen { responseRepeatGuard.reset() }
+        // Qualified speech also cancels buffered playback after model turn
+        // end. Only an open model turn needs another turn_eos in KV.
+        // Continue listening while retaining this microphone unit.
+        let modelBargeIn = allowsListen && pendingQualifiedBargeIn
         let forceListenOverride = pendingForceListenOverride || repeatForcedListen
         let forceListenGeneration = protocolState.beginGeneration(
             config: protocolConfig,
@@ -900,7 +906,10 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         var isListen = false
         var endOfTurn = false
         var terminator: Int?
-        let limit = max(0, config.maxNewTokens)
+        // A forced boundary still needs its listen protocol token when a
+        // caller requests zero text tokens; otherwise the old playback would
+        // be closed in KV without an interrupt event reaching the client.
+        let limit = max(forceListenGeneration ? 1 : 0, config.maxNewTokens)
         if limit > 0 {
             for index in 0..<limit {
                 if interruptionRequested() { return interruptionOutput() }
@@ -933,8 +942,7 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
                         case .none:
                             break
                         case .scaleListen(let scale):
-                            stepSampling.listenProbabilityScale = min(
-                                stepSampling.listenProbabilityScale, scale)
+                            stepSampling.listenLogProbabilityScale = scale
                         case .forbidListen:
                             if !forbidden.contains(ids.listen) {
                                 forbidden.append(ids.listen)
@@ -945,25 +953,10 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
                        Self.shouldUseGreedyListenSpeakDecision(
                            currentTurnEnded: protocolState.currentTurnEnded,
                            configuredGreedy: config.greedyListenSpeakDecision,
-                           allowSampledDecision: pendingSampledListenSpeakDecision) {
+                           allowSampledDecision: pendingSampledListenSpeakDecision,
+                           speechActive: allowsListen && pendingSpeechActivity) {
                         stepSampling.mode = .greedy
                     }
-                    // Keep the text budget and the audio budget in step.
-                    //
-                    // The audio side is pinned at 25 speech codes per duplex unit
-                    // (`MiniCPMToken2WavPipelineConfiguration.chunkTokenCount`),
-                    // i.e. exactly 1.00 s of waveform for ~6 characters of
-                    // Mandarin. The official natural `chunk_eos` probe, however,
-                    // returns the *unmasked* argmax and happily ends a unit after
-                    // 1-3 visible characters. The surplus then renders as silence
-                    // inside the block (measured 0.3-0.98 s per block), which is
-                    // audible as broken-up, choppy speech. Hold the probe back
-                    // until this unit has collected enough visible text; the
-                    // masked sample below still applies the full protocol policy,
-                    // and `turn_eos` / barge-in paths are untouched.
-                    stepSampling.suppressNaturalChunkEOS =
-                        models.tokenizer.decode(generated, skipSpecialTokens: true).count
-                            < Self.minVisibleCharactersPerUnit
                     let tokenArray = languageSession.sample(
                         logits: logits,
                         config: stepSampling,
@@ -977,7 +970,7 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
                             ttsBOS: ids.ttsBOS,
                             allSpecialTokenIds: models.tokenizer.allSpecialTokenIds),
                         forbidden: forbidden,
-                        previousTokens: languageSession.generatedTokens + protocolState.generatedIDs)
+                        previousTokens: nil)
                     let sampled = tokenArray.item(Int.self)
                     if let logitTraceTopK, !forceListenGeneration {
                         let trace = MiniCPMSampler.logitTrace(
@@ -999,39 +992,12 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
                             generate: max(protocolState.generateCount - 1, 0),
                             step: index)
                     }
-                    let isChunkTerminator = sampled == ids.listen
-                        || sampled == ids.chunkEOS
-                        || sampled == ids.chunkTTSEOS
-                    // Per-unit visible-text budget. The audio side is pinned at
-                    // 25 speech codes per duplex unit, i.e. 25 codes/s x 40 ms =
-                    // exactly 1.00 s of waveform, and natural Mandarin runs at
-                    // roughly 5-6 characters per second. A unit therefore must
-                    // not accumulate more than ~6 visible characters: with the
-                    // previous bound of 28 a dense unit produced 7-8 characters
-                    // against a 26-code cap, so the tail of the utterance was
-                    // truncated - audible as swallowed syllables. Official
-                    // MiniCPM-o binds the same ratio from the other side
-                    // (`generate_chunk_size = 10` text tokens per 25-code chunk
-                    // in `modeling_minicpmo.py`). Release the candidate token and
-                    // defer a chunk_eos instead of feeding it to KV.
-                    let reachesCharacterLimit = index != 0
-                        && !isChunkTerminator
-                        && models.tokenizer.decode(
-                            generated + [sampled], skipSpecialTokens: true).count
-                            >= Self.maxVisibleCharactersPerUnit
-                    if reachesCharacterLimit {
-                        step = protocolState.finishAtCharacterLimit(
-                            index: index,
-                            tokens: protocolTokenIDs,
-                            config: protocolConfig)
-                    } else {
-                        step = protocolState.consume(
-                            sampledToken: sampled,
-                            index: index,
-                            tokens: protocolTokenIDs,
-                            config: protocolConfig,
-                            allowListen: allowsListen)
-                    }
+                    step = protocolState.consume(
+                        sampledToken: sampled,
+                        index: index,
+                        tokens: protocolTokenIDs,
+                        config: protocolConfig,
+                        allowListen: allowsListen)
                 }
 
                 if step.isListen { isListen = true }
@@ -1070,18 +1036,21 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
             latestLLMDecodeMS = elapsedMS(since: llmDecodeStart)
         }
         var waveform: [Float]?
-        // Gate the vocoder on speakable text: a unit whose collected tokens
-        // are all protocol markers (e.g. a bare <|speak|> stutter) would hand
-        // the semantic TTS a condition with no speech-start content and come
-        // out as a full unit of unrecognizable noise.
-        if !isListen && !text.isEmpty && config.generateAudio,
+        // Protocol-only units still carry an audio-BOS condition. In particular,
+        // a final unit must drain Token2Wav's look-ahead and vocoder overlap
+        // before its turn state is reset, even when there is no visible text.
+        if !isListen && config.generateAudio,
            let semantic = models.ttsSemantic,
            let ttsSession,
            let token2wav,
            token2wav.isPrepared {
             if interruptionRequested() { return interruptionOutput() }
             let semanticStart = DispatchTime.now().uptimeNanoseconds
-            let hiddenSequence = concatenated(hidden, axis: 1)
+            let hiddenSequence = hidden.isEmpty
+                ? MLXArray.zeros(
+                    [1, 0, semantic.configuration.llmDim],
+                    dtype: semantic.textEmbedding.weight.dtype)
+                : concatenated(hidden, axis: 1)
             let tokenSequence = MLXArray(generated.map(Int32.init))
             let condition = try semantic.buildCondition(
                 hidden: hiddenSequence,
@@ -1134,18 +1103,6 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
                     latestFlowMS = token2wav.lastStageTiming?.flowMS
                     latestHiFTMS = token2wav.lastStageTiming?.hiftMS
                 }
-                if tts.isFinalChunk {
-                    // The wrapper intentionally leaves the session alive until
-                    // Token2Wav has consumed its 25 committed codes.  Re-open
-                    // the immutable prompt cache after the final waveform flush
-                    // so the next duplex chunk starts a fresh turn.
-                    // Required contract: `generateStreamingChunk` refuses a new
-                    // chunk while a final one is pending, which is why the
-                    // decoder must be stopped from ending the turn itself
-                    // mid-sentence (see `forceNoStop` above).
-                    ttsSession.finishTurn()
-                    token2wav.resetForNewTurn()
-                }
             } catch MiniCPMTTSSemanticError.cancelled {
                 return interruptionOutput()
             } catch MiniCPMToken2WavError.cancelled {
@@ -1167,16 +1124,9 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         // this keeps downstream playback and capture clocks aligned. Listen
         // markers are not sent to the speaker, so they have no trim metadata.
         //
-        // The 1.00 s padding below only ever fires for a unit that produced
-        // fewer than 25 speech codes while the turn stays open - in practice
-        // the first chunk of a turn, whose EOS is allowed immediately. The
-        // padding is PREPENDED, so the voice onset is delayed by whatever the
-        // fill is (up to 0.6 s) relative to when the client starts playing the
-        // block. The official implementation does not pad these blocks: its
-        // measured blocks run 0.32-1.12 s, and every short one is a turn
-        // boundary. `MINICPM_DUPLEX_VARIABLE_BLOCKS=1` matches that behaviour;
-        // middle chunks are unaffected because they always carry the full
-        // 26/25 look-ahead contract.
+        // The official duplex coordinator also left-pads short non-final
+        // waveforms to one second. Keep that default; the variable-block
+        // option changes only transport cadence, not semantic-TTS termination.
         if isListen {
             waveform = [Float](repeating: 0, count: 24_000)
         } else if !endOfTurn, !variableBlocksEnabled,
@@ -1204,12 +1154,12 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
             isListen: isListen,
             endOfTurn: endOfTurn,
             needsFinalize: true,
-            finishReason: isListen ? "listen" : (endOfTurn ? "turn_end" : "chunk"))
+            finishReason: modelBargeIn ? "model_barge_in"
+                : (isListen ? "listen" : (endOfTurn ? "turn_end" : "chunk")))
     }
 
     public func finalize() throws {
         guard pendingFinalize else { return }
-        let completedTurn = pendingEndOfTurn
         if let pendingTerminator {
             // Unified MiniCPM defers the chunk terminator and feeds it in the
             // same forward pass as `</unit>`.  Do not run a separate logits
@@ -1240,17 +1190,12 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         // this point, so rollback cannot evict any previously accepted unit.
         _ = languageSession.enforceSlidingWindow()
         pendingTTSnapshot = nil
+        pendingToken2WavSnapshot = nil
         pendingTerminatorFed = false
         responseStarvationGuard.commit(
             isListen: pendingIsListen,
             endOfTurn: pendingEndOfTurn)
         clearPendingState()
-        if completedTurn {
-            // The turn checkpoint is no longer needed once the answer's
-            // canonical end has been accepted.  Releasing it here also avoids
-            // pinning the pre-turn KV cache across later conversation turns.
-            activeTurnSnapshot = nil
-        }
     }
 
     public func rollback() throws {
@@ -1260,7 +1205,11 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         if let pendingTTSnapshot, let ttsSession {
             try? ttsSession.rollback(to: pendingTTSnapshot)
         }
+        if let pendingToken2WavSnapshot {
+            token2wav?.restore(pendingToken2WavSnapshot)
+        }
         pendingTTSnapshot = nil
+        pendingToken2WavSnapshot = nil
         _ = audioHistory.rollbackUnit()
         if let snapshot = pendingStreamingAudioBufferSnapshot {
             streamingAudioBuffer = snapshot
@@ -1274,12 +1223,12 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         pendingAudioSessionSnapshot = nil
         pendingStreamingAudioBufferSnapshot = nil
         pendingStreamingAudioInputStartedSnapshot = nil
-        clearPendingState()
-        // Keep the turn checkpoint: a transport rollback rejected only this
-        // unit, while the user turn is still live and may receive more audio.
-        if let token2wav, token2wav.isPrepared {
-            token2wav.interruptAndReset()
+        if let checkpoint = pendingBargeInPolicySnapshot {
+            bargeInPolicy = checkpoint
         }
+        clearPendingState()
+        // A transport rollback rejects only this provisional unit. Accepted
+        // microphone input and earlier spoken units remain in conversation KV.
         // The discarded unit never reached the transport, so its text must
         // not count toward the speech-loop detector.
         responseRepeatGuard.reset()
@@ -1304,6 +1253,7 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         ttsSession?.reset()
         protocolState.reset()
         pendingTTSnapshot = nil
+        pendingToken2WavSnapshot = nil
         pendingTerminatorFed = false
         audioHistory.reset()
         pendingAudioSessionSnapshot = nil
@@ -1311,9 +1261,9 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         streamingAudioInputStarted = false
         pendingStreamingAudioBufferSnapshot = nil
         pendingStreamingAudioInputStartedSnapshot = nil
-        activeTurnSnapshot = nil
         responseStarvationGuard.reset()
         responseRepeatGuard.reset()
+        bargeInPolicy.reset()
         clearPendingState()
         prepared = false
         interrupted = false
@@ -1357,6 +1307,9 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         pendingEndOfTurn = false
         pendingForceListenOverride = false
         pendingSampledListenSpeakDecision = false
+        pendingSpeechActivity = false
+        pendingQualifiedBargeIn = false
+        pendingBargeInPolicySnapshot = nil
     }
 
     private func resetUnitStageTimings(continuationOnly: Bool = false) {
@@ -1413,27 +1366,21 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
     private func repairInterruptedTurn() {
         responseStarvationGuard.reset()
         responseRepeatGuard.reset()
-        if let snapshot = activeTurnSnapshot {
-            restoreActiveTurn(snapshot)
-            activeTurnSnapshot = nil
-            // The next accepted input is a one-unit model fence.  It is set
-            // after restoring pending state because clearPendingState()
-            // intentionally clears per-input overrides.
-            pendingForceListenOverride = true
-            return
-        }
-
         let hadPendingUnit = pendingFinalize || prefetched
         let hadOpenTurnBeforeRollback = !protocolState.currentTurnEnded
         let hadPendingSpokenOutput = pendingFinalize
             && !pendingIsListen
             && !pendingEndOfTurn
-        let needsTurnRepair = hadOpenTurnBeforeRollback || hadPendingSpokenOutput
 
         // Capture the decision above before rollback clears the provisional
         // protocol/session metadata. `rollback()` is idempotent when the
         // generation already repaired itself on an epoch probe.
         if hadPendingUnit { try? rollback() }
+        bargeInPolicy.reset()
+        // A provisional final/forced-listen unit can mark the turn ended
+        // before rollback restores the last committed open spoken turn.
+        let needsTurnRepair = hadOpenTurnBeforeRollback || hadPendingSpokenOutput
+            || !protocolState.currentTurnEnded
 
         var repaired = 0
         if needsTurnRepair {
@@ -1457,35 +1404,12 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         // `prefill` preserves this latch if its first audio window is short.
         // Keep it even when there was no language unit to repair; that is the
         // safe boundary for cancel-before-first-token and repeated cancel.
+        pendingSampledListenSpeakDecision = false
+        pendingSpeechActivity = false
+        pendingQualifiedBargeIn = false
+        pendingBargeInPolicySnapshot = nil
         pendingForceListenOverride = true
         _ = repaired
-    }
-
-    /// Restore the state immediately before the current user turn.  This is
-    /// deliberately one serialized operation on the engine thread: language
-    /// KV, audio frontend cache, protocol history and TTS all describe the
-    /// same turn boundary and must never be repaired independently.
-    private func restoreActiveTurn(_ snapshot: ActiveTurnSnapshot) {
-        languageSession.restore(snapshot.language)
-        audioSession.restore(snapshot.audio)
-        audioHistory = snapshot.audioHistory
-        streamingAudioBuffer = snapshot.streamingAudioBuffer
-        streamingAudioInputStarted = snapshot.streamingAudioInputStarted
-        protocolState = snapshot.protocolState
-        if let ttsSnapshot = snapshot.tts {
-            try? ttsSession?.rollback(to: ttsSnapshot)
-        } else {
-            ttsSession?.reset()
-        }
-        if let token2wav, token2wav.isPrepared {
-            token2wav.interruptAndReset()
-        }
-        pendingAudioSessionSnapshot = nil
-        pendingStreamingAudioBufferSnapshot = nil
-        pendingStreamingAudioInputStartedSnapshot = nil
-        pendingTTSnapshot = nil
-        pendingTerminatorFed = false
-        clearPendingState()
     }
 
     private static let firstStreamingChunkRequiredSamples =
@@ -1503,9 +1427,10 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
     static func shouldUseGreedyListenSpeakDecision(
         currentTurnEnded: Bool,
         configuredGreedy: Bool,
-        allowSampledDecision: Bool
+        allowSampledDecision: Bool,
+        speechActive: Bool = false
     ) -> Bool {
-        currentTurnEnded && configuredGreedy && !allowSampledDecision
+        (currentTurnEnded || speechActive) && configuredGreedy && !allowSampledDecision
     }
 
     static func shouldUseContinuationOnly(
@@ -1519,8 +1444,7 @@ public final class MiniCPMNativeDuplexEngine: MiniCPMDuplexEngine {
         // audio embeddings - the model hears the continuous time axis, which
         // is what keeps unit-boundary text coherent. The former zero-silence
         // skip (continuation shortcut) starved the model of that context and
-        // caused boundary garbling; with the bucketed KV cache the encoder
-        // costs ~16ms per chunk, so the shortcut is retired outright.
+        // caused boundary garbling, so the shortcut is retired outright.
         _ = requested
         _ = currentTurnEnded
         _ = audio

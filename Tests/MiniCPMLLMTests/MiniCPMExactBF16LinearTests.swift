@@ -192,6 +192,61 @@ final class MiniCPMExactBF16LinearTests: XCTestCase {
         }
     }
 
+    func testPreparedWeightIsReusedAndInvalidatedByInPlaceParameterUpdate() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let originalValues: [Float] = [1, 2, 3, -1, 0.5, 2]
+        let linear = MiniCPMExactBF16Linear(
+            weight: MLXArray(originalValues, [2, 3]).asType(.bfloat16))
+        let parameterObject = linear.weight
+        let first = linear.preparedBF16Weight(device: device)
+        XCTAssertTrue(first === linear.preparedBF16Weight(device: device))
+        XCTAssertFalse(first.storageOwner === parameterObject)
+        XCTAssertEqual(linear.parameters().flattened().map(\.0), ["weight"])
+
+        // Module.update keeps the inherited MLXArray object's identity. The
+        // cached bridge must therefore be invalidated by the update itself.
+        let replacement = MLXArray(
+            [Float(-2), 1, 0, 3, -1, 2], [2, 3]).asType(.bfloat16)
+        let module: Module = linear
+        try module.update(
+            parameters: ModuleParameters.unflattened(["weight": replacement]), verify: .all)
+        XCTAssertTrue(linear.weight === parameterObject)
+        let second = linear.preparedBF16Weight(device: device)
+        XCTAssertFalse(first === second)
+        XCTAssertTrue(second === linear.preparedBF16Weight(device: device))
+
+        // A caller retaining the old feed must still own the old backing,
+        // even though the inherited parameter object now holds new values.
+        XCTAssertEqual(first.storageOwner.asType(.float32).asArray(Float.self), originalValues)
+        XCTAssertEqual(
+            second.storageOwner.asType(.float32).asArray(Float.self),
+            replacement.asType(.float32).asArray(Float.self))
+        let input = MLXArray([Float(1), -1, 2], [1, 3]).asType(.bfloat16)
+        XCTAssertEqual(linear(input).asType(.float32).asArray(Float.self), [-3, 8])
+    }
+
+    func testRejectedParameterUpdateDoesNotLeavePreparedWeightStale() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let linear = MiniCPMExactBF16Linear(
+            weight: MLXArray([Float(1), 2, 3], [1, 3]).asType(.bfloat16))
+        let previous = linear.preparedBF16Weight(device: device)
+        let replacement = MLXArray([Float(3), -1, 2], [1, 3]).asType(.bfloat16)
+        // Module.update replaces known parameters before reporting unused
+        // keys. A rejected update can therefore still change weight values.
+        XCTAssertThrowsError(try linear.update(
+            parameters: ModuleParameters.unflattened([
+                "weight": replacement, "unexpected": MLXArray(Float(0)),
+            ]), verify: .all))
+        let current = linear.preparedBF16Weight(device: device)
+        XCTAssertFalse(previous === current)
+        XCTAssertEqual(
+            current.storageOwner.asType(.float32).asArray(Float.self), [3, -1, 2])
+        XCTAssertEqual(
+            previous.storageOwner.asType(.float32).asArray(Float.self), [1, 2, 3])
+        let input = MLXArray([Float(1), -1, 2], [1, 3]).asType(.bfloat16)
+        XCTAssertEqual(linear(input).asType(.float32).asArray(Float.self), [8])
+    }
+
     func testFloat32InputUsesLinearFallback() {
         let weight = MLXArray([
             Float(1), 2, 3,

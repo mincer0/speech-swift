@@ -45,6 +45,46 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def greedy_prefix_contract(
+    logits: np.ndarray,
+    committed: list[int],
+    eos_token: int,
+    prefix_is_valid: bool,
+) -> dict[str, Any]:
+    """Describe only the free-running prefix before the first exact tie.
+
+    All rows remain numerical teacher-forcing oracles.  The exporter's tiny
+    positive temperature samples tied maxima through PyTorch multinomial;
+    Swift greedy argmax can choose another tied code.  Once that happens,
+    their later free-running inputs differ, including in subsequent chunks.
+    EOS is excluded here because this oracle uses force_no_stop=True.
+    """
+    rows = np.array(logits, dtype=np.float32, copy=True)
+    rows[:, eos_token] = -np.inf
+    top_two = np.partition(rows, -2, axis=-1)[:, -2:]
+    gaps = top_two[:, 1] - top_two[:, 0]
+    ties = np.flatnonzero(gaps == 0)
+    first_tie = int(ties[0]) if ties.size else None
+    stable_count = min(len(committed), first_tie) if first_tie is not None else len(committed)
+    tie_details = None
+    if first_tie is not None:
+        row = rows[first_tie]
+        maximum = float(np.max(row))
+        tie_details = {
+            "step_index": first_tie,
+            "top_gap": float(gaps[first_tie]),
+            "top_logit": maximum,
+            "tokens": [int(token) for token in np.flatnonzero(row == maximum)],
+        }
+    return {
+        "stable_prefix": committed[:stable_count] if prefix_is_valid else [],
+        "argmax_top_gaps": [float(gap) for gap in gaps],
+        "first_argmax_tie": tie_details,
+        "free_running_prefix_valid_at_chunk_start": prefix_is_valid,
+        "prefix_is_valid_after_chunk": prefix_is_valid and first_tie is None,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -358,6 +398,8 @@ def main() -> None:
         cache = None
         trace: list[dict[str, Any]] = []
         text_start = 0
+        prefix_is_valid = True
+        first_argmax_tie = None
         # Official generate_chunk uses multinomial sampling.  A tiny positive
         # temperature is the numerically stable equivalent of greedy decoding
         # and keeps the source loop untouched; manual_seed makes ties replayable.
@@ -365,19 +407,39 @@ def main() -> None:
         eos = torch.tensor(tts.num_audio_tokens - 1, dtype=torch.long, device=device)
         for index, definition in enumerate(chunk_definitions):
             condition = arrays[definition["expected_key"]]
-            returned, cache = tts.generate_chunk(
-                inputs_embeds=condition,
-                temperature=temperature,
-                repetition_penalty=1.0,
-                eos_token=eos,
-                force_no_stop=True,
-                max_new_token=26,
-                min_new_tokens=0 if index in (0, 2) else 26,
-                past_key_values=cache,
-                text_start_pos=text_start,
-            )
+            teacher_logits = []
+            hook = tts.head_code[0].register_forward_hook(
+                lambda _module, _inputs, output: teacher_logits.append(
+                    output[:, -1].reshape(-1).detach().clone().float()))
+            try:
+                returned, cache = tts.generate_chunk(
+                    inputs_embeds=condition,
+                    temperature=temperature,
+                    repetition_penalty=1.0,
+                    eos_token=eos,
+                    force_no_stop=True,
+                    max_new_token=26,
+                    min_new_tokens=0 if index in (0, 2) else 26,
+                    past_key_values=cache,
+                    text_start_pos=text_start,
+                )
+            finally:
+                hook.remove()
+            arrays[f"chunk{index}.teacher_logits"] = torch.stack(teacher_logits)
             committed = returned[0, :, 0].detach().to("cpu").tolist()
             committed = [int(value) for value in committed]
+            prefix_contract = greedy_prefix_contract(
+                arrays[f"chunk{index}.teacher_logits"].detach().to("cpu").numpy(),
+                committed,
+                int(tts.num_audio_tokens - 1),
+                prefix_is_valid,
+            )
+            prefix_is_valid = prefix_contract.pop("prefix_is_valid_after_chunk")
+            if first_argmax_tie is None and prefix_contract["first_argmax_tie"] is not None:
+                first_argmax_tie = {
+                    "chunk_index": index,
+                    **prefix_contract["first_argmax_tie"],
+                }
             condition_length = int(condition.shape[1])
             trace.append(
                 {
@@ -387,14 +449,17 @@ def main() -> None:
                     "next_text_start": text_start + condition_length + len(committed),
                     "sampled_count": 26,
                     "returned_count": len(committed),
-                    "stable_prefix": committed[:4] if index == 0 else [],
+                    **prefix_contract,
                     "committed": committed,
                     "pending": None,
                     "strict_pending": None,
                     "cache_offset": int(cache[0][0].shape[2]),
                     "is_first": index == 0,
                     "is_final": index == len(chunk_definitions) - 1,
-                    "force_flush": True,
+                    # Waveform scheduling is metadata only: generate_chunk
+                    # has no force_flush argument.  The imported non-unified
+                    # duplex helper requests it only at the start of a turn.
+                    "force_flush": index == 0,
                     "ended_by_eos": False,
                 }
             )
@@ -411,7 +476,8 @@ def main() -> None:
         "observed_upstream_commit": observed["upstream_commit"],
         "observed_modeling_sha256": observed["modeling_sha256"],
         "observed_unified_modeling_sha256": observed["unified_modeling_sha256"],
-        "condition_helper": "MiniCPMO._convert_results_to_tts_input",
+        "condition_helper": "MiniCPMODuplex._convert_results_to_tts_input",
+        "waveform_helper": "modeling_minicpmo.py:MiniCPMODuplex.streaming_generate",
         "condition_verified_with_fixed_source": source_matches,
         "oracle_backend": "official_pytorch",
         "oracle_dtype": args.dtype,
@@ -433,13 +499,17 @@ def main() -> None:
             "returned_per_full_chunk": 25,
             "committed_per_full_chunk": 25,
             "pending_per_full_chunk": 0,
-            "token_identity": "stable_prefix_only_after_bf16_argmax_tie",
+            "token_identity": "teacher_forced_logits_at_every_step",
+            "teacher_forcing_required": True,
+            "stable_prefix_contract": "unique argmax before first exact tie; no free-running token equality from that tie onward, including subsequent chunks",
+            "first_argmax_tie": first_argmax_tie,
             "logits_oracle_file": args.output.name,
             "logits_oracle_key": "chunk0.first_logits",
             "first_protocol_token_filtered": True,
             "condition_special_tokens": ["audio_bos"],
             "optional_condition_special_tokens": ["text_eos"],
-            "force_flush_cadence": "first middle final",
+            "force_flush_cadence": "first only; end_of_turn independently flushes final",
+            "waveform_scheduling": "metadata only; waveform output is not part of this semantic oracle",
             "eos_token": int(tts.num_audio_tokens - 1),
             "reset_after_final": "explicit session.finishTurn() after token2wav flush",
             "force_no_stop": True,

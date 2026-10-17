@@ -163,21 +163,12 @@ public final class MiniCPMExactBF16SDPA {
             additiveMask: additiveMask)
         let device = Self.sharedExecutionContext.device
 
-        // MPSGraph TensorData is a no-copy bridge.  Materialize the transposed
-        // Q/K/V views at this explicit boundary, then validate their backing
-        // storage again before feeding the graph.  This keeps the production
-        // caller free to use the natural [B,H,T,D] transpose layout without
-        // silently passing incorrect strides to MPSGraph.
-        let contiguousQuery = rowContiguous(query)
-        let contiguousKey = rowContiguous(key)
-        let contiguousValue = rowContiguous(value)
-        let contiguousMask = additiveMask.map(rowContiguous)
-        let queryBuffer = noCopyBuffer(contiguousQuery, device: device, label: "query")
-        let keyBuffer = noCopyBuffer(contiguousKey, device: device, label: "key")
-        let valueBuffer = noCopyBuffer(contiguousValue, device: device, label: "value")
-        let maskBuffer = contiguousMask.map {
-            noCopyBuffer($0, device: device, label: "additive mask")
-        }
+        // Keep view materialization lazy until every graph feed and bound
+        // destination can be evaluated together at the no-copy boundary.
+        let contiguousQuery = query.contiguous()
+        let contiguousKey = key.contiguous()
+        let contiguousValue = value.contiguous()
+        let contiguousMask = additiveMask?.contiguous()
 
         planLock.lock()
         let plan = plan(
@@ -198,7 +189,21 @@ public final class MiniCPMExactBF16SDPA {
             geometry.queryHeads,
             geometry.headDimension,
         ]
-        let output = MLXArray.zeros(outputShape, dtype: .bfloat16)
+        // Eager storage avoids submitting a zero-fill primitive for a graph
+        // destination whose contents are completely overwritten below.
+        let output = MLXArray(
+            Data(count: outputShape.reduce(1, *) * DType.bfloat16.size),
+            outputShape, dtype: .bfloat16)
+        var materialized = [contiguousQuery, contiguousKey, contiguousValue, output]
+        if let contiguousMask { materialized.append(contiguousMask) }
+        eval(materialized)
+
+        let queryBuffer = noCopyBuffer(contiguousQuery, device: device, label: "query")
+        let keyBuffer = noCopyBuffer(contiguousKey, device: device, label: "key")
+        let valueBuffer = noCopyBuffer(contiguousValue, device: device, label: "value")
+        let maskBuffer = contiguousMask.map {
+            noCopyBuffer($0, device: device, label: "additive mask")
+        }
         let outputBuffer = noCopyBuffer(output, device: device, label: "output")
         let queryData = MPSGraphTensorData(
             queryBuffer,
@@ -253,11 +258,16 @@ public final class MiniCPMExactBF16SDPA {
                 maskData == nil,
                 "MiniCPM exact SDPA received an additive mask for an unmasked graph")
         }
-        plan.graph.run(
-            with: executionContext.commandQueue,
-            feeds: feeds,
-            targetOperations: nil,
-            resultsDictionary: [plan.outputTensor: outputData])
+        // Keep materialized MLX storage alive while its no-copy buffers are in use.
+        withExtendedLifetime(
+            (contiguousQuery, contiguousKey, contiguousValue, contiguousMask, output)
+        ) {
+            plan.graph.run(
+                with: executionContext.commandQueue,
+                feeds: feeds,
+                targetOperations: nil,
+                resultsDictionary: [plan.outputTensor: outputData])
+        }
         return output
     }
 
@@ -505,21 +515,12 @@ public final class MiniCPMExactBF16SDPA {
             name: name)
     }
 
-    private static func rowContiguous(_ array: MLXArray) -> MLXArray {
-        eval(array)
-        let backing = array.asData(access: .noCopy)
-        guard isRowContiguous(shape: array.shape, strides: backing.strides) else {
-            return array.contiguous()
-        }
-        return array
-    }
-
+    /// Bridge storage already materialized by the caller's batched eval.
     private static func noCopyBuffer(
         _ array: MLXArray,
         device: any MTLDevice,
         label: String
     ) -> any MTLBuffer {
-        eval(array)
         precondition(array.dtype == .bfloat16, "MiniCPM exact SDPA \(label) must be BF16")
         let backing = array.asData(access: .noCopy)
         precondition(

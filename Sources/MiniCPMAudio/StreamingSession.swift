@@ -81,14 +81,13 @@ public final class MiniCPMAudioStreamingSession {
         _ samples: [Float],
         isFinal: Bool = false
     ) throws -> MiniCPMStreamingAudioEncoding? {
-        let isFirstChunk = melProcessor.emittedFrameCount == 0
         guard let features = try melProcessor.accept(samples, isFinal: isFinal) else {
             return nil
         }
-        // The upstream duplex path marks every emitted mel chunk as carrying
-        // two frames of CNN context on the right.  On the first chunk there
-        // is no left context to discard; each later chunk also carries two
-        // redundant frames on the left.  Keep this decision at the PCM entry
+        // Regular duplex chunks supply two CNN-context rows on the right;
+        // the first has no left context, and later chunks supply two on the
+        // left. A final flush has no redundant right rows. Keep the frontend's
+        // actual context metadata at the PCM entry
         // point because callers of ``encodeFeatures`` may intentionally pass
         // ordinary (non-context) chunks with its 0/0 defaults.
         //
@@ -96,15 +95,14 @@ public final class MiniCPMAudioStreamingSession {
         // exactly once.  The streaming wrapper only supplies the metadata;
         // its cache-length accounting below uses the same geometry without
         // slicing the feature tensor a second time.
-        let prefixExtraFrames = isFirstChunk ? 0 : 2
         let array = MLXArray(
             features.data,
             [1, features.timeFrames, features.melBins]
         )
         return try encodeFeatures(
             array,
-            prefixExtraFrames: prefixExtraFrames,
-            suffixExtraFrames: 2
+            prefixExtraFrames: features.prefixExtraFrames,
+            suffixExtraFrames: features.suffixExtraFrames
         )
     }
 
@@ -156,7 +154,8 @@ public final class MiniCPMAudioStreamingSession {
             ? (prefixExtraFrames + 1) / 2 : 0
         let suffixRemove = suffixExtraFrames > 0
             ? (suffixExtraFrames + 1) / 2 : 0
-        let incomingPositions = (features.dim(1) - 1) / 2 + 1
+        let convolutionPositions = (features.dim(1) - 1) / 2 + 1
+        let incomingPositions = convolutionPositions
             - prefixRemove - suffixRemove
         guard incomingPositions > 0 else {
             throw MiniCPMAudioError.invalidFeatures(
@@ -164,7 +163,9 @@ public final class MiniCPMAudioStreamingSession {
         }
         var didReset = false
         if let cache,
-           cache.length + incomingPositions
+           // The official reset test uses the pre-crop CNN length, even
+           // though only the core positions are added to the next KV cache.
+           cache.length + convolutionPositions
                 >= model.configuration.maximumSourcePositions {
             self.cache = nil
             cacheResetCount += 1

@@ -109,13 +109,10 @@ public enum MiniCPMAudioBF16Attention {
         captureIntermediates: Bool
     ) -> Result {
         validate(query: query, key: key, value: value)
-        let q = rowContiguous(query)
-        let k = rowContiguous(key)
-        let v = rowContiguous(value)
-        var m: MLXArray?
-        if let additiveMask {
-            m = rowContiguous(additiveMask)
-        }
+        let q = query.contiguous()
+        let k = key.contiguous()
+        let v = value.contiguous()
+        let m = additiveMask?.contiguous()
         let keyID = PlanKey(
             queryShape: q.shape,
             keyShape: k.shape,
@@ -211,12 +208,8 @@ public enum MiniCPMAudioBF16Attention {
         planLock.unlock()
 
         let device = execution.device
-        let queryBuffer = noCopyBuffer(q, device: device, label: "query")
-        let keyBuffer = noCopyBuffer(k, device: device, label: "key")
-        let valueBuffer = noCopyBuffer(v, device: device, label: "value")
         let contextShape = [q.dim(0), q.dim(1), q.dim(2), v.dim(3)]
         let context = MLXArray.zeros(contextShape, dtype: .bfloat16)
-        let contextBuffer = noCopyBuffer(context, device: device, label: "context")
         let scores: MLXArray
         let probabilities: MLXArray?
         if captureIntermediates {
@@ -233,6 +226,20 @@ public enum MiniCPMAudioBF16Attention {
             probabilities = nil
         }
 
+        // Materialize all feeds and bound destinations together before
+        // exposing their storage to MPSGraph. Unbound trace placeholders
+        // remain lazy in production calls.
+        var materialized = [q, k, v, context]
+        if let m { materialized.append(m) }
+        if captureIntermediates {
+            materialized.append(contentsOf: [scores, probabilities!])
+        }
+        eval(materialized)
+
+        let queryBuffer = noCopyBuffer(q, device: device, label: "query")
+        let keyBuffer = noCopyBuffer(k, device: device, label: "key")
+        let valueBuffer = noCopyBuffer(v, device: device, label: "value")
+        let contextBuffer = noCopyBuffer(context, device: device, label: "context")
         let queryData = MPSGraphTensorData(
             queryBuffer,
             shape: q.shape.map(NSNumber.init),
@@ -279,15 +286,14 @@ public enum MiniCPMAudioBF16Attention {
 
         execution.lock.lock()
         defer { execution.lock.unlock() }
-        plan.graph.run(
-            with: execution.commandQueue,
-            feeds: feeds,
-            targetOperations: nil,
-            resultsDictionary: resultDictionary)
-        if captureIntermediates {
-            eval(scores, probabilities!, context)
-        } else {
-            eval(context)
+        // TensorData retains buffer wrappers, while the MLX arrays own the
+        // underlying storage through this synchronous graph execution.
+        withExtendedLifetime((q, k, v, m, context, scores, probabilities)) {
+            plan.graph.run(
+                with: execution.commandQueue,
+                feeds: feeds,
+                targetOperations: nil,
+                resultsDictionary: resultDictionary)
         }
         return Result(
             scores: scores,
@@ -311,21 +317,12 @@ public enum MiniCPMAudioBF16Attention {
         precondition(query.dim(3) == key.dim(3))
     }
 
-    private static func rowContiguous(_ array: MLXArray) -> MLXArray {
-        eval(array)
-        let backing = array.asData(access: .noCopy)
-        guard isRowContiguous(shape: array.shape, strides: backing.strides) else {
-            return array.contiguous()
-        }
-        return array
-    }
-
+    /// Bridge storage already materialized by the caller's batched eval.
     private static func noCopyBuffer(
         _ array: MLXArray,
         device: any MTLDevice,
         label: String
     ) -> any MTLBuffer {
-        eval(array)
         let backing = array.asData(access: .noCopy)
         precondition(
             backing.dType == .bfloat16

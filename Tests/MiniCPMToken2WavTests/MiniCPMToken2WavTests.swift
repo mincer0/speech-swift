@@ -48,6 +48,30 @@ final class MiniCPMHiFTConfigurationTests: XCTestCase {
 }
 
 final class MiniCPMSpeechTokenBufferTests: XCTestCase {
+    func testCommittedLookaheadCheckpointSurvivesMiddleAndFinalRollback() {
+        var buffer = MiniCPMSpeechTokenBuffer(
+            chunkTokenCount: 25,
+            lookaheadTokenCount: 3,
+            minimumForceFlushTokenCount: 5,
+            initialTokens: [4_218, 4_218, 4_218])
+        _ = buffer.append(
+            (0 ..< 25).map(Int32.init), forceFlush: false, isFinal: false)
+        let checkpoint = buffer
+        XCTAssertEqual(checkpoint.tokens, [22, 23, 24])
+
+        let middle = buffer.append(
+            (25 ..< 50).map(Int32.init), forceFlush: false, isFinal: false)
+        let final = buffer.append([], forceFlush: false, isFinal: true)
+        XCTAssertTrue(buffer.tokens.isEmpty)
+
+        buffer = checkpoint
+        XCTAssertEqual(buffer.tokens, [22, 23, 24])
+        XCTAssertEqual(buffer.append(
+            (25 ..< 50).map(Int32.init), forceFlush: false, isFinal: false), middle)
+        XCTAssertEqual(buffer.append([], forceFlush: false, isFinal: true), final)
+        XCTAssertTrue(buffer.tokens.isEmpty)
+    }
+
     func testTokenBufferCheckpointRestoresAfterCancelledWindow() {
         var buffer = MiniCPMSpeechTokenBuffer(
             chunkTokenCount: 25,
@@ -146,6 +170,80 @@ final class MiniCPMSpeechTokenBufferTests: XCTestCase {
         XCTAssertEqual(jobs[2].stableTokenCount, 13)
         XCTAssertTrue(jobs[2].isFinal)
         XCTAssertTrue(buffer.tokens.isEmpty)
+    }
+}
+
+final class MiniCPMToken2WavSnapshotTests: XCTestCase {
+    func testSnapshotRestoresReleasedPromptAndExactPendingState() throws {
+        // Construct small modules without loading weights or running Flow.
+        var flowConfiguration = MiniCPMFlowConfiguration()
+        flowConfiguration.tokenVocabularySize = 32
+        flowConfiguration.tokenDimension = 8
+        flowConfiguration.encoderBlocks = 1
+        flowConfiguration.encoderUpsampleBlocks = 1
+        flowConfiguration.encoderHeads = 1
+        flowConfiguration.encoderFeedForwardDimension = 16
+        flowConfiguration.decoderHiddenDimension = 8
+        flowConfiguration.decoderBlocks = 1
+        flowConfiguration.decoderHeads = 1
+        flowConfiguration.decoderHeadDimension = 8
+        flowConfiguration.odeSteps = 1
+        var hiftConfiguration = MiniCPMHiFTConfiguration()
+        hiftConfiguration.upsampleRates = []
+        hiftConfiguration.upsampleKernelSizes = []
+        hiftConfiguration.residualKernelSizes = []
+        hiftConfiguration.residualDilations = []
+        hiftConfiguration.sourceResidualKernelSizes = []
+        hiftConfiguration.sourceResidualDilations = []
+        let pipeline = MiniCPMToken2WavPipeline(
+            flow: MiniCPMToken2WavFlowModel(configuration: flowConfiguration),
+            hift: MiniCPMHiFTGenerator(configuration: hiftConfiguration))
+        let empty = pipeline.snapshot()
+        let conformer = MiniCPMUpsampleConformerCache(
+            firstAttention: [], secondAttention: [],
+            preLookaheadConvolution: MLXArray.zeros([1, 1, 2]),
+            upsampleConvolution: MLXArray.zeros([1, 1, 4]))
+        let base = MiniCPMToken2WavFlowCache(
+            conformer: conformer,
+            decoder: MiniCPMFlowMatchingCache(odeStepCaches: [], totalFrames: 4))
+        let generated = MiniCPMToken2WavFlowCache(
+            conformer: conformer,
+            decoder: MiniCPMFlowMatchingCache(odeStepCaches: [], totalFrames: 54))
+        let checkpoint = MiniCPMToken2WavPipeline.Snapshot(
+            baseFlowCache: base,
+            flowCache: generated,
+            speakerEmbedding: MLXArray.ones([1, 192]),
+            tokenBuffer: MiniCPMSpeechTokenBuffer(
+                chunkTokenCount: 25, lookaheadTokenCount: 3,
+                minimumForceFlushTokenCount: 5, initialTokens: [22, 23, 24]),
+            turnOpen: true,
+            vocoder: pipeline.vocoder.snapshot(),
+            lastStageTiming: MiniCPMToken2WavStageTiming(flowMS: 12, hiftMS: 3))
+        pipeline.restore(checkpoint)
+        pipeline.releaseContext()
+        XCTAssertFalse(pipeline.isPrepared)
+        XCTAssertFalse(pipeline.isTurnOpen)
+        XCTAssertEqual(pipeline.pendingTokenCount, 0)
+
+        pipeline.restore(checkpoint)
+        let restored = pipeline.snapshot()
+        XCTAssertTrue(pipeline.isPrepared)
+        XCTAssertTrue(pipeline.isTurnOpen)
+        XCTAssertTrue(restored.baseFlowCache === base)
+        XCTAssertTrue(restored.flowCache === generated)
+        XCTAssertEqual(restored.tokenBuffer.tokens, [22, 23, 24])
+        XCTAssertEqual(restored.lastStageTiming, checkpoint.lastStageTiming)
+        XCTAssertEqual(try XCTUnwrap(restored.speakerEmbedding).shape, [1, 192])
+        XCTAssertEqual(
+            try XCTUnwrap(pipeline.contextStatistics()).totalGeneratedAndPromptFrames, 54)
+
+        // Restore also replaces the persistent prompt, not only generated KV.
+        pipeline.restore(empty)
+        XCTAssertFalse(pipeline.isPrepared)
+        XCTAssertFalse(pipeline.isTurnOpen)
+        XCTAssertNil(pipeline.contextStatistics())
+        XCTAssertNil(pipeline.lastStageTiming)
+        XCTAssertEqual(pipeline.pendingTokenCount, 0)
     }
 }
 
@@ -421,6 +519,114 @@ final class E2EMiniCPMToken2WavTests: XCTestCase {
         XCTAssertLessThanOrEqual(maximum, accuracy, file: file, line: line)
     }
 
+    private func assertFlowCachesEqual(
+        _ lhs: MiniCPMToken2WavFlowCache,
+        _ rhs: MiniCPMToken2WavFlowCache,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        func arrays(_ cache: MiniCPMToken2WavFlowCache) -> [MLXArray] {
+            var values = cache.conformer.firstAttention.flatMap { [$0.keys, $0.values] }
+            values += cache.conformer.secondAttention.flatMap { [$0.keys, $0.values] }
+            values += [cache.conformer.preLookaheadConvolution,
+                       cache.conformer.upsampleConvolution]
+            for step in cache.decoder.odeStepCaches {
+                for layer in step.layers {
+                    values += [layer.attention.keys, layer.attention.values,
+                               layer.convolution.first, layer.convolution.second]
+                }
+            }
+            return values
+        }
+        XCTAssertEqual(lhs.promptInputPositions, rhs.promptInputPositions,
+                       file: file, line: line)
+        XCTAssertEqual(lhs.promptOutputPositions, rhs.promptOutputPositions,
+                       file: file, line: line)
+        XCTAssertEqual(lhs.decoder.totalFrames, rhs.decoder.totalFrames,
+                       file: file, line: line)
+        let left = arrays(lhs)
+        let right = arrays(rhs)
+        XCTAssertEqual(left.count, right.count, file: file, line: line)
+        for (a, b) in zip(left, right) {
+            XCTAssertEqual(a.shape, b.shape, file: file, line: line)
+            guard a.shape == b.shape, a.size > 0 else { continue }
+            XCTAssertEqual(MLX.abs(a - b).max().item(Float.self), 0,
+                           file: file, line: line)
+        }
+    }
+
+    func testRealSnapshotRestoresCommittedMiddleAndFinalAudio() throws {
+        let fixture = try loadRealFixture()
+        let pipeline = fixture.pipeline
+        let tokens = fixture.generatedTokens
+        guard tokens.count >= 50 else {
+            return XCTFail("snapshot regression needs at least two 25-code units")
+        }
+        _ = try pipeline.append(Array(tokens.prefix(25)))
+        let first = pipeline.snapshot()
+        let firstStatistics = try XCTUnwrap(pipeline.contextStatistics())
+        XCTAssertEqual(firstStatistics.pendingTokens, 3)
+        XCTAssertGreaterThan(firstStatistics.vocoderSpeechSamples, 0)
+
+        let middleTokens = Array(tokens[25 ..< 50])
+        MLXRandom.seed(4_501)
+        let middle = try pipeline.append(middleTokens)
+        let middleSamples = samples(middle)
+        let middleSnapshot = pipeline.snapshot()
+        let middleStatistics = try XCTUnwrap(pipeline.contextStatistics())
+        MLXRandom.seed(4_502)
+        let final = try pipeline.append([], isFinal: true)
+        let finalSamples = samples(final)
+        let finalStatistics = try XCTUnwrap(pipeline.contextStatistics())
+        XCTAssertEqual(final.count, 1)
+        XCTAssertTrue(final[0].isFinal)
+        XCTAssertFalse(pipeline.isTurnOpen)
+
+        // A rejected final unit may already have reset/released the prompt
+        // state. Restoring the prior unit must recover its committed tail,
+        // generated Flow KV and HiFT overlap, rather than opening a new turn.
+        pipeline.releaseContext()
+        pipeline.restore(first)
+        XCTAssertTrue(pipeline.isPrepared)
+        XCTAssertTrue(pipeline.isTurnOpen)
+        assertStatisticsEqual(firstStatistics,
+                              try XCTUnwrap(pipeline.contextStatistics()))
+        XCTAssertTrue(pipeline.snapshot().flowCache === first.flowCache)
+        XCTAssertEqual(pipeline.snapshot().tokenBuffer.tokens, first.tokenBuffer.tokens)
+        XCTAssertEqual(pipeline.lastStageTiming, first.lastStageTiming)
+
+        // Pin only the test's source noise/initial harmonic phase. Production
+        // snapshots deliberately leave the shared MLX random source alone.
+        MLXRandom.seed(4_501)
+        let middleRetry = try pipeline.append(middleTokens)
+        assertWaveformsEqual(middleSamples, samples(middleRetry), accuracy: 0)
+        assertStatisticsEqual(middleStatistics,
+                              try XCTUnwrap(pipeline.contextStatistics()))
+        assertFlowCachesEqual(
+            try XCTUnwrap(middleSnapshot.flowCache),
+            try XCTUnwrap(pipeline.snapshot().flowCache))
+        XCTAssertEqual(pipeline.snapshot().tokenBuffer.tokens,
+                       middleSnapshot.tokenBuffer.tokens)
+
+        MLXRandom.seed(4_502)
+        let finalRetry = try pipeline.append([], isFinal: true)
+        assertWaveformsEqual(finalSamples, samples(finalRetry), accuracy: 0)
+        assertStatisticsEqual(finalStatistics,
+                              try XCTUnwrap(pipeline.contextStatistics()))
+        XCTAssertFalse(pipeline.isTurnOpen)
+
+        // Also retry a final-only unit from the already committed middle
+        // boundary. A reset-based rollback would lose this three-code tail.
+        pipeline.restore(middleSnapshot)
+        XCTAssertTrue(pipeline.isTurnOpen)
+        XCTAssertEqual(pipeline.pendingTokenCount, 3)
+        MLXRandom.seed(4_502)
+        let finalOnlyRetry = try pipeline.append([], isFinal: true)
+        assertWaveformsEqual(finalSamples, samples(finalOnlyRetry), accuracy: 0)
+        assertStatisticsEqual(finalStatistics,
+                              try XCTUnwrap(pipeline.contextStatistics()))
+    }
+
     func testRealPipelineEmitsFiniteWaveform() throws {
         let fixture = try loadRealFixture()
         let chunks = try fixture.pipeline.append(
@@ -446,6 +652,7 @@ final class E2EMiniCPMToken2WavTests: XCTestCase {
         XCTAssertEqual(prepared.vocoderSpeechSamples, 0)
         let promptStatistics = prepared
 
+        MLXRandom.seed(4_503)
         let chunks = try stream(pipeline, tokens: tokens)
         XCTAssertEqual(chunks.count, 4)
         XCTAssertEqual(chunks.map(\.inputTokenCount), [28, 28, 15, 21])
@@ -504,6 +711,7 @@ final class E2EMiniCPMToken2WavTests: XCTestCase {
             resetStatistics.conformerOutputPositions,
             promptStatistics.conformerOutputPositions)
 
+        MLXRandom.seed(4_503)
         let replay = try stream(pipeline, tokens: tokens)
         assertWaveformsEqual(waveform, samples(replay))
         XCTAssertEqual(replay.map(\.inputTokenCount), chunks.map(\.inputTokenCount))
@@ -540,6 +748,7 @@ final class E2EMiniCPMToken2WavTests: XCTestCase {
         XCTAssertTrue(samples(final).allSatisfy(\.isFinite))
 
         pipeline.resetForNewTurn()
+        MLXRandom.seed(4_504)
         let baseline = try pipeline.append(
             Array(tokens.prefix(25)), isFinal: false)
         let baselineSamples = samples(baseline)
@@ -571,6 +780,7 @@ final class E2EMiniCPMToken2WavTests: XCTestCase {
         assertStatisticsEqual(beforeCancel, afterCancel)
         XCTAssertTrue(pipeline.isTurnOpen)
 
+        MLXRandom.seed(4_504)
         let retry = try pipeline.append(
             Array(tokens.prefix(25)), isFinal: false)
         assertWaveformsEqual(baselineSamples, samples(retry))

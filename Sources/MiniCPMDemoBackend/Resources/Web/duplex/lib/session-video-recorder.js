@@ -40,6 +40,11 @@ export class SessionVideoRecorder {
         this._recCtx = null;
         this._stereoNode = null;
         this._startTime = 0;
+        this._pausedAt = 0;
+        this._pausedDurationMs = 0;
+        this._inputHeld = false;
+        this._videoTrack = null;
+        this._pausedRightSources = [];
 
         // Canvas compositing state (subtitle overlay or iOS fallback)
         this._canvasComposite = null; // { canvas, ctx, animFrame }
@@ -79,91 +84,170 @@ export class SessionVideoRecorder {
         } = settings;
         const { leftAudioStream = null, leftAudioBuffer = null } = leftAudioOptions;
 
-        this._subtitleEnabled = subtitle;
-        this._subtitleMessages = [];
-        this._subtitleHeight = subtitleHeight;
-        this._subtitleOpacityBottom = subtitleOpacityBottom;
-        this._subtitleOpacityTop = subtitleOpacityTop;
+        try {
+            this._subtitleEnabled = subtitle;
+            this._subtitleMessages = [];
+            this._subtitleHeight = subtitleHeight;
+            this._subtitleOpacityBottom = subtitleOpacityBottom;
+            this._subtitleOpacityTop = subtitleOpacityTop;
 
-        // 1. Acquire video track (force canvas when subtitle is enabled for compositing)
-        const { track: videoTrack, method } = subtitle
-            ? this._acquireCanvasTrack()
-            : this._acquireVideoTrack();
+            // Prepare the audio producer before acquiring a video track. Starting
+            // video while audio is awaiting its first render gives the muxer two
+            // different track origins, particularly under CPU/GPU load.
+            this._recCtx = new AudioContext({ sampleRate: this._inputSR });
+            if (this._recCtx.state === 'suspended') await this._recCtx.resume();
 
-        // 2. Create recording AudioContext + stereo mixing worklet
-        this._recCtx = new AudioContext({ sampleRate: this._inputSR });
-        if (this._recCtx.state === 'suspended') await this._recCtx.resume();
+            await this._recCtx.audioWorklet.addModule('/static/duplex/lib/stereo-recorder-processor.js');
+            this._stereoNode = new AudioWorkletNode(this._recCtx, 'stereo-recorder-processor', {
+                numberOfInputs: 2,    // input 0: left channel, input 1: right channel
+                outputChannelCount: [2],
+            });
+            const audioReady = new Promise((resolve, reject) => {
+                this._audioReadyTimer = setTimeout(() => {
+                    this._stereoNode.port.onmessage = null;
+                    reject(new Error('Recording audio did not start rendering'));
+                }, 15000);
+                this._stereoNode.port.onmessage = (event) => {
+                    if (event.data?.type !== 'ready') return;
+                    clearTimeout(this._audioReadyTimer);
+                    this._audioReadyTimer = null;
+                    this._stereoNode.port.onmessage = null;
+                    resolve();
+                };
+            });
 
-        await this._recCtx.audioWorklet.addModule('/static/duplex/lib/stereo-recorder-processor.js');
-        this._stereoNode = new AudioWorkletNode(this._recCtx, 'stereo-recorder-processor', {
-            numberOfInputs: 2,    // input 0: left channel, input 1: right channel
-            outputChannelCount: [2],
-        });
+            // 2b. Connect direct left audio source (zero-delay, bypasses CaptureProcessor 1s chunking)
+            this._directLeft = false;
+            this._leftSource = null;
+            this._leftBufSource = null;
+            this._leftBuffer = null;
+            this._leftBufferOffset = 0;
+            this._leftBufferStartedAt = null;
+            this._inputHeld = false;
 
-        // 2b. Connect direct left audio source (zero-delay, bypasses CaptureProcessor 1s chunking)
-        this._directLeft = false;
-        this._leftSource = null;
-        this._leftBufSource = null;
+            if (leftAudioStream) {
+                this._leftSource = this._recCtx.createMediaStreamSource(leftAudioStream);
+                this._leftSource.connect(this._stereoNode);
+                this._stereoNode.port.postMessage({ command: 'useInputLeft' });
+                this._directLeft = true;
+            } else if (leftAudioBuffer && leftAudioBuffer.length > 0) {
+                const buf = this._recCtx.createBuffer(1, leftAudioBuffer.length, this._inputSR);
+                buf.getChannelData(0).set(leftAudioBuffer);
+                this._leftBuffer = buf;
+                this._stereoNode.port.postMessage({ command: 'useInputLeft' });
+                this._directLeft = true;
+            }
 
-        if (leftAudioStream) {
-            this._leftSource = this._recCtx.createMediaStreamSource(leftAudioStream);
-            this._leftSource.connect(this._stereoNode);
-            this._stereoNode.port.postMessage({ command: 'useInputLeft' });
-            this._directLeft = true;
-        } else if (leftAudioBuffer && leftAudioBuffer.length > 0) {
-            const buf = this._recCtx.createBuffer(1, leftAudioBuffer.length, this._inputSR);
-            buf.getChannelData(0).set(leftAudioBuffer);
-            this._leftBufSource = this._recCtx.createBufferSource();
-            this._leftBufSource.buffer = buf;
-            this._leftBufSource.connect(this._stereoNode);
-            this._stereoNode.port.postMessage({ command: 'useInputLeft' });
-            this._directLeft = true;
+            // 2c. Setup right channel: sample-accurate AudioBufferSourceNode scheduling
+            //     Mirrors AudioPlayer's scheduling — no postMessage jitter, no queue-drain gaps.
+            this._rightNextTime = 0;
+            this._rightSources = [];
+            this._pausedRightSources = [];
+            this._stereoNode.port.postMessage({ command: 'useInputRight' });
+
+            // 3. Connect to MediaStreamDestination for stereo audio track
+            const dest = this._recCtx.createMediaStreamDestination();
+            this._stereoNode.connect(dest);
+            await audioReady;
+
+            const { track: videoTrack, method } = subtitle
+                ? this._acquireCanvasTrack()
+                : this._acquireVideoTrack();
+            this._videoTrack = videoTrack;
+
+            // 4. Combine video + stereo audio into one MediaStream
+            const tracks = [...dest.stream.getAudioTracks()];
+            if (videoTrack) tracks.unshift(videoTrack);
+            const combinedStream = new MediaStream(tracks);
+
+            // 5. Select codec: user-specified or auto-detect
+            const mimeType = (requestedMime === 'auto')
+                ? this._selectMimeType(!!videoTrack)
+                : requestedMime;
+
+            // 6. Create MediaRecorder
+            const options = { mimeType };
+            if (videoTrack) options.videoBitsPerSecond = videoBitsPerSecond;
+            this._mediaRecorder = new MediaRecorder(combinedStream, options);
+
+            this._chunks = [];
+            this._mediaRecorder.ondataavailable = (e) => {
+                if (e.data.size > 0) this._chunks.push(e.data);
+            };
+
+            await new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    reject(new Error('Media recorder did not start'));
+                }, 15000);
+                this._mediaRecorder.onstart = () => {
+                    clearTimeout(timer);
+                    this._mediaRecorder.onstart = null;
+                    this._mediaRecorder.onerror = null;
+                    resolve();
+                };
+                this._mediaRecorder.onerror = (event) => {
+                    clearTimeout(timer);
+                    reject(event.error || new Error('Media recorder failed to start'));
+                };
+                try {
+                    this._mediaRecorder.start(1000); // 1-second timeslice
+                } catch (error) {
+                    clearTimeout(timer);
+                    reject(error);
+                }
+            });
+
+            this._recording = true;
+            this._paused = false;
+            this._startTime = performance.now();
+            this._pausedAt = 0;
+            this._pausedDurationMs = 0;
+            this._rightNextTime = this._recCtx.currentTime;
+            this._resumeLeftBuffer();
+
+            const leftMode = leftAudioStream ? 'stream' : leftAudioBuffer ? 'buffer' : 'pushLeft';
+            console.log(`[SessionVideoRecorder] started (${mimeType}, video=${method}, left=${leftMode}, right=scheduled, ${(videoBitsPerSecond / 1_000_000).toFixed(0)} Mbps)`);
+        } catch (error) {
+            // start() may fail before recording becomes true. stop() cannot
+            // release that partially prepared graph, so close it here.
+            clearTimeout(this._audioReadyTimer);
+            this._audioReadyTimer = null;
+            if (this._canvasComposite) {
+                cancelAnimationFrame(this._canvasComposite.animFrame);
+                this._canvasComposite = null;
+            }
+            this._videoTrack?.stop();
+            this._videoTrack = null;
+            if (this._mediaRecorder) {
+                this._mediaRecorder.onstart = null;
+                this._mediaRecorder.onerror = null;
+                this._mediaRecorder.ondataavailable = null;
+                if (this._mediaRecorder.state !== 'inactive') {
+                    try { this._mediaRecorder.stop(); } catch (_) {}
+                }
+                this._mediaRecorder = null;
+            }
+            this._leftSource?.disconnect();
+            this._leftSource = null;
+            if (this._leftBufSource) {
+                try { this._leftBufSource.stop(); } catch (_) {}
+                this._leftBufSource.disconnect();
+                this._leftBufSource = null;
+            }
+            if (this._stereoNode) {
+                this._stereoNode.port.onmessage = null;
+                this._stereoNode.disconnect();
+                this._stereoNode = null;
+            }
+            if (this._recCtx) {
+                await this._recCtx.close().catch(() => {});
+                this._recCtx = null;
+            }
+            this._leftBuffer = null;
+            this._chunks = [];
+            this._recording = false;
+            throw error;
         }
-
-        // 2c. Setup right channel: sample-accurate AudioBufferSourceNode scheduling
-        //     Mirrors AudioPlayer's scheduling — no postMessage jitter, no queue-drain gaps.
-        this._rightNextTime = 0;
-        this._rightSources = [];
-        this._stereoNode.port.postMessage({ command: 'useInputRight' });
-
-        // 3. Connect to MediaStreamDestination for stereo audio track
-        const dest = this._recCtx.createMediaStreamDestination();
-        this._stereoNode.connect(dest);
-
-        // 4. Combine video + stereo audio into one MediaStream
-        const tracks = [...dest.stream.getAudioTracks()];
-        if (videoTrack) tracks.unshift(videoTrack);
-        const combinedStream = new MediaStream(tracks);
-
-        // 5. Select codec: user-specified or auto-detect
-        const mimeType = (requestedMime === 'auto')
-            ? this._selectMimeType(!!videoTrack)
-            : requestedMime;
-
-        // 6. Create MediaRecorder
-        const options = { mimeType };
-        if (videoTrack) options.videoBitsPerSecond = videoBitsPerSecond;
-        this._mediaRecorder = new MediaRecorder(combinedStream, options);
-
-        this._chunks = [];
-        this._mediaRecorder.ondataavailable = (e) => {
-            if (e.data.size > 0) this._chunks.push(e.data);
-        };
-
-        this._mediaRecorder.start(1000); // 1-second timeslice for memory efficiency
-
-        // Start pre-buffered audio playback (video-only File mode)
-        if (this._leftBufSource) {
-            this._leftBufSource.start();
-        }
-
-        this._recording = true;
-        this._paused = false;
-        this._startTime = performance.now();
-        this._rightNextTime = this._recCtx.currentTime;
-
-        const leftMode = leftAudioStream ? 'stream' : leftAudioBuffer ? 'buffer' : 'pushLeft';
-        console.log(`[SessionVideoRecorder] started (${mimeType}, video=${method}, left=${leftMode}, right=scheduled, ${(videoBitsPerSecond / 1_000_000).toFixed(0)} Mbps)`);
     }
 
     /**
@@ -176,6 +260,54 @@ export class SessionVideoRecorder {
         this._stereoNode?.port.postMessage({ channel: 'left', audio: pcm16k });
     }
 
+    // Input-only holds leave MediaRecorder and assistant audio running. Buffer
+    // sources cannot resume after stop(), so retain their consumed offset and
+    // create the next source from that position when capture is released.
+    pauseInputCapture() {
+        if (!this._recording || this._inputHeld) return;
+        this._inputHeld = true;
+        this._pauseLeftBuffer();
+    }
+
+    _pauseLeftBuffer() {
+        if (this._leftBufSource) {
+            const src = this._leftBufSource;
+            this._leftBufferOffset = Math.min(this._leftBuffer.duration,
+                this._leftBufferOffset + Math.max(0,
+                    this._recCtx.currentTime - this._leftBufferStartedAt));
+            this._leftBufSource = null;
+            this._leftBufferStartedAt = null;
+            try { src.stop(); } catch (_) {}
+            try { src.disconnect(); } catch (_) {}
+        }
+    }
+
+    resumeInputCapture() {
+        if (!this._recording || !this._inputHeld) return;
+        this._inputHeld = false;
+        this._resumeLeftBuffer();
+    }
+
+    _resumeLeftBuffer() {
+        if (!this._recording || this._paused || this._inputHeld
+            || !this._leftBuffer || this._leftBufSource
+            || this._leftBufferOffset >= this._leftBuffer.duration) return;
+        const src = this._recCtx.createBufferSource();
+        src.buffer = this._leftBuffer;
+        src.connect(this._stereoNode);
+        this._leftBufferStartedAt = this._recCtx.currentTime;
+        this._leftBufSource = src;
+        src.onended = () => {
+            // A stopped source can finish after its replacement has started.
+            if (this._leftBufSource !== src) return;
+            this._leftBufferOffset = this._leftBuffer.duration;
+            this._leftBufSource = null;
+            this._leftBufferStartedAt = null;
+            src.disconnect();
+        };
+        src.start(this._recCtx.currentTime, this._leftBufferOffset);
+    }
+
     /**
      * Push right-channel chunk (AI response from AudioPlayer.onRawAudio).
      * Uses AudioBufferSourceNode scheduling for sample-accurate placement,
@@ -184,7 +316,7 @@ export class SessionVideoRecorder {
      *
      * @param {Float32Array} samples - Raw PCM at aiSR
      * @param {number} sampleRate - Source sample rate (typically 24000)
-     * @param {number} timestamp - performance.now() timestamp (kept for API compat)
+     * @param {number} timestamp - performance.now() timestamp of scheduled playback
      */
     pushRight(samples, sampleRate, timestamp) {
         if (!this._recording || this._paused || !this._recCtx) return;
@@ -197,11 +329,13 @@ export class SessionVideoRecorder {
         src.buffer = audioBuf;
         src.connect(this._stereoNode, 0, 1); // output 0 → stereoNode input 1 (right)
 
-        // Schedule: gapless back-to-back; shift forward on underrun (mirrors AudioPlayer)
+        // Map the player's wall-clock schedule into this recording context.
+        // A future buffered chunk must not be encoded before the user hears it.
         const now = this._recCtx.currentTime;
-        if (this._rightNextTime < now) {
-            this._rightNextTime = now;
-        }
+        const scheduled = Number.isFinite(timestamp)
+            ? now + Math.max(0, (timestamp - performance.now()) / 1000) : now;
+        this._rightNextTime = Math.max(this._rightNextTime, now, scheduled);
+        src._scheduledAt = this._rightNextTime;
         src.start(this._rightNextTime);
         this._rightNextTime += audioBuf.duration;
 
@@ -211,6 +345,19 @@ export class SessionVideoRecorder {
             const idx = this._rightSources.indexOf(src);
             if (idx >= 0) this._rightSources.splice(idx, 1);
         };
+    }
+
+    /** Cancel pending AI playback; already encoded audio remains intact. */
+    cancelRight(timestamp = performance.now()) {
+        if (!this._recording || !this._recCtx) return;
+        const now = this._recCtx.currentTime;
+        const cutoff = Math.max(now, now + (timestamp - performance.now()) / 1000);
+        for (const src of this._rightSources) {
+            try { src.stop(cutoff); } catch (_) {}
+        }
+        this._rightSources = [];
+        this._pausedRightSources = [];
+        this._rightNextTime = cutoff;
     }
 
     /**
@@ -247,17 +394,29 @@ export class SessionVideoRecorder {
     }
 
     /**
-     * Pause recording. MediaRecorder pauses encoding; AudioContext suspended
-     * to keep AudioBufferSource playback position aligned with recording timeline.
+     * Pause encoding and preserve queued sources. Keep both track producers on
+     * the same continuous clock; suspending only AudioContext shifts audio PTS
+     * relative to the video track after MediaRecorder removes the pause.
      */
     pause() {
         if (!this._recording || this._paused) return;
         this._paused = true;
+        this._pausedAt = performance.now();
+        this._pauseLeftBuffer();
+        const now = this._recCtx?.currentTime || 0;
+        this._pausedRightSources = this._rightSources.map(src => ({
+            buffer: src.buffer,
+            offset: (src._bufferOffset || 0) + Math.max(0, now - src._scheduledAt),
+            delay: Math.max(0, src._scheduledAt - now),
+        })).filter(item => item.offset < item.buffer.duration);
+        for (const src of this._rightSources) {
+            try { src.stop(); } catch (_) {}
+            try { src.disconnect(); } catch (_) {}
+        }
+        this._rightSources = [];
+        this._stereoNode?.port.postMessage({ command: 'pause' });
         if (this._mediaRecorder?.state === 'recording') {
             this._mediaRecorder.pause();
-        }
-        if (this._recCtx?.state === 'running') {
-            this._recCtx.suspend();
         }
         console.log('[SessionVideoRecorder] paused');
     }
@@ -267,18 +426,30 @@ export class SessionVideoRecorder {
      */
     resume() {
         if (!this._recording || !this._paused) return;
+        this._pausedDurationMs += Math.max(0, performance.now() - this._pausedAt);
+        this._pausedAt = 0;
         this._paused = false;
-        if (this._recCtx?.state === 'suspended') {
-            this._recCtx.resume().then(() => {
-                if (this._mediaRecorder?.state === 'paused') {
-                    this._mediaRecorder.resume();
-                }
-            });
-        } else {
-            if (this._mediaRecorder?.state === 'paused') {
-                this._mediaRecorder.resume();
-            }
+        this._stereoNode?.port.postMessage({ command: 'resume' });
+        if (this._mediaRecorder?.state === 'paused') this._mediaRecorder.resume();
+        const now = this._recCtx?.currentTime || 0;
+        this._rightNextTime = now;
+        for (const item of this._pausedRightSources) {
+            const src = this._recCtx.createBufferSource();
+            src.buffer = item.buffer;
+            src.connect(this._stereoNode, 0, 1);
+            src._scheduledAt = now + item.delay;
+            src._bufferOffset = item.offset;
+            src.start(src._scheduledAt, item.offset);
+            this._rightNextTime = Math.max(this._rightNextTime,
+                src._scheduledAt + item.buffer.duration - item.offset);
+            this._rightSources.push(src);
+            src.onended = () => {
+                const idx = this._rightSources.indexOf(src);
+                if (idx >= 0) this._rightSources.splice(idx, 1);
+            };
         }
+        this._pausedRightSources = [];
+        this._resumeLeftBuffer();
         console.log('[SessionVideoRecorder] resumed');
     }
 
@@ -289,6 +460,14 @@ export class SessionVideoRecorder {
     stop() {
         if (!this._recording) {
             return Promise.resolve({ blob: new Blob(), durationSec: 0 });
+        }
+        // Stop scheduled right-channel sources before MediaRecorder's async
+        // final flush so cancelled tail audio cannot enter that flush.
+        this.cancelRight();
+        const elapsedMs = (this._paused ? this._pausedAt : performance.now())
+            - this._startTime - this._pausedDurationMs;
+        if (this._leftBufSource) {
+            try { this._leftBufSource.stop(); } catch (_) {}
         }
         this._recording = false;
         this._paused = false;
@@ -303,7 +482,7 @@ export class SessionVideoRecorder {
             this._mediaRecorder.onstop = () => {
                 const mimeType = this._mediaRecorder.mimeType || 'video/webm';
                 const blob = new Blob(this._chunks, { type: mimeType });
-                const durationSec = (performance.now() - this._startTime) / 1000;
+                const durationSec = Math.max(0, elapsedMs / 1000);
 
                 console.log(`[SessionVideoRecorder] encoded: ${durationSec.toFixed(1)}s, ` +
                     `${(blob.size / 1024 / 1024).toFixed(1)} MB (${mimeType})`);
@@ -311,7 +490,12 @@ export class SessionVideoRecorder {
                 // Cleanup
                 if (this._leftSource) { this._leftSource.disconnect(); this._leftSource = null; }
                 if (this._leftBufSource) { try { this._leftBufSource.stop(); } catch (_) {} this._leftBufSource = null; }
+                this._leftBuffer = null;
+                this._leftBufferStartedAt = null;
+                this._inputHeld = false;
                 this._directLeft = false;
+                this._videoTrack?.stop();
+                this._videoTrack = null;
                 for (const src of this._rightSources) {
                     try { src.stop(); } catch (_) {}
                     try { src.disconnect(); } catch (_) {}

@@ -54,6 +54,22 @@ public final class MiniCPMTTSLayerCache {
 
     public var offset: Int { count }
 
+    /// Full backing storage for a transactional, private-queue decode. The
+    /// encoded path reads this storage and returns separate allocations.
+    fileprivate var encodedState: MiniCPMTTSEncodedBF16Decode.Cache {
+        .init(keys: storedKeys, values: storedValues, count: count, capacity: capacity)
+    }
+
+    fileprivate func commitEncodedState(_ state: MiniCPMTTSEncodedBF16Decode.Cache) {
+        if state.capacity > capacity { capacityGrowthCount += 1 }
+        storedKeys = state.keys
+        storedValues = state.values
+        count = state.count
+        // Every encoded result owns fresh storage, so older snapshots retain
+        // their immutable allocations without a subsequent detach.
+        hasOutstandingSnapshot = false
+    }
+
     @discardableResult
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
         let tokenCount = newKeys.dim(2)
@@ -213,8 +229,8 @@ public final class MiniCPMTTSSession {
     /// Position at which the next semantic condition starts for the protocol
     /// streaming path.  The upstream MiniCPM-o contract advances by the
     /// condition length plus the 25 codes returned from a normal 26-step
-    /// generation.  The sampled look-ahead code is retained internally for
-    /// the next KV update, but is not part of this text-position accounting.
+    /// generation.  The final sampled code is discarded without entering KV,
+    /// so text-position accounting remains equal to the logical cache length.
     public private(set) var textStartPosition: Int = 0
     /// Number of accepted streaming chunks in the current turn.
     public private(set) var chunkIndex: Int = 0
@@ -229,8 +245,8 @@ public final class MiniCPMTTSSession {
 
     /// Lower-level ``generateChunk`` exposes the newest sampled code as a
     /// pending look-ahead token.  The protocol ``generateStreamingChunk``
-    /// facade keeps this slot between chunks so the next KV update consumes
-    /// it, while still hiding it from the Token2Wav-facing result.
+    /// facade discards this slot, matching the official duplex loop. Full-sequence
+    /// and explicitly interleaved callers may retain it through the lower-level API.
     public func clearPendingToken() { pendingToken = nil }
 
     public func reset() {
@@ -363,9 +379,9 @@ public struct MiniCPMTTSInterleavedGenerationResult {
 /// Result of one protocol-level semantic TTS chunk.
 ///
 /// A normal 26-step look-ahead chunk exposes 25 codes to Token2Wav and hides
-/// the newest sampled code.  That look-ahead code remains in the session and
-/// is consumed before the next condition, matching the official decoder's KV
-/// behavior.  ``textStartPosition`` is the value used for this condition;
+/// the newest sampled code. That final sample is discarded by the streaming
+/// facade and never enters KV, matching the official decoder's return contract.
+/// ``textStartPosition`` is the value used for this condition;
 /// ``nextTextStartPosition`` is the value after the returned 25-code prefix
 /// has been accounted for.  This matches MiniCPM-o's Python
 /// ``generate_chunk`` return value.
@@ -420,16 +436,12 @@ private func makeMiniCPMTTSLinear(
     _ outputDimensions: Int,
     bias: Bool = false
 ) -> Linear {
-    // Keep the production path on MLX.  The MPSGraph BF16 implementation is a
-    // parity diagnostic only: on the pinned CPU and MPS PyTorch oracles it did
-    // not improve the first-logits gate and changed stable-prefix tokens.  It
-    // may still be selected explicitly while investigating backend arithmetic,
-    // but an unproved diagnostic kernel must never become the model default.
-    let backend = ProcessInfo.processInfo.environment[
-        "MINICPM_TTS_BF16_LINEAR"]?.lowercased()
-    let exactKernels = ProcessInfo.processInfo.environment[
-        "MINICPM_TTS_EXACT_KERNELS"]?.lowercased()
-    if !bias, backend == "mpsgraph" || exactKernels == "mpsgraph" {
+    // The official three-chunk teacher trace requires both BF16 linear and
+    // multi-token attention boundaries. Float32/tiny calls still fall back
+    // inside the shared Linear implementation.
+    if !bias, MiniCPMTTSKernelPolicy.usesMPSGraph(
+        kernel: "LINEAR", defaultEnabled: true)
+    {
         return MiniCPMExactBF16Linear(
             inputDimensions,
             outputDimensions,
@@ -440,12 +452,28 @@ private func makeMiniCPMTTSLinear(
 
 @inline(__always)
 private func makeMiniCPMTTSRMSNorm(_ dimensions: Int, eps: Float) -> RMSNorm {
-    let exact = ProcessInfo.processInfo.environment[
-        "MINICPM_TTS_EXACT_KERNELS"]?.lowercased() == "mpsgraph"
+    let exact = MiniCPMTTSKernelPolicy.usesMPSGraph(
+        kernel: "RMSNORM", defaultEnabled: false)
     if exact {
         return MiniCPMExactBF16RMSNorm(dimensions: dimensions, eps: eps)
     }
     return RMSNorm(dimensions: dimensions, eps: eps)
+}
+
+enum MiniCPMTTSKernelPolicy {
+    static func usesMPSGraph(
+        kernel: String,
+        defaultEnabled: Bool,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        let selected = environment["MINICPM_TTS_BF16_" + kernel]?.lowercased()
+            ?? environment["MINICPM_TTS_EXACT_KERNELS"]?.lowercased()
+        switch selected {
+        case "mpsgraph": return true
+        case "mlx": return false
+        default: return defaultEnabled
+        }
+    }
 }
 
 final class MiniCPMTTSProjector: Module {
@@ -476,8 +504,9 @@ final class MiniCPMTTSProjector: Module {
 struct MiniCPMTTSHFStyleRoPE {
     let dimensions: Int
     let base: Float
-    /// Transformers initializes the default Llama inverse frequencies in
-    /// float32 (the model input is cast only after cos/sin are computed).
+    /// Transformers initializes this non-persistent buffer in Float32, but
+    /// model.to(dtype:) casts it with the checkpoint. It is promoted back to
+    /// Float32 only after that rounding, before frequency/trigonometry math.
     let inverseFrequency: MLXArray
 
     init(dimensions: Int, base: Float = 10_000) {
@@ -500,7 +529,7 @@ struct MiniCPMTTSHFStyleRoPE {
             (0..<length).map { Float(offset + $0) }, [length, 1])
         let frequencies = matmul(
             positions,
-            inverseFrequency.asType(.float32))
+            inverseFrequency.asType(input.dtype).asType(.float32))
         let cosine = concatenated([cos(frequencies), cos(frequencies)], axis: -1)
             .asType(input.dtype)
             .expandedDimensions(axis: 0)
@@ -531,13 +560,29 @@ final class MiniCPMTTSAudioAttention: Module {
     @ModuleInfo(key: "v_proj") var value: Linear
     @ModuleInfo(key: "o_proj") var output: Linear
 
+    /// Keep routing testable without loading checkpoint weights.  Official
+    /// PyTorch/MPS Q=1 decode uses its fast vector kernel, so retain MLX's
+    /// fused vector route there; the general graph targets multi-token SDPA.
+    static func shouldUseExactBF16SDPA(
+        enabled: Bool,
+        sequence: Int,
+        queryDType: DType,
+        keyDType: DType,
+        valueDType: DType
+    ) -> Bool {
+        enabled && sequence > 1
+            && queryDType == .bfloat16
+            && keyDType == .bfloat16
+            && valueDType == .bfloat16
+    }
+
     init(_ configuration: MiniCPMTTSSemanticConfiguration) {
         numHeads = configuration.numAttentionHeads
         numKVHeads = configuration.numKeyValueHeads
         headDimension = configuration.hiddenSize / configuration.numAttentionHeads
         scale = 1 / sqrt(Float(headDimension))
-        useExactBF16SDPA = ProcessInfo.processInfo.environment[
-            "MINICPM_TTS_EXACT_KERNELS"]?.lowercased() == "mpsgraph"
+        useExactBF16SDPA = MiniCPMTTSKernelPolicy.usesMPSGraph(
+            kernel: "SDPA", defaultEnabled: true)
         let hidden = configuration.hiddenSize
         _query = ModuleInfo(wrappedValue: makeMiniCPMTTSLinear(
             hidden, numHeads * headDimension))
@@ -557,13 +602,16 @@ final class MiniCPMTTSAudioAttention: Module {
         _ input: MLXArray,
         cache: MiniCPMTTSLayerCache,
         offset: Int,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        projectOutput: Bool = true
     ) -> MLXArray {
         let batch = input.dim(0)
         let sequence = input.dim(1)
-        var q = query(input).reshaped(batch, sequence, numHeads, headDimension)
-        var k = key(input).reshaped(batch, sequence, numKVHeads, headDimension)
-        let v = value(input).reshaped(batch, sequence, numKVHeads, headDimension)
+        let projections = MiniCPMTTSBatchedBF16Projection.apply(
+            input, projections: [query, key, value])
+        var q = projections[0].reshaped(batch, sequence, numHeads, headDimension)
+        var k = projections[1].reshaped(batch, sequence, numKVHeads, headDimension)
+        let v = projections[2].reshaped(batch, sequence, numKVHeads, headDimension)
         q = q.transposed(0, 2, 1, 3)
         k = k.transposed(0, 2, 1, 3)
         let values = v.transposed(0, 2, 1, 3)
@@ -573,11 +621,12 @@ final class MiniCPMTTSAudioAttention: Module {
         k = rope(k, offset: ropeOffset)
         let (keys, cachedValues) = cache.update(keys: k, values: values)
         let attended: MLXArray
-        if useExactBF16SDPA,
-           q.dtype == .bfloat16,
-           keys.dtype == .bfloat16,
-           cachedValues.dtype == .bfloat16,
-           sequence > 1
+        if Self.shouldUseExactBF16SDPA(
+            enabled: useExactBF16SDPA,
+            sequence: sequence,
+            queryDType: q.dtype,
+            keyDType: keys.dtype,
+            valueDType: cachedValues.dtype)
         {
             let additiveMask: MLXArray? = keys.dim(2) > sequence
                 ? MiniCPMExactBF16SDPA.rightAlignedAdditiveMask(
@@ -604,7 +653,7 @@ final class MiniCPMTTSAudioAttention: Module {
                 .transposed(0, 2, 1, 3)
                 .reshaped(batch, sequence, numHeads * headDimension)
         }
-        return output(attended)
+        return projectOutput ? output(attended) : attended
     }
 }
 
@@ -613,8 +662,12 @@ final class MiniCPMTTSAudioLayer: Module {
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
     @ModuleInfo(key: "self_attn") var attention: MiniCPMTTSAudioAttention
     @ModuleInfo var mlp: MiniCPMTTSMLP
+    private let useEncodedBF16Block: Bool
+    private let normEpsilon: Float
 
     init(_ configuration: MiniCPMTTSSemanticConfiguration) {
+        useEncodedBF16Block = ProcessInfo.processInfo.environment["MINICPM_TTS_ENCODED_BLOCK"] == "1"
+        normEpsilon = configuration.rmsNormEps
         _inputLayerNorm = ModuleInfo(wrappedValue: makeMiniCPMTTSRMSNorm(
             configuration.hiddenSize,
             eps: configuration.rmsNormEps))
@@ -636,8 +689,17 @@ final class MiniCPMTTSAudioLayer: Module {
             inputLayerNorm(input),
             cache: cache,
             offset: offset,
-            mask: mask)
-        let residual = input + attended
+            mask: mask,
+            projectOutput: !useEncodedBF16Block)
+        if useEncodedBF16Block,
+           let output = MiniCPMTTSEncodedBF16Block.apply(
+               residual: input, attended: attended,
+               outputProjection: attention.output, norm: postAttentionLayerNorm,
+               gate: mlp.gate, up: mlp.up, down: mlp.down, epsilon: normEpsilon) {
+            return output
+        }
+        let projected = useEncodedBF16Block ? attention.output(attended) : attended
+        let residual = input + projected
         return residual + mlp(postAttentionLayerNorm(residual))
     }
 }
@@ -646,11 +708,10 @@ final class MiniCPMTTSMLP: Module {
     @ModuleInfo(key: "gate_proj") var gate: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
     @ModuleInfo(key: "down_proj") var down: Linear
-    private let useExactBF16SiLU: Bool
+    private let useEncodedBF16MLP: Bool
 
     init(_ configuration: MiniCPMTTSSemanticConfiguration) {
-        useExactBF16SiLU = ProcessInfo.processInfo.environment[
-            "MINICPM_TTS_EXACT_KERNELS"]?.lowercased() == "mpsgraph"
+        useEncodedBF16MLP = ProcessInfo.processInfo.environment["MINICPM_TTS_ENCODED_MLP"] == "1"
         _gate = ModuleInfo(wrappedValue: makeMiniCPMTTSLinear(
             configuration.hiddenSize,
             configuration.intermediateSize))
@@ -664,11 +725,22 @@ final class MiniCPMTTSMLP: Module {
     }
 
     func callAsFunction(_ input: MLXArray) -> MLXArray {
-        let gateValue = gate(input)
-        let activated = useExactBF16SiLU
-            ? MiniCPMExactBF16SiLU.apply(gateValue)
-            : silu(gateValue)
-        return down(activated * up(input))
+        if useEncodedBF16MLP,
+           let output = MiniCPMTTSEncodedBF16MLP.apply(
+               input: input, gate: gate, up: up, down: down) {
+            return output
+        }
+        let projections = MiniCPMTTSBatchedBF16Projection.apply(
+            input, projections: [gate, up])
+        let activated = Self.activate(projections[0])
+        return down(activated * projections[1])
+    }
+
+    static func activate(_ input: MLXArray) -> MLXArray {
+        // The official SiLU evaluates sigmoid and multiplication in Float32
+        // and rounds only the final result. A BF16 sigmoid rounded before
+        // multiplication changes the recurrent speech decoder's logits.
+        MiniCPMExactBF16SiLU.apply(input)
     }
 }
 
@@ -677,9 +749,12 @@ final class MiniCPMTTSAudioDecoder: Module {
     @ModuleInfo var norm: RMSNorm
 
     let configuration: MiniCPMTTSSemanticConfiguration
+    private let useEncodedBF16Decode: Bool
+    private(set) var encodedDecodeCount = 0
 
     init(_ configuration: MiniCPMTTSSemanticConfiguration) {
         self.configuration = configuration
+        useEncodedBF16Decode = ProcessInfo.processInfo.environment["MINICPM_TTS_ENCODED_DECODE"] == "1"
         _layers = ModuleInfo(wrappedValue: (0..<configuration.numHiddenLayers).map { _ in
             MiniCPMTTSAudioLayer(configuration)
         })
@@ -692,11 +767,33 @@ final class MiniCPMTTSAudioDecoder: Module {
     func callAsFunction(
         _ embeddings: MLXArray,
         caches: [MiniCPMTTSLayerCache],
-        offset: Int
+        offset: Int,
+        encodedDecode: Bool? = nil
     ) -> MLXArray {
         precondition(caches.count == layers.count)
         let batch = embeddings.dim(0)
         let sequence = embeddings.dim(1)
+        // Keep prefill and noncanonical configurations on the established
+        // route. Cache replacement happens only after every layer succeeds.
+        if encodedDecode ?? useEncodedBF16Decode,
+           batch == 1, sequence == 1, (caches.first?.offset ?? 0) > 0,
+           configuration.hiddenSize == 768, configuration.intermediateSize == 3072,
+           configuration.numAttentionHeads == 12, configuration.numKeyValueHeads == 12,
+           let result = MiniCPMTTSEncodedBF16Decode.apply(
+               input: embeddings,
+               layers: layers.map { layer in
+                   .init(inputNorm: layer.inputLayerNorm,
+                         postNorm: layer.postAttentionLayerNorm,
+                         query: layer.attention.query, key: layer.attention.key,
+                         value: layer.attention.value, output: layer.attention.output,
+                         gate: layer.mlp.gate, up: layer.mlp.up, down: layer.mlp.down,
+                         inverseFrequency: layer.attention.rope.inverseFrequency,
+                         eps: configuration.rmsNormEps)
+               }, caches: caches.map(\.encodedState), finalNorm: norm) {
+            for (cache, state) in zip(caches, result.caches) { cache.commitEncodedState(state) }
+            encodedDecodeCount += 1
+            return result.hidden
+        }
         let keyLength = (caches.first?.offset ?? 0) + sequence
         let mask: MLXFast.ScaledDotProductAttentionMaskMode
         if ProcessInfo.processInfo.environment["MINICPM_TTS_MASK_VARIANT"] == "causal"
@@ -727,7 +824,8 @@ final class MiniCPMTTSAudioDecoder: Module {
     }
 }
 
-/// Pure-MLX MiniCPM-o semantic TTS condition + audio-token decoder.
+/// MiniCPM-o semantic TTS condition + audio-token decoder, using MLX with
+/// MPSGraph at the BF16 boundaries required for the official MPS parity gate.
 ///
 /// The language model remains owned by the duplex runtime.  It passes its
 /// hidden states to ``buildCondition`` and then carries a session-local
@@ -832,12 +930,8 @@ public final class MiniCPMTTSSemantic: Module {
         else {
             throw MiniCPMTTSSemanticError.invalidWeights("missing weight-normalized audio head")
         }
-        let direction32 = direction.asType(.float32)
-        let magnitude32 = magnitude.asType(.float32)
-        let norm = MLX.sqrt((direction32 * direction32).sum(axis: -1, keepDims: true))
-        mapped["audioHead.weight"] = (
-            direction32 * magnitude32 / MLX.maximum(norm, MLXArray(Float(1e-12)))
-        ).asType(model.textEmbedding.weight.dtype)
+        mapped["audioHead.weight"] = MiniCPMTTSWeightNormalization.reconstruct(
+            direction: direction, magnitude: magnitude)
 
         let expected = Set(model.parameters().flattened().map(\.0))
         let actual = Set(mapped.keys)
@@ -957,9 +1051,10 @@ public final class MiniCPMTTSSemantic: Module {
             let projected32 = projected.asType(.float32)
             let denominator = MLX.sqrt(
                 MLX.sum(projected32 * projected32, axis: -1, keepDims: true))
-            projected = (
-                projected32 / MLX.maximum(denominator, MLXArray(Float(1e-12)))
-            ).asType(dtype)
+            // F.normalize rounds the norm to the input dtype before dividing.
+            // Preserve that BF16 boundary instead of doing the division in F32.
+            projected = projected / MLX.maximum(
+                denominator.asType(dtype), MLXArray(Float(1e-12)).asType(dtype))
         }
         var condition = text.expandedDimensions(axis: 0) + projected
         if addTextEOS {
@@ -1173,8 +1268,8 @@ public final class MiniCPMTTSSemantic: Module {
     /// the first condition (the official path uses an empty tensor when no
     /// speaker prompt is present).  Every condition contributes its complete
     /// sampled code sequence to the result; the final look-ahead code of one
-    /// condition is fed before the next condition, preserving the streaming
-    /// protocol without a second decoder implementation.
+    /// condition is fed before the next condition, preserving the sampled
+    /// sequence without a second decoder implementation.
     public func interleavedGenerate(
         speakerEmbeds: MLXArray? = nil,
         conditions: [MLXArray],
@@ -1232,9 +1327,8 @@ public final class MiniCPMTTSSemantic: Module {
             // The generic facade intentionally carries its look-ahead code
             // into the next condition, so account for every sampled code in
             // this explicitly interleaved API.  The protocol streaming facade
-            // below follows the stricter upstream contract and hides it from
-            // the Token2Wav-facing result while retaining it for the next KV
-            // update.
+            // below follows the stricter upstream contract and discards the
+            // newest sample from both Token2Wav and the next KV update.
             let conditionCount = condition.ndim == 2 ? condition.dim(0) : condition.dim(1)
             let nextTextStart = ownedSession.textStartPosition
                 + conditionCount
@@ -1314,9 +1408,8 @@ public final class MiniCPMTTSSemantic: Module {
     /// The first and final chunks allow EOS immediately.  A middle chunk
     /// masks EOS for all 26 steps, returning the 25-code prefix while hiding
     /// the newest look-ahead code, exactly as the upstream Python helper does.
-    /// Token2Wav owns the exposed-code buffering; the semantic session still
-    /// carries the hidden look-ahead code between protocol chunks so its KV
-    /// history stays aligned with the official implementation.
+    /// Token2Wav owns buffering the 25 exposed codes. The final sampled code
+    /// is discarded; the next condition immediately follows the cached prefix.
     /// ``textStartPosition`` advances by condition length + committed count,
     /// matching the official ``text_start_pos`` bookkeeping.  A final chunk or
     /// sampled EOS is reported without clearing the session: the caller must
@@ -1363,17 +1456,11 @@ public final class MiniCPMTTSSemantic: Module {
 
         let isFirst = session.chunkIndex == 0
         let chunkIndex = session.chunkIndex
-        // Only a real turn boundary may cut a chunk short.
-        //
-        // The historical `isFirst` exemption ("allow decoding <1s audio") let
-        // the first chunk of every turn stop after 5-13 codes instead of 25.
-        // In the duplex path that short chunk then rendered as a whole second
-        // of near-silence (measured RMS < 0.01 over the entire 1.00 s block,
-        // e.g. "天气非" / "好的，" / "嗯，那"), so the unit's text was never
-        // spoken at all - the most audible form of swallowed characters.
-        // The explicit forceNoStop flag remains available for deterministic
-        // warm-up/oracle tests and takes precedence over this EOS policy.
-        let minNewTokens = endOfTurn ? 0 : maxNewToken
+        // The official duplex loop allows a short first/final chunk. Only
+        // middle chunks mask EOS for all 26 steps. The newest sampled code is
+        // never returned or cached across protocol chunks, even when non-EOS.
+        let minNewTokens = (isFirst || endOfTurn) ? 0 : maxNewToken
+        session.clearPendingToken()
         let generation = try generateChunk(
             inputsEmbeds: inputsEmbeds,
             session: session,
@@ -1385,23 +1472,17 @@ public final class MiniCPMTTSSemantic: Module {
             minNewTokens: minNewTokens,
             shouldCancel: shouldCancel)
 
-        // ``generateChunk`` samples one look-ahead code beyond the 25 codes
-        // committed to Token2Wav.  The official ``generate_chunk`` omits that
-        // newest code from its returned tensor, but its KV history is
-        // continued by feeding the code at the beginning of the next call.
-        // Preserve that session state while hiding the code from the protocol
-        // result and advancing text position by the committed prefix only.
-        let streamingGeneration: MiniCPMTTSGenerationResult
-        if generation.pendingToken == nil {
-            streamingGeneration = generation
-        } else {
-            streamingGeneration = MiniCPMTTSGenerationResult(
-                committedTokens: generation.committedTokens,
-                pendingToken: nil,
-                sampledTokenCount: generation.sampledTokenCount,
-                cacheOffset: generation.cacheOffset,
-                eosEmitted: generation.eosEmitted)
-        }
+        // The low-level/full-sequence API exposes the final sample as pending.
+        // Official generate_chunk drops it unconditionally. Do the same here
+        // before accepting the next protocol condition, keeping KV and RoPE
+        // positions equal to condition length + the returned code count.
+        session.clearPendingToken()
+        let streamingGeneration = MiniCPMTTSGenerationResult(
+            committedTokens: generation.committedTokens,
+            pendingToken: nil,
+            sampledTokenCount: generation.sampledTokenCount,
+            cacheOffset: generation.cacheOffset,
+            eosEmitted: generation.eosEmitted)
 
         let textStart = session.textStartPosition
         let nextTextStart = textStart
@@ -1446,18 +1527,21 @@ public final class MiniCPMTTSSemantic: Module {
         return result
     }
 
-    private func applyRepetitionPenalty(
+    func applyRepetitionPenalty(
         _ logits: MLXArray,
         generated: [Int],
         penalty: Float,
         window: Int = 16
     ) -> MLXArray {
-        guard penalty > 0 else { return logits }
+        guard penalty > 0, penalty != 1 else { return logits }
         let recent = Array(generated.suffix(window))
         guard !recent.isEmpty else { return logits }
-        let ids = MLXArray(recent.map(Int32.init)).expandedDimensions(axis: 1)
-        let vocab = MLXArray(0..<Int32(configuration.numAudioTokens)).expandedDimensions(axis: 0)
-        let frequencies = (ids .== vocab).asType(.float32).sum(axis: 0)
+        // The recent codes are already on the CPU. Counting their exact small
+        // integer frequencies avoids a [window,vocabulary] GPU comparison and
+        // reduction on every sampled code; retain the original FP32 alpha ops.
+        var counts = [Float](repeating: 0, count: configuration.numAudioTokens)
+        for token in recent where token >= 0 && token < counts.count { counts[token] += 1 }
+        let frequencies = MLXArray(counts)
         let alpha = MLX.exp(MLX.log(MLXArray(penalty)) * frequencies)
         return MLX.where(logits .< MLXArray(Float(0)), logits * alpha, logits / alpha)
     }

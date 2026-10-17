@@ -570,13 +570,9 @@ public actor MiniCPMDemoBackend {
             ?? "in_\(String(format: "%08llu", inputCounter))"
         // A real client packet ends any synthetic streak.
         syntheticStreak = 0
-        // Browser clients only mark zero-filled silence with
-        // `continuation_tick` while their own model-state heuristic says
-        // "speaking", so plenty of silent packets arrive unmarked and each
-        // would otherwise pay a full 350-440ms audio-encoder prefill.  The
-        // engine itself still validates every precondition (turn open, no
-        // frames/text, all-zero samples), so deciding it here purely saves
-        // that work; nothing about the client flag is trusted.
+        // Label zero-filled client audio consistently even if the browser
+        // omitted its continuation hint. The native engine still encodes every
+        // packet, preserving the continuous audio context expected by duplex.
         if isDuplexMode, Self.isAllZeroAudioInput(decodedInput) {
             decodedInput["continuation_tick"] = .bool(true)
         }
@@ -730,18 +726,13 @@ public actor MiniCPMDemoBackend {
         return events
     }
 
-    /// Generate the next duplex unit without waiting for the transport's next
-    /// `input.append`.  The one-input-one-unit worker loop otherwise ties the
-    /// output audio rate to the client's packet cadence: a client that streams
-    /// one-second packets (or waits for per-packet acknowledgements) makes a
-    /// fully model-driven answer arrive slower than realtime, which renders as
-    /// choppy playback.  While a spoken response is open and no real packet is
-    /// queued, the transport worker calls this method to advance the turn with
-    /// a zero-filled continuation tick — the native engine handles that without
-    /// re-running the audio encoder, so output streams at model speed and the
-    /// client builds a playback buffer instead of running dry.  Returns nil
-    /// when there is nothing to continue (no open spoken response, inactive
-    /// state, cap reached) or the engine rejected/ended the turn.
+    /// Generate a diagnostic duplex unit from an additional second of silent
+    /// audio. The native engine fully encodes this packet, advancing the model's
+    /// input timeline. Live transport does not call this unless
+    /// `MINICPM_SYNTHETIC_CONTINUATION=1` explicitly enables synthetic input.
+    /// Returns nil when no spoken response is open, the state is inactive, a
+    /// diagnostic cap is reached, or the engine rejects/ends the turn. A cap
+    /// leaves the response waiting for the next real input.
     func continueResponse() async -> [MiniCPMDemoEvent]? {
         guard state == .active, isDuplexMode, activeResponseID != nil, !pendingFinalize else {
             return nil

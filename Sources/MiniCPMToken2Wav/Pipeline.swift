@@ -148,6 +148,19 @@ public struct MiniCPMToken2WavStageTiming: Sendable, Equatable {
 /// The class is intentionally single-threaded. A caller should serialize
 /// `append` calls (an actor is a natural owner in an AVAudioEngine runtime).
 public final class MiniCPMToken2WavPipeline {
+    /// Checkpoint for a speculative duplex unit. Flow caches and MLX arrays
+    /// are replaced, never mutated by this pipeline, so retaining their
+    /// references also preserves the prompt and generated context cheaply.
+    public struct Snapshot {
+        let baseFlowCache: MiniCPMToken2WavFlowCache?
+        let flowCache: MiniCPMToken2WavFlowCache?
+        let speakerEmbedding: MLXArray?
+        let tokenBuffer: MiniCPMSpeechTokenBuffer
+        let turnOpen: Bool
+        let vocoder: MiniCPMHiFTStreamingSession.Snapshot
+        let lastStageTiming: MiniCPMToken2WavStageTiming?
+    }
+
     public let flow: MiniCPMToken2WavFlowModel
     public let vocoder: MiniCPMHiFTStreamingSession
     public let configuration: MiniCPMToken2WavPipelineConfiguration
@@ -198,6 +211,30 @@ public final class MiniCPMToken2WavPipeline {
     public var isPrepared: Bool { baseFlowCache != nil && speakerEmbedding != nil }
     public var isTurnOpen: Bool { turnOpen }
     public var pendingTokenCount: Int { tokenBuffer.tokens.count }
+
+    public func snapshot() -> Snapshot {
+        Snapshot(
+            baseFlowCache: baseFlowCache,
+            flowCache: flowCache,
+            speakerEmbedding: speakerEmbedding,
+            tokenBuffer: tokenBuffer,
+            turnOpen: turnOpen,
+            vocoder: vocoder.snapshot(),
+            lastStageTiming: lastStageTiming)
+    }
+
+    /// Restores a checkpoint captured on this pipeline. Unlike an interrupt,
+    /// rollback keeps previously committed lookahead tokens and HiFT overlap.
+    /// The caller must serialize this with prepare/append/reset operations.
+    public func restore(_ snapshot: Snapshot) {
+        baseFlowCache = snapshot.baseFlowCache
+        flowCache = snapshot.flowCache
+        speakerEmbedding = snapshot.speakerEmbedding
+        tokenBuffer = snapshot.tokenBuffer
+        turnOpen = snapshot.turnOpen
+        vocoder.restore(snapshot.vocoder)
+        lastStageTiming = snapshot.lastStageTiming
+    }
 
     /// Enables synchronization at the Flow/HiFT boundary for one-shot
     /// profiling. Leave disabled in production so MLX can preserve its normal
@@ -321,7 +358,6 @@ public final class MiniCPMToken2WavPipeline {
         isFinal: Bool = false,
         shouldCancel: (@Sendable () -> Bool)? = nil
     ) throws -> [MiniCPMToken2WavChunk] {
-        lastStageTiming = nil
         guard let speakerEmbedding, var currentCache = flowCache else {
             throw MiniCPMToken2WavError.pipelineNotPrepared
         }
@@ -332,9 +368,8 @@ public final class MiniCPMToken2WavPipeline {
         // append mutates three independent streaming states. Keep a single
         // transaction checkpoint so cancellation after a partial Flow/HiFT
         // job cannot leave a half-consumed token window behind.
-        let tokenBufferSnapshot = tokenBuffer
-        let flowCacheSnapshot = flowCache
-        let vocoderSnapshot = vocoder.snapshot()
+        let checkpoint = snapshot()
+        lastStageTiming = nil
         do {
             let jobs = tokenBuffer.append(
                 tokens, forceFlush: forceFlush, isFinal: isFinal)
@@ -363,9 +398,7 @@ public final class MiniCPMToken2WavPipeline {
             if stageTimingEnabled { lastStageTiming = timing }
             return chunks
         } catch MiniCPMToken2WavError.cancelled {
-            tokenBuffer = tokenBufferSnapshot
-            flowCache = flowCacheSnapshot
-            vocoder.restore(vocoderSnapshot)
+            restore(checkpoint)
             throw MiniCPMToken2WavError.cancelled
         }
     }
@@ -378,7 +411,6 @@ public final class MiniCPMToken2WavPipeline {
         isFinal: Bool = false,
         shouldCancel: (@Sendable () -> Bool)? = nil
     ) throws -> MiniCPMToken2WavChunk {
-        lastStageTiming = nil
         guard let speakerEmbedding, let currentCache = flowCache else {
             throw MiniCPMToken2WavError.pipelineNotPrepared
         }
@@ -394,8 +426,8 @@ public final class MiniCPMToken2WavPipeline {
         }
         try validate(tokens: tokens)
         try checkCancellation(shouldCancel)
-        let flowCacheSnapshot = flowCache
-        let vocoderSnapshot = vocoder.snapshot()
+        let checkpoint = snapshot()
+        lastStageTiming = nil
         do {
             let job = MiniCPMSpeechTokenJob(
                 tokens: tokens,
@@ -412,8 +444,7 @@ public final class MiniCPMToken2WavPipeline {
             lastStageTiming = result.timing
             return result.chunk
         } catch MiniCPMToken2WavError.cancelled {
-            flowCache = flowCacheSnapshot
-            vocoder.restore(vocoderSnapshot)
+            restore(checkpoint)
             throw MiniCPMToken2WavError.cancelled
         }
     }

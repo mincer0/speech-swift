@@ -294,15 +294,48 @@ def _cache_tensors(prefix: str, cache: Any, tensors: dict[str, torch.Tensor]) ->
         tensors[f"{prefix}_layer_{index:02d}_values"] = _as_float_tensor(values)
 
 
-# Streaming KV bucket length (in post-convolution encoder positions). Both
-# the oracle and the MLX runtime lay every streaming chunk's attention keys
-# out as [real_past | zeros | current] with a constant total length
-# (KV_BUCKET_POSITIONS) and mask the zero middle out of the softmax with a
-# large finite negative value, so attention tensor shapes are identical for
-# every chunk of a session and compiled graph plans are reused.
-# exp(-10000 - max) underflows to exactly +0 in FP32, so the zero block
-# contributes nothing and the layout is mathematically transparent.
+# Optional shape-reuse diagnostic, disabled in the official golden export.
+# The official encoder and default native runtime use real KV lengths.
+# Bucket padding is mathematically neutral but changes BF16 reductions.
 KV_BUCKET_POSITIONS = 256
+
+
+def official_duplex_feature_chunks(
+    processing: Any, source: Path, waveform: np.ndarray, count: int = 3
+) -> tuple[list[torch.Tensor], list[np.ndarray], list[dict[str, Any]]]:
+    """Use the upstream PCM frontend as the duplex protocol authority.
+
+    Slicing ordinary 100-frame chunks and then labelling them as context
+    silently creates a different protocol. The original processor supplies
+    102 frames first and 104 thereafter, including the real CNN overlap.
+    """
+    frontend = processing.StreamingMelProcessorExact(
+        processing.MiniCPMAAudioProcessor.from_pretrained(source),
+        chunk_ms=1000,
+        first_chunk_ms=1035,
+        cnn_redundancy_ms=20,
+        enable_sliding_window=True,
+        slide_trigger_seconds=30.0,
+        slide_stride_seconds=10.0,
+    )
+    chunks: list[torch.Tensor] = []
+    pcm_chunks: list[np.ndarray] = []
+    metadata: list[dict[str, Any]] = []
+    offset = 0
+    for index in range(count):
+        size = frontend.get_chunk_size()
+        pcm = waveform[offset:offset + size].copy()
+        if len(pcm) != size:
+            raise ValueError("waveform is too short for the duplex frontend oracle")
+        features, info = frontend.process(pcm)
+        expected_frames = 102 if index == 0 else 104
+        if tuple(features.shape) != (1, 80, expected_frames):
+            raise RuntimeError(f"unexpected official duplex mel geometry: {features.shape}")
+        chunks.append(features)
+        pcm_chunks.append(pcm)
+        metadata.append(info)
+        offset += size
+    return chunks, pcm_chunks, metadata
 
 
 def _bucketize_cache(
@@ -359,9 +392,8 @@ def _run_encoder_chunk(
     if current <= 0:
         raise RuntimeError("audio chunk is empty after CNN context removal")
     # Static-shape bucket layout: [zeros | real_past | current] with total
-    # length KV_BUCKET_POSITIONS. The mask exposes only the real positions
-    # (head zeros + real past + current are 0; the zero middle is -10000).
-    # The MLX runtime applies the identical layout and mask geometry.
+    # length KV_BUCKET_POSITIONS. Real positions have mask 0 and the zero
+    # prefix is masked with -10000. This is an explicit diagnostic only.
     if bucket_pad:
         run_cache, head_pad = _bucketize_cache(
             cache, bucket_real_length - 0, current)
@@ -571,12 +603,13 @@ def main() -> None:
         tensors[f"stream_embeddings_{index}"] = _as_float_tensor(stream_embeddings)
         _cache_tensors(f"stream_cache_{index}", cache, tensors)
 
-    # Context mode removes 20 ms (two mel frames) of redundant CNN input on
-    # each applicable side.  Keep this as a separate sequence so a parity
-    # test can distinguish ordinary streaming from the duplex protocol.
+    # Context features come directly from the official PCM processor, rather
+    # than reusing the ordinary 100-frame operator diagnostic above.
+    context_chunks, context_pcm, context_frontend_metadata = official_duplex_feature_chunks(
+        processing, source, streaming_waveform)
     context_cache = None
     context_real_length = 0
-    for index, original_chunk in enumerate(feature_chunks[:2]):
+    for index, original_chunk in enumerate(context_chunks):
         prefix = 0 if index == 0 else 2
         suffix = 2
         current_real = (original_chunk.shape[-1] - 1) // 2 + 1
@@ -600,6 +633,7 @@ def main() -> None:
         tensors[f"context_stream_features_{index}"] = _as_float_tensor(
             original_chunk.transpose(1, 2)
         )
+        tensors[f"context_stream_pcm_{index}"] = torch.from_numpy(context_pcm[index])
         tensors[f"context_stream_encoder_states_{index}"] = _as_float_tensor(context_states)
         with torch.inference_mode():
             context_projected = projection(context_states)
@@ -700,6 +734,8 @@ def main() -> None:
             "first_chunk_samples": 16_480,
             "regular_chunk_samples": 16_000,
             "redundancy_frames": 2,
+            "duplex_frontend": "official_StreamingMelProcessorExact",
+            "duplex_frontend_metadata": context_frontend_metadata,
             "pool_step": pool_step,
         },
         "artifact": {

@@ -39,10 +39,12 @@ class CaptureProcessor extends AudioWorkletProcessor {
         this._chunkBuffer = new Float32Array(this._chunkSize);
         this._chunkPos = 0;
         this._active = false;
+        this._captureEpoch = null;
 
         this.port.onmessage = (e) => {
             const { command } = e.data;
             if (command === 'start') {
+                this._captureEpoch = e.data.captureEpoch ?? null;
                 this._active = true;
                 this._previousSample = 0;
                 this._hasPrevious = false;
@@ -53,7 +55,8 @@ class CaptureProcessor extends AudioWorkletProcessor {
                 if (this._chunkPos > 0) {
                     const remaining = this._chunkBuffer.slice(0, this._chunkPos);
                     this.port.postMessage(
-                        { type: 'chunk', audio: remaining, final: true },
+                        { type: 'chunk', audio: remaining, final: true,
+                            ...(this._captureEpoch === null ? {} : { captureEpoch: this._captureEpoch }) },
                         [remaining.buffer]
                     );
                 }
@@ -120,7 +123,8 @@ class CaptureProcessor extends AudioWorkletProcessor {
         this._chunkBuffer[this._chunkPos++] = value;
         if (this._chunkPos === this._chunkSize) {
             const chunk = this._chunkBuffer;
-            this.port.postMessage({ type: 'chunk', audio: chunk }, [chunk.buffer]);
+            this.port.postMessage({ type: 'chunk', audio: chunk,
+                ...(this._captureEpoch === null ? {} : { captureEpoch: this._captureEpoch }) }, [chunk.buffer]);
             // The transferred ArrayBuffer is detached; allocate exactly one
             // replacement for the next chunk, never per render quantum.
             this._chunkBuffer = new Float32Array(this._chunkSize);

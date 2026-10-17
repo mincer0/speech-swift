@@ -254,10 +254,9 @@ public struct MiniCPMDuplexProtocolState: Sendable {
         let endOfTurn = token == tokens.turnEOS
         if endOfTurn { currentTurnEnded = true }
 
-        // The first generated token is generally <|speak|> or <|tts_bos|> and
-        // is a protocol priming token, not semantic text for TTS. The priming
-        // markers MUST stay in the collected sequence: the semantic-TTS
-        // condition consumes them as its speech-start marker (P3-A parity).
+        // The official streaming decoder excludes its first generated token
+        // from semantic TTS. Later non-terminator tokens retain their matching
+        // post-feed hidden state, including any subsequent protocol markers.
         let collectForTTS = index != 0
         if collectForTTS { generatedIDs.append(token) }
         trace.append(.init(name: "token", index: index, token: token))

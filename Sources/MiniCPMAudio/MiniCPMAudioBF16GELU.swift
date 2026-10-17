@@ -54,7 +54,7 @@ public enum MiniCPMAudioBF16GELU {
     /// Compute exact GELU for a BF16 tensor and return BF16.
     public static func apply(_ input: MLXArray) -> MLXArray {
         precondition(input.dtype == .bfloat16, "MiniCPM audio GELU input must be BF16")
-        let contiguous = rowContiguous(input)
+        let contiguous = input.contiguous()
         let key = PlanKey(shape: contiguous.shape)
 
         planLock.lock()
@@ -104,7 +104,10 @@ public enum MiniCPMAudioBF16GELU {
         }
         planLock.unlock()
 
-        eval(contiguous)
+        let output = MLXArray.zeros(contiguous.shape, dtype: .bfloat16)
+        // Allocate the bound destination with the input's computation in
+        // one MLX submission before bridging their backing storage.
+        eval(contiguous, output)
         let backing = contiguous.asData(access: .noCopy)
         precondition(
             backing.dType == .bfloat16
@@ -114,7 +117,6 @@ public enum MiniCPMAudioBF16GELU {
             device: context.device, noCopy: true) else {
             preconditionFailure("MiniCPM audio GELU could not obtain input MTLBuffer")
         }
-        let output = MLXArray.zeros(contiguous.shape, dtype: .bfloat16)
         guard let outputBuffer = output.asMTLBuffer(
             device: context.device, noCopy: true) else {
             preconditionFailure("MiniCPM audio GELU could not obtain output MTLBuffer")
@@ -130,21 +132,15 @@ public enum MiniCPMAudioBF16GELU {
 
         context.lock.lock()
         defer { context.lock.unlock() }
-        plan.graph.run(
-            with: context.commandQueue,
-            feeds: [plan.input: inputData],
-            targetOperations: nil,
-            resultsDictionary: [plan.output: outputData])
-        return output
-    }
-
-    private static func rowContiguous(_ array: MLXArray) -> MLXArray {
-        eval(array)
-        let backing = array.asData(access: .noCopy)
-        guard isRowContiguous(shape: array.shape, strides: backing.strides) else {
-            return array.contiguous()
+        // Buffer wrappers do not own their MLX backing allocations.
+        withExtendedLifetime((contiguous, output)) {
+            plan.graph.run(
+                with: context.commandQueue,
+                feeds: [plan.input: inputData],
+                targetOperations: nil,
+                resultsDictionary: [plan.output: outputData])
         }
-        return array
+        return output
     }
 
     private static func isRowContiguous(shape: [Int], strides: [Int]) -> Bool {

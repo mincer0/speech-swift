@@ -26,6 +26,8 @@ class StereoRecorderProcessor extends AudioWorkletProcessor {
         this._leftPos = 0;
         this._rightBuf = null;
         this._rightPos = 0;
+        this._ready = false;
+        this._paused = false;
 
         this.port.onmessage = (e) => {
             const { command, channel, audio } = e.data;
@@ -33,6 +35,10 @@ class StereoRecorderProcessor extends AudioWorkletProcessor {
                 this._useInputLeft = true;
             } else if (command === 'useInputRight') {
                 this._useInputRight = true;
+            } else if (command === 'pause') {
+                this._paused = true;
+            } else if (command === 'resume') {
+                this._paused = false;
             } else if (channel === 'left') {
                 this._leftQueue.push(new Float32Array(audio));
             } else if (channel === 'right') {
@@ -44,6 +50,15 @@ class StereoRecorderProcessor extends AudioWorkletProcessor {
     process(inputs, outputs) {
         const out = outputs[0];
         if (out.length < 2) return true;
+        if (!this._ready) {
+            this._ready = true;
+            this.port.postMessage({ type: 'ready' });
+        }
+        if (this._paused) {
+            out[0].fill(0);
+            out[1].fill(0);
+            return true;
+        }
 
         // Left: audio graph input 0 or postMessage queue
         if (this._useInputLeft) {

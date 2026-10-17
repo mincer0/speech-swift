@@ -43,9 +43,9 @@ from export_minicpm_o_llm_golden import (  # noqa: E402
     ArtifactWriter,
     array_hash,
     deterministic_external_embeddings,
-    deterministic_sampler_case,
     output_record,
     output_records,
+    make_sampling_cases,
     protocol_special_ids,
     sha256_file,
     sha256_tree,
@@ -582,9 +582,16 @@ def output_manifest_records(writer: ArtifactWriter, name: str, outputs: list[tup
     return output_records(writer, name, outputs, selected)
 
 
-def load_float_array(root: Path, manifest: Mapping[str, Any], name: str) -> np.ndarray:
+def load_manifest_array(root: Path, manifest: Mapping[str, Any], name: str) -> np.ndarray:
+    """Read the declared dtype; token-ID arrays are little-endian int32."""
+
     spec = manifest["arrays"][name]
-    return np.fromfile(root / spec["path"], dtype="<f4").reshape(spec["shape"])
+    dtypes = {"float32-le": "<f4", "int32-le": "<i4"}
+    try:
+        dtype = dtypes[spec["dtype"]]
+    except KeyError as exc:
+        raise ValueError(f"unsupported array dtype for {name}: {spec.get('dtype')}") from exc
+    return np.fromfile(root / spec["path"], dtype=dtype).reshape(spec["shape"])
 
 
 def output_metrics(
@@ -616,8 +623,7 @@ def output_metrics(
         }
 
     def read_writer_array(name: str) -> np.ndarray:
-        spec = writer.arrays[name]
-        return np.fromfile(output_root / spec["path"], dtype="<f4").reshape(spec["shape"])
+        return load_manifest_array(output_root, {"arrays": writer.arrays}, name)
 
     actual_hidden_name = str(record["hidden"])
     actual_logits_name = str(record["logits_selected"])
@@ -625,10 +631,10 @@ def output_metrics(
     expected_logits_name = str(official_record["logits_selected"])
     actual_hidden = read_writer_array(actual_hidden_name)
     actual_logits = read_writer_array(actual_logits_name)
-    expected_hidden = load_float_array(official_root, official_manifest, expected_hidden_name)
-    expected_logits = load_float_array(official_root, official_manifest, expected_logits_name)
+    expected_hidden = load_manifest_array(official_root, official_manifest, expected_hidden_name)
+    expected_logits = load_manifest_array(official_root, official_manifest, expected_logits_name)
     actual_top = read_writer_array(str(record["top20"])).astype(np.int64)
-    expected_top = load_float_array(official_root, official_manifest, str(official_record["top20"])).astype(np.int64)
+    expected_top = load_manifest_array(official_root, official_manifest, str(official_record["top20"])).astype(np.int64)
     overlaps = []
     for a, e in zip(actual_top.reshape(-1, actual_top.shape[-1]), expected_top.reshape(-1, expected_top.shape[-1])):
         overlaps.append(int(len(set(a.tolist()).intersection(e.tolist()))))
@@ -650,43 +656,6 @@ def load_audio_embeddings(path: Path) -> tuple[np.ndarray, str]:
     if value.ndim != 3 or value.shape[0] != 1 or value.shape[2] != 4096:
         raise ValueError(f"audio embeddings must be [1,T,4096], got {value.shape}")
     return value, hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def make_sampling_cases(writer: ArtifactWriter, protocol: Mapping[str, int]) -> list[dict[str, Any]]:
-    """Keep sampler coverage identical to the official fixture."""
-
-    width = max(32, max(int(value) for value in protocol.values()) + 1)
-    cases: list[dict[str, Any]] = []
-
-    def add(name: str, logits: np.ndarray, **kwargs: Any) -> None:
-        uniforms = list(kwargs.pop("uniforms"))
-        expected, draws = deterministic_sampler_case(
-            logits, protocol=protocol, uniforms=uniforms, **kwargs
-        )
-        logits_name = writer.array(f"sampling_{name}_logits", logits)
-        cases.append(
-            {
-                "name": name,
-                "logits": logits_name,
-                "uniforms": uniforms,
-                "expected_token": expected,
-                "draw_count": draws,
-                **kwargs,
-            }
-        )
-
-    base = np.full(width, -10.0, dtype=np.float32)
-    values = base.copy(); values[protocol["chunk_eos"]] = 10
-    add("natural_chunk_eos", values, uniforms=[0.2], mode="sampling", temperature=0.7, top_k=20, top_p=0.8, forbidden=[protocol["chunk_eos"]], previous_tokens=[], repetition_penalty=1.05, length_penalty=1.1, listen_top_k=None, listen_probability_scale=1.0)
-    values = base.copy(); values[0] = 10; values[1] = 9
-    add("forbidden_after_probe", values, uniforms=[0.1, 0.1], mode="sampling", temperature=1.0, top_k=0, top_p=1.0, forbidden=[0], previous_tokens=[], repetition_penalty=1.0, length_penalty=1.0, listen_top_k=None, listen_probability_scale=1.0)
-    values = base.copy(); values[20] = 5; values[21] = 4.9
-    add("repetition_penalty", values, uniforms=[0.2, 0.2], mode="sampling", temperature=1.0, top_k=2, top_p=1.0, forbidden=[], previous_tokens=[20], repetition_penalty=2.0, length_penalty=1.0, listen_top_k=None, listen_probability_scale=1.0)
-    values = base.copy(); values[protocol["listen"]] = 4; values[10] = 3
-    add("listen_rank", values, uniforms=[0.2, 0.2], mode="sampling", temperature=1.0, top_k=20, top_p=1.0, forbidden=[], previous_tokens=[], repetition_penalty=1.0, length_penalty=1.0, listen_top_k=2, listen_probability_scale=1.0)
-    values = np.full(width, -10.0, dtype=np.float32); values[0:3] = [3, 2, 1]
-    add("top_p_boundary", values, uniforms=[0.2, 0.99], mode="sampling", temperature=1.0, top_k=0, top_p=0.5, forbidden=[], previous_tokens=[], repetition_penalty=1.0, length_penalty=1.0, listen_top_k=None, listen_probability_scale=1.0)
-    return cases
 
 
 def main() -> None:

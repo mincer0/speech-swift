@@ -93,8 +93,27 @@ fi
 OUT_METALLIB="$OUT_DIR/mlx.metallib"
 HASH_FILE="$OUT_DIR/.mlx.metallib.sha"
 
-# Content hash of all metal sources + headers to detect changes
-CURRENT_HASH="$(find "$KERNELS_DIR" -type f \( -name '*.metal' -o -name '*.h' \) ! -name '*_nax.metal' | LC_ALL=C sort | xargs cat | shasum -a 256 | awk '{print $1}')"
+# Match Package.swift's macOS 15 deployment target. Newer Xcode defaults
+# to Metal address-space rules that reject the pinned MLX kernels.
+METAL_FLAGS=(
+  -x metal
+  -Wall
+  -Wextra
+  -fno-fast-math
+  -Wno-c++17-extensions
+  -Wno-c++20-extensions
+  -mmacosx-version-min=15.0
+)
+
+# Compiler/math flags can change BF16 inference with identical sources.
+CURRENT_HASH="$(
+  {
+    printf '%s\n' "${METAL_FLAGS[@]}"
+    xcrun -sdk macosx metal --version
+    xcrun -sdk macosx --show-sdk-version
+    find "$KERNELS_DIR" -type f \( -name '*.metal' -o -name '*.h' \) ! -name '*_nax.metal' | LC_ALL=C sort | xargs cat
+  } | shasum -a 256 | awk '{print $1}'
+)"
 
 if [[ "$FORCE" != "1" && -f "$OUT_METALLIB" && -f "$HASH_FILE" ]]; then
   PREV_HASH="$(cat "$HASH_FILE" 2>/dev/null || true)"
@@ -112,15 +131,6 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   trap cleanup EXIT
 
   AIR_FILES=()
-  METAL_FLAGS=(
-    -x metal
-    -Wall
-    -Wextra
-    -fno-fast-math
-    -Wno-c++17-extensions
-    -Wno-c++20-extensions
-  )
-
   echo "Compiling ${#METAL_SRCS[@]} Metal sources..."
   for SRC in "${METAL_SRCS[@]}"; do
     REL="${SRC#"$KERNELS_DIR/"}"
@@ -147,7 +157,7 @@ fi
 
 # Also copy to test binary location so swift test can find it
 ARCH="$(uname -m)-apple-macosx"
-for CFG in debug release; do
+for CFG in "$CONFIG"; do
   for BUNDLE_NAME in Qwen3SpeechPackageTests Qwen3ASRPackageTests; do
     TEST_BUNDLE_DIR="$BUILD_DIR/$ARCH/$CFG/$BUNDLE_NAME.xctest/Contents/MacOS"
     if [[ -d "$TEST_BUNDLE_DIR" ]]; then

@@ -111,11 +111,14 @@ final class MiniCPMTTSExactBF16Linear: Linear {
         let context = Self.execution
         context.lock.lock()
         defer { context.lock.unlock() }
-        plan.graph.run(
-            with: context.commandQueue,
-            feeds: [plan.input: inputData, plan.weight: weightData],
-            targetOperations: nil,
-            resultsDictionary: [plan.output: outputData])
+        // TensorData retains the no-copy buffer wrapper, not its MLX storage owner.
+        withExtendedLifetime((graphInput, weight, output)) {
+            plan.graph.run(
+                with: context.commandQueue,
+                feeds: [plan.input: inputData, plan.weight: weightData],
+                targetOperations: nil,
+                resultsDictionary: [plan.output: outputData])
+        }
         return output
     }
 

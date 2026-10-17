@@ -1,4 +1,7 @@
 import Foundation
+#if os(macOS)
+import Darwin
+#endif
 
 /// Persistent storage limits shared by the Demo service layer.  The limits
 /// are checked before every write; they are not advisory UI settings.
@@ -299,16 +302,49 @@ enum MiniCPMDemoPersistence {
     }
 
     static func directorySize(_ url: URL) -> Int64 {
+        #if os(macOS)
+        // Quota checks run for every recording write. FTS reads each stat
+        // once, avoiding Foundation resource lookups for every stored blob.
+        // Physical traversal preserves the existing no-symlink accounting.
+        guard let path = strdup(url.path) else { return 0 }
+        defer { free(path) }
+        var roots: [UnsafeMutablePointer<CChar>?] = [path, nil]
+        guard let tree = roots.withUnsafeMutableBufferPointer({
+            fts_open($0.baseAddress, FTS_PHYSICAL | FTS_NOCHDIR, nil)
+        }) else { return 0 }
+        defer { fts_close(tree) }
+        var total: Int64 = 0
+        while let entry = fts_read(tree) {
+            let kind = Int32(entry.pointee.fts_info)
+            guard kind == FTS_D || kind == FTS_F,
+                  let attributes = entry.pointee.fts_statp else { continue }
+            let firstNameByte = withUnsafePointer(to: &entry.pointee.fts_name) {
+                UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self).pointee
+            }
+            if entry.pointee.fts_level > 0,
+               firstNameByte == 46 || attributes.pointee.st_flags & UInt32(UF_HIDDEN) != 0 {
+                if kind == FTS_D { fts_set(tree, entry, FTS_SKIP) }
+                continue
+            }
+            // A file passed as the root has no directory contents, matching
+            // FileManager's enumerator rather than counting the root itself.
+            if kind == FTS_F, entry.pointee.fts_level > 0 {
+                total += Int64(attributes.pointee.st_size)
+            }
+        }
+        return total
+        #else
         guard let enumerator = FileManager.default.enumerator(
             at: url, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
             options: [.skipsHiddenFiles]) else { return 0 }
         var total: Int64 = 0
         for case let item as URL in enumerator {
-            guard (try? item.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true,
-                  let size = try? item.resourceValues(forKeys: [.fileSizeKey]).fileSize else { continue }
+            guard let values = try? item.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true, let size = values.fileSize else { continue }
             total += Int64(size)
         }
         return total
+        #endif
     }
 
     static func ensureDirectory(_ url: URL) throws {
@@ -396,10 +432,11 @@ public actor MiniCPMDemoSessionStore {
     public func appendEvent(
         sessionID: String,
         direction: MiniCPMDemoRecordingDirection,
-        frame: MiniCPMJSONValue
+        frame: MiniCPMJSONValue,
+        timestamp: Date = Date()
     ) async throws -> MiniCPMDemoRecordedEvent {
         let recorder = try activeRecorder(sessionID)
-        return try await recorder.append(direction: direction, frame: frame)
+        return try await recorder.append(direction: direction, frame: frame, timestamp: timestamp)
     }
 
     public func appendEvent(

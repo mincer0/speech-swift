@@ -11,7 +11,8 @@ public struct MiniCPMProtocolTokenIds: Sendable, Equatable {
     public let ttsBOS: Int?
     /// Additional protocol markers known by the tokenizer.  They are not
     /// automatically forbidden as output (some markers are valid decisions
-    /// in a duplex turn), but are excluded from repetition history.
+    /// in a duplex turn). Chat excludes these from repetition history;
+    /// officialDuplex follows the caller's complete generated history.
     public let allSpecialTokenIds: Set<Int>
 
     public init(
@@ -92,21 +93,31 @@ public struct MiniCPMSamplingConfig: Sendable, Equatable {
     public var topP: Float
     public var repetitionPenalty: Float
     public var repetitionWindowSize: Int
-    /// Penalty applied to protocol terminators after the natural `chunk_eos`
-    /// probe.  MiniCPM's official chunk generator uses this to make a higher
-    /// value mean "keep generating a little longer".  It is intentionally
-    /// separate from `repetitionPenalty` because it only touches terminators.
+    /// Chat uses Hugging Face's sign-aware text penalty. Duplex uses the
+    /// checkpoint's StreamDecoder rule, including protocol tokens in history.
+    public var repetitionPolicy: RepetitionPolicy
+    /// Chat/pinned-runtime turn_eos shaping after the natural chunk_eos probe.
+    /// The checkpoint's officialDuplex policy has no length penalty and
+    /// ignores this value.
     public var lengthPenalty: Float
     public var listenTopK: Int?
     public var listenProbabilityScale: Float
-    /// Hold back the official natural `chunk_eos` probe. The probe returns the
-    /// raw (unmasked) argmax, so it can end a duplex unit after a single visible
-    /// character even though the audio side is pinned at 25 codes / 1.00 s per
-    /// unit. Callers set this while a unit has not yet collected enough visible
-    /// text, which keeps the text and audio budgets aligned.
+    /// Optional multiplicative adjustment in probability space for the
+    /// protocol listen token. This is kept separate from
+    /// ``listenProbabilityScale`` because multiplying a negative logit by a
+    /// value below one increases it. A value of 0 forbids listen; values in
+    /// (0, 1) add ``log(value)`` to the listen logit.
+    public var listenLogProbabilityScale: Float
+    /// Optionally skip the natural chunk_eos early return. The final sample
+    /// still obeys the caller's forbidden masks. False follows the checkpoint's
+    /// natural-probe behavior without imposing a minimum text length.
     public var suppressNaturalChunkEOS: Bool
 
     public enum Mode: Sendable, Equatable { case sampling, greedy }
+    public enum RepetitionPolicy: String, Sendable, Equatable {
+        case huggingFace = "hugging_face"
+        case officialDuplex = "official_duplex"
+    }
 
     public init(
         mode: Mode = .sampling,
@@ -115,10 +126,12 @@ public struct MiniCPMSamplingConfig: Sendable, Equatable {
         topP: Float = 0.8,
         repetitionPenalty: Float = 1.05,
         repetitionWindowSize: Int = 512,
+        repetitionPolicy: RepetitionPolicy = .huggingFace,
         lengthPenalty: Float = 1.1,
         listenTopK: Int? = nil,
         listenProbabilityScale: Float = 1.0,
-        suppressNaturalChunkEOS: Bool = false
+        suppressNaturalChunkEOS: Bool = false,
+        listenLogProbabilityScale: Float = 1.0
     ) {
         self.mode = mode
         self.temperature = temperature
@@ -126,9 +139,11 @@ public struct MiniCPMSamplingConfig: Sendable, Equatable {
         self.topP = topP
         self.repetitionPenalty = repetitionPenalty
         self.repetitionWindowSize = repetitionWindowSize
+        self.repetitionPolicy = repetitionPolicy
         self.lengthPenalty = lengthPenalty
         self.listenTopK = listenTopK
         self.listenProbabilityScale = listenProbabilityScale
+        self.listenLogProbabilityScale = max(0, listenLogProbabilityScale)
         self.suppressNaturalChunkEOS = suppressNaturalChunkEOS
     }
 }
@@ -142,6 +157,18 @@ public struct MiniCPMSamplingConfig: Sendable, Equatable {
 /// consume exactly the same draws as the original path.
 public struct MiniCPMSamplerState: Sendable, Equatable {
     private var state: UInt64
+    /// The official decoder records filtered samples, including protocol
+    /// markers. Natural chunkEOS and listenTopK early returns are unrecorded.
+    public private(set) var sampledTokens: [Int] = []
+
+    /// Clear session history while preserving the random generator position.
+    public mutating func clearTokenHistory() {
+        sampledTokens.removeAll(keepingCapacity: true)
+    }
+
+    fileprivate mutating func recordSampledToken(_ token: Int) {
+        sampledTokens.append(token)
+    }
 
     /// Create a state from a caller supplied seed.  With no seed, the seed is
     /// drawn from the system generator, so production sessions never all use
@@ -273,8 +300,8 @@ public enum MiniCPMSampler {
     /// Sample using the per-session generator.  This is the production entry
     /// point; unlike the legacy fixed-quantile helper below, it consumes the
     /// same number of draws as the official decoder: one for the natural
-    /// `chunk_eos` probe, and a second one for the filtered sample when the
-    /// probe did not terminate the chunk.
+    /// `chunk_eos` probe, and a second one for a filtered sample unless the
+    /// natural probe or listenTopK rule returned early.
     public static func sample(
         logits: MLXArray,
         config: MiniCPMSamplingConfig,
@@ -288,16 +315,19 @@ public enum MiniCPMSampler {
         let natural = choose(
             row, mode: config.mode, temperature: 1, topK: 0, topP: 1,
             uniform: naturalDraw)
-        if natural.item(Int.self) == `protocol`.chunkEOS { return natural }
+        if shouldReturnNaturalChunkEOS(natural, config: config, protocol: `protocol`) {
+            return natural
+        }
 
-        let finalDraw = config.mode == .greedy ? 0 : state.nextUniform()
-        return sampleAfterNaturalProbe(
+        let result = sampleAfterNaturalProbe(
             row: row,
             config: config,
             protocol: `protocol`,
             forbidden: forbidden,
             previousTokens: previousTokens,
-            uniform: finalDraw)
+            uniform: { config.mode == .greedy ? 0 : state.nextUniform() })
+        if result.recordHistory { state.recordSampledToken(result.token.item(Int.self)) }
+        return result.token
     }
 
     /// Sample with a caller-provided draw.  Supplying a draw is useful for
@@ -342,16 +372,10 @@ public enum MiniCPMSampler {
             topK: 0,
             topP: 1,
             uniform: naturalDraw)
-        // The natural `chunk_eos` probe is the official decoder's early-exit
-        // path and ignores both the forbidden list and the character bounds.
-        // A duplex unit may therefore end after one or two visible characters
-        // even though the token2wav stage is pinned at 25 codes (1.00 s) per
-        // unit - the surplus renders as silence inside the block, which is
-        // audible as choppy, broken-up speech. `suppressNaturalChunkEOS` lets
-        // the caller hold the probe back until the unit has collected enough
-        // visible text; the masked categorical sample below still applies the
-        // normal protocol policy.
-        if !config.suppressNaturalChunkEOS, natural.item(Int.self) == `protocol`.chunkEOS {
+        // The checkpoint's natural probe runs before the forbidden masks.
+        // A caller can explicitly suppress this early return; the final
+        // categorical sample still applies the caller's masks and policy.
+        if shouldReturnNaturalChunkEOS(natural, config: config, protocol: `protocol`) {
             return natural
         }
 
@@ -362,7 +386,15 @@ public enum MiniCPMSampler {
             protocol: `protocol`,
             forbidden: forbidden,
             previousTokens: previousTokens,
-            uniform: finalDraw)
+            uniform: { finalDraw }).token
+    }
+
+    private static func shouldReturnNaturalChunkEOS(
+        _ token: MLXArray,
+        config: MiniCPMSamplingConfig,
+        `protocol`: MiniCPMProtocolTokenIds
+    ) -> Bool {
+        !config.suppressNaturalChunkEOS && token.item(Int.self) == `protocol`.chunkEOS
     }
 
     private static func sampleAfterNaturalProbe(
@@ -371,20 +403,27 @@ public enum MiniCPMSampler {
         `protocol`: MiniCPMProtocolTokenIds,
         forbidden: [Int],
         previousTokens: [Int],
-        uniform: Float
-    ) -> MLXArray {
+        uniform: () -> Float
+    ) -> (token: MLXArray, recordHistory: Bool) {
 
-        var scores = row
+        // MLXArray is a reference type, and asType returns self when the dtype
+        // already matches. A distinct handle keeps indexed score updates from
+        // changing caller-owned logits or a later natural probe/diagnostic.
+        var scores = row.reshaped(row.shape)
         let blocked = forbidden.filter { $0 >= 0 && $0 < scores.dim(0) }
         if !blocked.isEmpty {
-            scores[MLXArray(blocked.map(Int32.init))] = MLXArray(-Float.greatestFiniteMagnitude)
+            scores[MLXArray(blocked.map(Int32.init))] = MLXArray(-Float.infinity)
         }
 
-        let history = previousTokens.suffix(max(config.repetitionWindowSize, 0))
-        // Protocol markers are bookkeeping, not text.  Applying repetition
-        // pressure to them makes a previous `<|listen|>` or `<|turn_eos|>`
-        // alter the next conversational decision and is unlike the official
-        // decoder, which keeps special tokens in a separate history.
+        // Python's generated_tokens[-0:] means the complete history. Preserve
+        // that checkpoint convention only for officialDuplex; chat uses zero
+        // to disable its repetition window.
+        let history = config.repetitionPolicy == .officialDuplex
+            && config.repetitionWindowSize == 0
+            ? previousTokens[...]
+            : previousTokens.suffix(max(config.repetitionWindowSize, 0))
+        // Chat excludes protocol markers. The official duplex decoder starts
+        // with special_token_ids=[], so all supplied generated history counts.
         var protocolSpecials: Set<Int> = [
             `protocol`.listen,
             `protocol`.chunkEOS,
@@ -396,36 +435,30 @@ public enum MiniCPMSampler {
         if let ttsBOS = `protocol`.ttsBOS { protocolSpecials.insert(ttsBOS) }
         protocolSpecials.formUnion(`protocol`.allSpecialTokenIds)
         let unique = Set(history).filter {
-            $0 >= 0 && $0 < scores.dim(0) && !protocolSpecials.contains($0)
+            $0 >= 0 && $0 < scores.dim(0)
+                && (config.repetitionPolicy == .officialDuplex || !protocolSpecials.contains($0))
         }
         if config.repetitionPenalty != 1, !unique.isEmpty {
             let ids = MLXArray(unique.map(Int32.init))
             let values = scores[ids]
             let penalty = config.repetitionPenalty
-            // Match HuggingFace `RepetitionPenaltyLogitsProcessor`: a token that
-            // already appeared has to be pushed *away* from zero, on whichever
-            // side of zero it sits.
-            //     logit <  0  -> multiply  (further negative)
-            //     logit >= 0  -> divide    (closer to zero)
-            // The previous unconditional `values / penalty` moved a negative
-            // logit *toward* zero, i.e. it rewarded repetition of exactly the
-            // tokens the model had just produced. With ~150k negative logits in
-            // the tail, that lifted junk pieces - and the character just
-            // emitted - into the top-k/top-p window. That is the source of the
-            // duplicated characters ("苹果果", "准备备着") and stray tokens ("_").
-            let penalized = MLX.where(values .< 0, values * penalty, values / penalty)
-            // Keep the non-finite mask sentinels untouched: scaling them can
-            // turn a finite mask into NaN on some MLX backends.
+            let penalized: MLXArray
+            switch config.repetitionPolicy {
+            case .huggingFace:
+                penalized = MLX.where(values .< 0, values * penalty, values / penalty)
+            case .officialDuplex:
+                // StreamDecoder applies this rule regardless of logit sign.
+                penalized = penalty > 1 ? values / penalty : values * (1 / penalty)
+            }
+            // Forbidden sentinels must stay masked when encouraging repetition.
             scores[ids] = MLX.where(isFinite(values), penalized, values)
         }
 
-        // The official decoder applies the length penalty only to
-        // ``turn_eos`` after the natural ``chunk_eos`` probe.  In particular,
-        // ``chunk_tts_eos`` is a distinct chunk boundary and must retain its
-        // model logit.  Keep masked values untouched: multiplying a
-        // non-finite sentinel can otherwise turn a finite mask into NaN on
-        // some MLX backends.
-        if config.lengthPenalty != 1,
+        // The chat/pinned runtime policy shapes turn_eos. The checkpoint's
+        // MPS StreamDecoder has no length penalty, so officialDuplex skips it.
+        // Keep masked values untouched when applying the chat policy.
+        if config.repetitionPolicy == .huggingFace,
+           config.lengthPenalty != 1,
            config.lengthPenalty.isFinite,
            config.lengthPenalty > 0 {
             let token = `protocol`.turnEOS
@@ -444,10 +477,19 @@ public enum MiniCPMSampler {
             let current = scores[`protocol`.listen]
             // Keep a masked listen logit masked.  Multiplying `-inf` by zero
             // would otherwise create NaN and make the entire categorical
-            // distribution invalid; the official decoder skips non-finite
-            // values for the same reason.
+            // distribution invalid.
             if isFinite(current).item(Bool.self) {
                 scores[`protocol`.listen] = current * config.listenProbabilityScale
+            }
+        }
+        if config.listenLogProbabilityScale != 1,
+           `protocol`.listen >= 0,
+           `protocol`.listen < scores.dim(0) {
+            let current = scores[`protocol`.listen]
+            if isFinite(current).item(Bool.self) {
+                scores[`protocol`.listen] = config.listenLogProbabilityScale > 0
+                    ? current + Foundation.log(config.listenLogProbabilityScale)
+                    : MLXArray(-Float.infinity)
             }
         }
         if let listenTopK = config.listenTopK,
@@ -456,17 +498,17 @@ public enum MiniCPMSampler {
            `protocol`.listen < scores.dim(0) {
             let rank = (scores .> scores[`protocol`.listen]).asType(.int32).sum().item(Int.self)
             if rank < listenTopK {
-                return MLXArray(Int32(`protocol`.listen))
+                return (MLXArray(Int32(`protocol`.listen)), false)
             }
         }
 
-        return choose(
+        return (choose(
             scores,
             mode: config.mode,
             temperature: max(config.temperature, 0.000001),
             topK: config.topK,
             topP: config.topP,
-            uniform: uniform)
+            uniform: uniform()), true)
     }
 
     private static func lastRow(_ logits: MLXArray) -> MLXArray {
@@ -487,8 +529,13 @@ public enum MiniCPMSampler {
         var scores = raw / temperature
         let vocab = scores.dim(0)
         let k = topK > 0 && topK < vocab ? topK : vocab
-        var order = argSort(scores, axis: 0)[.stride(by: -1)]
-        if k < vocab { order = order[0 ..< k] }
+        let order = argSort(scores, axis: 0)[.stride(by: -1)]
+        if k < vocab {
+            // torch.topk defines a score threshold; every token tied with the
+            // kth score survives, even when that leaves more than k tokens.
+            let threshold = take(scores, order[k - 1], axis: 0)
+            scores = which(scores .< threshold, MLXArray(-Float.infinity), scores)
+        }
         let ranked = take(scores, order, axis: 0)
         let probabilities = softmax(ranked, axis: 0, precise: true)
         let kept: MLXArray

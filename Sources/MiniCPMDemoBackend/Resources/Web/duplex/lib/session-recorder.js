@@ -27,6 +27,8 @@ export class SessionRecorder {
         this._startTime = 0;
         this._pausedAt = 0;
         this._pausedDurationMs = 0;
+        this._inputHeldAtMs = null;
+        this._inputHeldSamples = 0;
 
         /** @type {Float32Array[]} */
         this._leftChunks = [];
@@ -50,6 +52,8 @@ export class SessionRecorder {
         this._startTime = performance.now();
         this._pausedAt = 0;
         this._pausedDurationMs = 0;
+        this._inputHeldAtMs = null;
+        this._inputHeldSamples = 0;
         console.log('[SessionRecorder] recording started');
     }
 
@@ -75,6 +79,29 @@ export class SessionRecorder {
         console.log('[SessionRecorder] resumed');
     }
 
+    // Flow control pauses only input. Assistant playback keeps its wall-clock
+    // position, so leave silence in the left channel for the capture gap.
+    pauseInputCapture() {
+        if (!this._recording || this._inputHeldAtMs !== null) return;
+        this._inputHeldAtMs = this._elapsedMs();
+        this._inputHeldSamples = 0;
+    }
+
+    resumeInputCapture() {
+        if (!this._recording || this._inputHeldAtMs === null) return;
+        const count = Math.max(0, Math.round(
+            (this._elapsedMs() - this._inputHeldAtMs) / 1000 * this._inputSR)
+            - this._inputHeldSamples);
+        if (count > 0) this._leftChunks.push(new Float32Array(count));
+        this._inputHeldAtMs = null;
+        this._inputHeldSamples = 0;
+    }
+
+    _elapsedMs() {
+        const now = this._paused ? this._pausedAt : performance.now();
+        return now - this._startTime - this._pausedDurationMs;
+    }
+
     /**
      * Push a left-channel chunk (user input mix from CaptureProcessor).
      * Chunks are appended sequentially — order must match real time.
@@ -83,6 +110,7 @@ export class SessionRecorder {
     pushLeft(pcm16k) {
         if (!this._recording || this._paused) return;
         this._leftChunks.push(pcm16k);
+        if (this._inputHeldAtMs !== null) this._inputHeldSamples += pcm16k.length;
     }
 
     /**
@@ -103,11 +131,32 @@ export class SessionRecorder {
         this._rightNextOffset = offset + resampled.length;
     }
 
+    /** Preserve played AI audio and discard the cancelled future timeline. */
+    cancelRight(timestamp = performance.now()) {
+        if (!this._recording) return;
+        const cutoffTime = this._paused ? Math.min(timestamp, this._pausedAt) : timestamp;
+        const cutoff = Math.max(0, Math.floor(
+            (cutoffTime - this._startTime - this._pausedDurationMs) / 1000 * this._inputSR));
+        const kept = [];
+        let nextOffset = 0;
+        for (const entry of this._rightEntries) {
+            const played = Math.min(entry.data.length, cutoff - entry.offset);
+            if (played <= 0) continue;
+            const data = played === entry.data.length ? entry.data : entry.data.slice(0, played);
+            kept.push({ offset: entry.offset, data });
+            nextOffset = Math.max(nextOffset, entry.offset + data.length);
+        }
+        this._rightEntries = kept;
+        this._rightNextOffset = nextOffset;
+    }
+
     /**
      * Stop recording and encode stereo WAV.
      * @returns {{ blob: Blob, durationSec: number, leftSamples: number, rightSamples: number }}
      */
     stop() {
+        this.resumeInputCapture();
+        this.cancelRight();
         this._recording = false;
 
         const leftTotal = this._leftChunks.reduce((a, c) => a + c.length, 0);

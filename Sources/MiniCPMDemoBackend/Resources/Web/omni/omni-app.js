@@ -13,6 +13,7 @@ import { SessionVideoRecorder } from '../duplex/lib/session-video-recorder.js';
 import { RecordingSettings } from '../duplex/lib/recording-settings.js';
 import { measureLUFS } from '../duplex/lib/lufs.js';
 import { MixerController } from '../duplex/lib/mixer-controller.js';
+import { FileResponseDrain } from '../duplex/lib/file-response-drain.js';
 
 // Layer 1: UI binding
 import {
@@ -54,6 +55,29 @@ let sessionRecorder = null;
 let lastRecordingBlob = null;
 /** @type {RecordingSettings|null} */
 let recordingSettings = null;
+
+function syncOmniRecorderInputFlow() {
+    if (session && (!session._sessionReady || session.inputFlowHeld || media?._waitingForInputDrain)) {
+        sessionRecorder?.pauseInputCapture?.();
+    } else {
+        sessionRecorder?.resumeInputCapture?.();
+    }
+}
+
+function syncOmniInputCaptureFlow() {
+    if (!session || !media) return;
+    const held = !session._sessionReady || session.inputFlowHeld || session.paused;
+    if (held) media.pause?.();
+    else media.resume?.();
+    if (session.running) {
+        setStatusLamp(held ? 'preparing' : 'live');
+        if (session.inputFlowHeld && !session.paused) {
+            const label = document.querySelector('#statusLamp .label');
+            if (label) label.textContent = currentMode === 'live'
+                ? 'Processing — mic paused' : 'Processing — file paused';
+        }
+    }
+}
 
 // 排队倒计时（使用共享 CountdownTimer 模块）
 import { CountdownTimer } from '../lib/countdown-timer.js';
@@ -240,6 +264,7 @@ class MediaProvider {
     constructor() {
         this.onChunk = null;
         this.onEnd = null;
+        this.onReady = null;
         this.running = false;
     }
     async start() { throw new Error('Not implemented'); }
@@ -264,6 +289,8 @@ class LiveMediaProvider extends MediaProvider {
         this._useFront = _globalCameraFront;
         this._previewing = false;
         this._aborted = false;
+        this.paused = false;
+        this._captureEpoch = 0;
     }
 
     async startPreview() {
@@ -307,12 +334,14 @@ class LiveMediaProvider extends MediaProvider {
     }
 
     async start() {
+        this._aborted = false;
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
             throw new Error('浏览器不支持 getUserMedia。请使用 HTTPS 访问。');
         }
         if (!this._videoStream) {
             await this._openVideoStream(this._useFront);
         }
+        if (this._aborted) throw new Error('Media preparation cancelled');
         const _omniMicId = omniDeviceSelector.getSelectedMicId();
         this._audioStream = await navigator.mediaDevices.getUserMedia({
             audio: {
@@ -324,11 +353,20 @@ class LiveMediaProvider extends MediaProvider {
             },
             video: false,
         });
+        if (this._aborted) {
+            this._audioStream.getTracks().forEach(track => track.stop());
+            this._audioStream = null;
+            throw new Error('Media preparation cancelled');
+        }
         this._audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE_IN });
         if (this._audioCtx.state === 'suspended') await this._audioCtx.resume();
         await this._audioCtx.audioWorklet.addModule('/static/duplex/lib/capture-processor.js');
+        if (this._aborted) throw new Error('Media preparation cancelled');
         this._connectAudioPipeline();
         this.running = true;
+        if (this.onReady) await this.onReady();
+        if (!this.running) return;
+        this.resetCaptureTimeline();
         this._previewing = false;
         document.getElementById('camFlipBtn').classList.add('visible');
         document.getElementById('mirrorBtn').classList.add('visible');
@@ -364,7 +402,6 @@ class LiveMediaProvider extends MediaProvider {
         });
 
         this._audioSource.connect(this._captureNode);
-        this._captureNode.port.postMessage({ command: 'start' });
 
         _omniStartWaveform(this._audioCtx, this._audioSource);
 
@@ -375,6 +412,7 @@ class LiveMediaProvider extends MediaProvider {
         this._captureNode.port.onmessage = (e) => {
             if (e.data.type === 'chunk') {
                 if (!this.running) return;
+                if (e.data.captureEpoch !== this._captureEpoch) return;
                 const frameB64 = this._captureFrame();
                 if (this.onChunk) this.onChunk({ audio: e.data.audio, frameBase64: frameB64 });
             }
@@ -383,6 +421,27 @@ class LiveMediaProvider extends MediaProvider {
 
     /** Real-time audio output stream for recording (bypasses 1s CaptureProcessor chunking) */
     getAudioOutputStream() { return this._recDest?.stream || null; }
+
+    pause() {
+        if (!this.running || this.paused) return;
+        this.paused = true;
+        if (this._audioCtx && this._audioCtx.state !== 'closed') {
+            this._audioCtx.suspend()?.catch(err => addSystemEntry(`Input capture: ${err.message}`));
+        }
+    }
+
+    resume() {
+        if (!this.running || !this.paused) return;
+        this.paused = false;
+        if (this._audioCtx && this._audioCtx.state !== 'closed') {
+            this._audioCtx.resume()?.catch(err => addSystemEntry(`Input capture: ${err.message}`));
+        }
+    }
+
+    resetCaptureTimeline() {
+        this._captureEpoch++;
+        this._captureNode?.port.postMessage({ command: 'start', captureEpoch: this._captureEpoch });
+    }
 
     async flipCamera() {
         const wantFront = !this._useFront;
@@ -406,8 +465,11 @@ class LiveMediaProvider extends MediaProvider {
     }
 
     stop() {
+        this._aborted = true;
         this.running = false;
-        _omniStopWaveform();
+        this.paused = false;
+        const ownsSurface = !media || media === this;
+        if (ownsSurface) _omniStopWaveform();
         if (this._captureNode) {
             this._captureNode.port.postMessage({ command: 'stop' });
             try { this._captureNode.disconnect(); } catch (_) {}
@@ -417,11 +479,13 @@ class LiveMediaProvider extends MediaProvider {
         if (this._audioCtx) { this._audioCtx.close().catch(() => {}); this._audioCtx = null; }
         if (this._audioStream) { this._audioStream.getTracks().forEach(t => t.stop()); this._audioStream = null; }
         if (this._videoStream) { this._videoStream.getTracks().forEach(t => t.stop()); this._videoStream = null; }
-        this._videoEl.srcObject = null;
-        this._videoEl.style.display = 'none';
-        this._videoEl.style.transform = 'none';
-        document.getElementById('camFlipBtn').classList.remove('visible');
-        document.getElementById('mirrorBtn').classList.remove('visible');
+        if (ownsSurface) {
+            this._videoEl.srcObject = null;
+            this._videoEl.style.display = 'none';
+            this._videoEl.style.transform = 'none';
+            document.getElementById('camFlipBtn').classList.remove('visible');
+            document.getElementById('mirrorBtn').classList.remove('visible');
+        }
     }
 
     _captureFrame() {
@@ -492,6 +556,8 @@ class FileMediaProvider extends MediaProvider {
         this._mixAnalyserNode = null;
         this._fileSrcNode = null;
         this._graphConnected = false;
+        this._captureEpoch = 0;
+        this._aborted = false;
 
         this._videoEl = document.getElementById('videoEl');
         this._canvas = document.getElementById('frameCanvas');
@@ -499,13 +565,22 @@ class FileMediaProvider extends MediaProvider {
         this._objectUrl = null;
         this._padBeforeTimer = null;
         this.paused = false;
+        this.getResponseState = null;
+        this.getPlaybackActive = null;
+        this.getInputPending = null;
+        this.canResumeInput = null;
+        this.onInputHoldChange = null;
+        this._waitingForInputDrain = false;
+        this._responseDrain = new FileResponseDrain();
     }
 
     async start() {
+        this._aborted = false;
         addSystemEntry('Processing video file...');
 
         // 1. Get duration, cap at 2 minutes
         const rawDuration = await this._getVideoDuration();
+        if (this._aborted) throw new Error('Media preparation cancelled');
         const cappedDuration = Math.min(rawDuration, FILE_MAX_DURATION);
         this._mainChunks = Math.floor(cappedDuration);
         if (this._mainChunks === 0) throw new Error('Video too short');
@@ -515,17 +590,20 @@ class FileMediaProvider extends MediaProvider {
 
         // 2. Pre-extract frames (with offset k)
         this._frames = await this._extractFrames(this._mainChunks, this._frameOffset);
+        if (this._aborted) throw new Error('Media preparation cancelled');
         this._firstFrame = this._frames[0] || null;
         this._lastFrame = this._frames[this._frames.length - 1] || null;
 
         // 3. Decode video audio (modes: video, mixed)
         if (this._audioMode === 'video' || this._audioMode === 'mixed') {
             await this._decodeVideoAudio(cappedDuration);
+            if (this._aborted) throw new Error('Media preparation cancelled');
         }
 
         // 4. Setup mic but don't connect yet (modes: mic, mixed)
         if (this._audioMode === 'mic' || this._audioMode === 'mixed') {
             await this._setupMic();
+            if (this._aborted) throw new Error('Media preparation cancelled');
         }
 
         // 5. Compute phase boundaries
@@ -554,10 +632,13 @@ class FileMediaProvider extends MediaProvider {
 
         // 7. Start chunk feeding
         this._chunkIdx = 0;
+        this._responseDrain.reset();
         this.running = true;
 
         if (this._audioMode === 'video') {
             this._buildPaddedArrays();
+            if (this.onReady) await this.onReady();
+            if (!this.running) return;
             this._feedNext();
         } else {
             // mic/mixed: mic runs for entire padded duration; file buffer + frames include padding
@@ -567,6 +648,9 @@ class FileMediaProvider extends MediaProvider {
                 ...this._frames,
                 ...Array(this._padAfter).fill(this._lastFrame),
             ];
+            this._connectMic();
+            if (this.onReady) await this.onReady();
+            if (!this.running) return;
             this._startMainMicPhase();
         }
     }
@@ -590,7 +674,30 @@ class FileMediaProvider extends MediaProvider {
     _feedNext() {
         if (!this.running || this.paused) return;
         if (this._chunkIdx >= this._grandTotal) {
+            if (this.getInputPending?.()) {
+                if (!this._waitingForInputDrain) {
+                    this._waitingForInputDrain = true;
+                    this.onInputHoldChange?.();
+                }
+                this._timer = setTimeout(() => this._feedNext(), CHUNK_MS);
+                return;
+            }
+            if (this._waitingForInputDrain) {
+                this._waitingForInputDrain = false;
+                this.onInputHoldChange?.();
+            }
+            if (this._continueResponseDrain()) {
+                this._chunkIdx++;
+                if (this.onChunk) this.onChunk({
+                    audio: new Float32Array(SAMPLE_RATE_IN), frameBase64: this._lastFrame,
+                });
+                if (this.running && !this.paused) {
+                    this._timer = setTimeout(() => this._feedNext(), CHUNK_MS);
+                }
+                return;
+            }
             this.running = false;
+            this._videoEl.pause();
             if (this.onEnd) this.onEnd();
             return;
         }
@@ -604,7 +711,9 @@ class FileMediaProvider extends MediaProvider {
         this._chunkIdx++;
         if (this.onChunk) this.onChunk({ audio, frameBase64: frame });
         const elapsed = performance.now() - t0;
-        this._timer = setTimeout(() => this._feedNext(), Math.max(0, CHUNK_MS - elapsed));
+        if (this.running && !this.paused) {
+            this._timer = setTimeout(() => this._feedNext(), Math.max(0, CHUNK_MS - elapsed));
+        }
     }
 
     // ==================== Mic/Mixed modes: phased feeding ====================
@@ -621,11 +730,17 @@ class FileMediaProvider extends MediaProvider {
             },
             video: false,
         });
+        if (this._aborted) {
+            this._micStream.getTracks().forEach(track => track.stop());
+            this._micStream = null;
+            throw new Error('Media preparation cancelled');
+        }
 
         this._micCtx = new AudioContext({ sampleRate: SAMPLE_RATE_IN });
         if (this._micCtx.state === 'suspended') await this._micCtx.resume();
 
         await this._micCtx.audioWorklet.addModule('/static/duplex/lib/capture-processor.js');
+        if (this._aborted) throw new Error('Media preparation cancelled');
 
         this._micSource = this._micCtx.createMediaStreamSource(this._micStream);
 
@@ -690,7 +805,6 @@ class FileMediaProvider extends MediaProvider {
             this._fileGainNode.connect(this._captureNode);
             this._fileGainNode.connect(this._fileAnalyserNode);
             // Speaker output uses HTML video element (original quality); Web Audio monitor disconnected
-            this._fileSrcNode.start();
             this._fileSrcNode.onended = () => addSystemEntry('Video audio in graph completed');
         }
 
@@ -702,16 +816,16 @@ class FileMediaProvider extends MediaProvider {
 
         this._captureNode.port.onmessage = (e) => {
             if (e.data.type === 'chunk') {
+                if (e.data.captureEpoch !== this._captureEpoch) return;
                 this._handleMicChunk(e.data.audio);
             }
         };
-        this._captureNode.port.postMessage({ command: 'start' });
         this._graphConnected = true;
         addSystemEntry(`Mic connected — AudioWorklet graph (${this._audioMode})`);
     }
 
     _disconnectMic() {
-        _omniStopWaveform();
+        if (!media || media === this) _omniStopWaveform();
         this._graphConnected = false;
         if (this._captureNode) {
             this._captureNode.port.postMessage({ command: 'stop' });
@@ -731,6 +845,8 @@ class FileMediaProvider extends MediaProvider {
     }
 
     _startMainMicPhase() {
+        this.resetCaptureTimeline();
+        this._fileSrcNode?.start();
         // Delay video playback by padBefore — graph plays silence during leading padding
         if (this._padBefore > 0) {
             this._padBeforeTimer = setTimeout(() => {
@@ -739,13 +855,45 @@ class FileMediaProvider extends MediaProvider {
         } else {
             this._videoEl.play();
         }
-        this._connectMic();
     }
 
     _handleMicChunk(mixedAudio) {
+        if (!this.running) return;
         // During padding: file audio = zero → mix = mic only; frame = first/last
         // During main:    file audio = real → mix = mic + file; frame from video
         if (this._chunkIdx >= this._grandTotal) {
+            if (this._waitingForInputDrain) {
+                this._chunkIdx++;
+                if (this.onChunk) this.onChunk({ audio: mixedAudio, frameBase64: this._lastFrame });
+                return;
+            }
+            if (this.getInputPending?.()) {
+                this._chunkIdx++;
+                if (this.onChunk) this.onChunk({ audio: mixedAudio, frameBase64: this._lastFrame });
+                this._waitingForInputDrain = true;
+                this.onInputHoldChange?.();
+                this.pause();
+                const poll = () => {
+                    this._timer = null;
+                    if (!this.running || !this._waitingForInputDrain) return;
+                    if (this.getInputPending?.() || this.canResumeInput?.() === false) {
+                        this._timer = setTimeout(poll, CHUNK_MS);
+                        return;
+                    }
+                    this._waitingForInputDrain = false;
+                    this.onInputHoldChange?.();
+                    this._handleMicChunk(new Float32Array(SAMPLE_RATE_IN));
+                    if (this.running && this.canResumeInput?.() !== false) this.resume();
+                };
+                this._timer = setTimeout(poll, CHUNK_MS);
+                return;
+            }
+            if (this._continueResponseDrain()) {
+                this._micChunkCount++;
+                this._chunkIdx++;
+                if (this.onChunk) this.onChunk({ audio: mixedAudio, frameBase64: this._lastFrame });
+                return;
+            }
             this._disconnectMic();
             this._videoEl.pause();
             addSystemEntry(`Mic phase done: ${this._micChunkCount} chunks via AudioWorklet`);
@@ -757,6 +905,22 @@ class FileMediaProvider extends MediaProvider {
         this._micChunkCount++;
         this._chunkIdx++;
         if (this.onChunk) this.onChunk({ audio: mixedAudio, frameBase64: frame });
+    }
+
+    _continueResponseDrain() {
+        const decision = this._responseDrain.next(
+            this.getResponseState?.() || 'listening', this.getPlaybackActive?.() || false);
+        if (decision.continue && decision.chunks === 1) {
+            addSystemEntry('File input complete — waiting for the assistant turn to finish.');
+        } else if (!decision.continue && decision.reason === 'timeout') {
+            addSystemEntry(`Assistant drain reached ${decision.chunks}s limit; stopping file session.`);
+        }
+        return decision.continue;
+    }
+
+    resetCaptureTimeline() {
+        this._captureEpoch++;
+        this._captureNode?.port.postMessage({ command: 'start', captureEpoch: this._captureEpoch });
     }
 
     // ==================== Recording audio accessors ====================
@@ -911,8 +1075,8 @@ class FileMediaProvider extends MediaProvider {
         // Cancel pending padBefore timer (delayed video play)
         if (this._padBeforeTimer) { clearTimeout(this._padBeforeTimer); this._padBeforeTimer = null; }
         // Mic/Mixed: suspend AudioContext (freezes entire graph — mic, file buffer, capture)
-        if (this._micCtx && this._micCtx.state === 'running') {
-            this._micCtx.suspend();
+        if (this._micCtx && this._micCtx.state !== 'closed') {
+            this._micCtx.suspend()?.catch(err => addSystemEntry(`Input capture: ${err.message}`));
         }
         // Pause speaker output
         if (!this._videoEl.paused) this._videoEl.pause();
@@ -921,6 +1085,7 @@ class FileMediaProvider extends MediaProvider {
 
     resume() {
         if (!this.running || !this.paused) return;
+        if (this._waitingForInputDrain && this._audioMode !== 'video') return;
         this.paused = false;
         if (this._audioMode === 'video') {
             // Video-only: restart the timer and video element
@@ -930,8 +1095,8 @@ class FileMediaProvider extends MediaProvider {
             this._feedNext();
         } else {
             // Mic/Mixed: resume AudioContext (unfreezes entire graph)
-            if (this._micCtx && this._micCtx.state === 'suspended') {
-                this._micCtx.resume();
+            if (this._micCtx && this._micCtx.state !== 'closed') {
+                this._micCtx.resume()?.catch(err => addSystemEntry(`Input capture: ${err.message}`));
             }
             // Resume or schedule video playback
             if (this._chunkIdx < this._mainStart) {
@@ -949,8 +1114,10 @@ class FileMediaProvider extends MediaProvider {
     }
 
     stop() {
+        this._aborted = true;
         this.running = false;
         this.paused = false;
+        this._waitingForInputDrain = false;
         if (this._timer) { clearTimeout(this._timer); this._timer = null; }
         if (this._padBeforeTimer) { clearTimeout(this._padBeforeTimer); this._padBeforeTimer = null; }
         this._disconnectMic();
@@ -966,12 +1133,14 @@ class FileMediaProvider extends MediaProvider {
         this._micSource = null;
         this._graphConnected = false;
         this._paddedFrames = null;
-        this._videoEl.autoplay = true;   // restore for LiveMediaProvider camera preview
-        this._videoEl.muted = false;
-        this._videoEl.volume = 1.0;
-        this._videoEl.pause();
-        this._videoEl.src = '';
-        this._videoEl.style.display = 'none';
+        if (!media || media === this) {
+            this._videoEl.autoplay = true;   // restore for LiveMediaProvider camera preview
+            this._videoEl.muted = false;
+            this._videoEl.volume = 1.0;
+            this._videoEl.pause();
+            this._videoEl.src = '';
+            this._videoEl.style.display = 'none';
+        }
         if (this._objectUrl) { URL.revokeObjectURL(this._objectUrl); this._objectUrl = null; }
     }
 }
@@ -1467,6 +1636,7 @@ async function startSession() {
 
     // Create RealtimeSession + wire hooks
     session = new RealtimeSession('omni', {
+        enableInputFlowControl: true,
         getMaxKvTokens: () => parseInt(document.getElementById('maxKvTokens').value, 10) || 8192,
         getPlaybackDelayMs: () => parseInt(document.getElementById('playbackDelay').value, 10) || 200,
         outputSampleRate: SAMPLE_RATE_OUT,
@@ -1476,6 +1646,8 @@ async function startSession() {
             return window.ClientIdentity ? window.ClientIdentity.appendToUrl(url) : url;
         },
     });
+    const ownerSession = session;
+    const ownerMedia = media;
     session.onMetrics = (data) => metricsPanel.update(data);
     session.onSystemLog = addSystemEntry;
     session.onSpeakStart = (text) => {
@@ -1521,12 +1693,14 @@ async function startSession() {
         playAlarmBell();
     };
     session.onPrepared = async () => {
-        if (session.audioPlayer && session.audioPlayer._ctx) {
-            omniDeviceSelector.applySinkId(session.audioPlayer._ctx);
+        if (session !== ownerSession) throw new Error('Media preparation cancelled');
+        if (ownerSession.audioPlayer && ownerSession.audioPlayer._ctx) {
+            omniDeviceSelector.applySinkId(ownerSession.audioPlayer._ctx);
         }
         await playSessionChime();
     };
     session.onCleanup = () => {
+        if (session !== ownerSession) return;
         _omniCountdown.stop();
         if (_stopDingDong) { _stopDingDong(); _stopDingDong = null; }
         _queuePhase = null;
@@ -1537,6 +1711,7 @@ async function startSession() {
             const recorder = sessionRecorder;
             sessionRecorder = null;
             recorder.stop().then((result) => {
+                if (session && session !== ownerSession) return;
                 if (result.blob.size > 0) {
                     lastRecordingBlob = result.blob;
                     addSystemEntry(`Recording: ${result.durationSec.toFixed(1)}s WebM (${(result.blob.size / 1024 / 1024).toFixed(1)} MB)`);
@@ -1566,8 +1741,25 @@ async function startSession() {
         if (currentMode === 'live') { startCameraPreview(); }
         else { updateFullscreenBtnVisibility(false); document.getElementById('videoPlaceholder').style.display = 'flex'; document.getElementById('videoEl').style.display = 'none'; }
     };
-    session.onRunningChange = (running) => setButtonStates(running);
+    session.onRunningChange = (running) => {
+        if (session && session !== ownerSession) return;
+        setButtonStates(running);
+    };
+    session.onInputFlowChange = () => {
+        if (session !== ownerSession) return;
+        syncOmniRecorderInputFlow();
+        syncOmniInputCaptureFlow();
+    };
+    session.onReconnectState = (state) => {
+        if (session !== ownerSession) return;
+        if (state === 'connected') media?.resetCaptureTimeline?.();
+        if (state === 'reconnecting' || state === 'connected') {
+            syncOmniRecorderInputFlow();
+            syncOmniInputCaptureFlow();
+        }
+    };
     session.onPauseStateChange = (state) => {
+        if (session !== ownerSession || !ownerSession.running) return;
         setPauseBtnState(state);
         if (session && session.running) {
             if (state === 'active') setStatusLamp('live');
@@ -1575,12 +1767,12 @@ async function startSession() {
         }
         // Pause/resume media provider and recording to keep timeline aligned
         if (state === 'paused' || state === 'pausing') {
-            if (media && media.pause) media.pause();
             if (sessionRecorder && sessionRecorder.pause) sessionRecorder.pause();
         } else if (state === 'active') {
-            if (media && media.resume) media.resume();
+            media?.resetCaptureTimeline?.();
             if (sessionRecorder && sessionRecorder.resume) sessionRecorder.resume();
         }
+        syncOmniInputCaptureFlow();
     };
     session.onForceListenChange = (active) => setForceListenBtnState(active);
     session.onExtraResult = (result, recvTime) => {
@@ -1622,53 +1814,95 @@ async function startSession() {
             session.audioPlayer.onRawAudio = (samples, sr, ts) => {
                 if (sessionRecorder) sessionRecorder.pushRight(samples, sr, ts);
             };
+            session.audioPlayer.onPlaybackCancel = ts => sessionRecorder?.cancelRight(ts);
         }
 
         await session.start(
             document.getElementById('systemPrompt').value,
             preparePayload,
             async () => {
-                media.onChunk = (chunk) => {
+                if (session !== ownerSession || media !== ownerMedia) {
+                    throw new Error('Media preparation cancelled');
+                }
+                ownerMedia.onChunk = (chunk) => {
+                    if (session !== ownerSession || media !== ownerMedia
+                        || ownerSession.paused || !ownerSession._sessionReady) return;
                     const msg = { type: 'audio_chunk', audio_base64: arrayBufferToBase64(chunk.audio.buffer) };
                     if (chunk.frameBase64) msg.frame_base64_list = [chunk.frameBase64];
                     const effectiveSlice = getEffectiveMaxSliceNums();
                     if (effectiveSlice > 1) msg.max_slice_nums = effectiveSlice;
-                    session.sendChunk(msg);
-                    updateTimeBadge(session.chunksSent);
                     // Fallback path: no-op when direct audio mode is active in recorder
                     if (sessionRecorder) sessionRecorder.pushLeft(chunk.audio);
+                    ownerSession.sendChunk(msg);
+                    updateTimeBadge(ownerSession.chunksSent);
                 };
-                media.onEnd = () => {
-                    addSystemEntry('File playback completed (including padding). Auto-stopping session.');
+                ownerMedia.getResponseState = () => ownerSession.modelState || 'listening';
+                ownerMedia.getPlaybackActive = () => ownerSession.audioPlayer?.hasBufferedAudio || false;
+                ownerMedia.getInputPending = () => ownerSession._recentInputs.size > 0
+                    || ownerSession._pendingInputs.length > 0;
+                ownerMedia.canResumeInput = () => session === ownerSession && media === ownerMedia
+                    && ownerSession._sessionReady && !ownerSession.paused && !ownerSession.inputFlowHeld;
+                ownerMedia.onInputHoldChange = () => {
+                    if (session === ownerSession && media === ownerMedia) syncOmniRecorderInputFlow();
+                };
+                ownerMedia.onEnd = () => {
+                    if (session !== ownerSession || media !== ownerMedia) return;
+                    addSystemEntry('File playback and assistant drain completed. Auto-stopping session.');
                     stopSession();
                 };
-                await media.start();
-
-                // Start video recording right after media (direct left audio, zero delay)
-                if (sessionRecorder) {
-                    const leftAudioOptions = {};
-                    const audioStream = media.getAudioOutputStream?.();
-                    if (audioStream) {
-                        leftAudioOptions.leftAudioStream = audioStream;
-                    } else {
-                        const buf = media.getFullAudioBuffer?.();
-                        if (buf) leftAudioOptions.leftAudioBuffer = buf;
+                // Prepare recording before the first synchronous file packet
+                // or source clock starts. The provider has already built the
+                // decoded buffer or stream when this hook runs.
+                ownerMedia.onReady = async () => {
+                    const assertOwnerActive = async () => {
+                        if (session !== ownerSession || media !== ownerMedia) {
+                            if (!ownerMedia._aborted) ownerMedia.stop();
+                            throw new Error('Media preparation cancelled');
+                        }
+                    };
+                    await assertOwnerActive();
+                    const recorder = sessionRecorder;
+                    if (recorder) {
+                        const leftAudioOptions = {};
+                        const audioStream = ownerMedia.getAudioOutputStream?.();
+                        if (audioStream) {
+                            leftAudioOptions.leftAudioStream = audioStream;
+                        } else {
+                            const buf = ownerMedia.getFullAudioBuffer?.();
+                            if (buf) leftAudioOptions.leftAudioBuffer = buf;
+                        }
+                        const recSettings = recordingSettings ? recordingSettings.getSettings() : {};
+                        await recorder.start(recSettings, leftAudioOptions);
+                        // Cleanup may run while MediaRecorder/AudioWorklet
+                        // preparation is awaiting. Finish closing that local
+                        // recorder even after the page globals are cleared.
+                        if (session !== ownerSession || media !== ownerMedia) {
+                            await recorder.stop();
+                            if (!ownerMedia._aborted) ownerMedia.stop();
+                            throw new Error('Media preparation cancelled');
+                        }
                     }
-                    const recSettings = recordingSettings ? recordingSettings.getSettings() : {};
-                    await sessionRecorder.start(recSettings, leftAudioOptions);
-                }
+                    await assertOwnerActive();
+                };
+                await ownerMedia.start();
 
                 mixerCtrl?.stopMixerMic();
                 mixerCtrl?.startMixerMeters();
             }
         );
 
+        if (session !== ownerSession || media !== ownerMedia) return;
+
         metricsPanel.update({ type: 'state', sessionState: 'Active' });
-        setStatusLamp('live');
+        syncOmniRecorderInputFlow();
+        syncOmniInputCaptureFlow();
         updateFullscreenBtnVisibility(true);
 
         if (_saveShareUI && session && session.recordingSessionId) _saveShareUI.setSessionId(session.recordingSessionId);
     } catch (err) {
+        // An earlier cancelled startup must not close a newly started session
+        // when its delayed media or recording preparation finally completes.
+        if (session !== ownerSession) return;
         const isCancelled = err.message?.includes('cancelled');
         if (!isCancelled) {
             console.error('Session start failed:', err);

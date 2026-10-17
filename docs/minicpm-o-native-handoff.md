@@ -1,12 +1,31 @@
 # HANDOFF：MiniCPM-o 原生双工（Swift/MLX）
 
-最后更新：2026-09-24
-分支：`feature/minicpm-o-native`
-HEAD：`56c47b0`（与 `origin` 同步，工作区干净）
+最后更新：2026-10-17（当前修复入口；下文保留旧历史记录）
+当前修复分支：`fix/minicpm-quality-20261010`，基于 `a2e32ad`
+当前工作区：大量修复WIP，未commit/push；不要按历史记录执行重启或改动旧checkout。
+
+## 当前修复状态（2026-10-17，断续与没声回归）
+
+权威入口：[本轮HANDOFF](/Users/mincer/项目/s2s/test-output/swift-mps-audit-20261017/HANDOFF.md)。上一轮隐式top5造成误打断，已撤回；默认改为跨包持续声学证据确认、用户说完前保持listen，模型自然结束后排队尾音也可被持续语音打断。最新原30+6输入重放只有input27打断，旧41→42跨包插话仍生效。播放设备恢复会清理旧echo排期参考；录音写入与准确容量遍历已优化，纯读取归档不要求写权限。
+
+Node129/129、Swift172/172通过，零token forced-listen及显式cancel真实模型验证通过。最新有声计算RTF1.0395，端到端额外等待中位50.56ms；播放模拟仍有15个短gap、最大103.8ms；长回答、真实设备AEC/主观连续性仍需验收。41个数值源码与上一轮完整78步gate后相同。
+
+7862 PID48563、exec38075，日志 `/tmp/s2s-quality-stable-production-20261017.log`；刷新 http://127.0.0.1:7862/audio_duplex 并新建会话。实际操作以实时health和source-state为准。全部WIP保留未提交/推送，旧7861和ComfyUI未动。
+
+## 历史修复状态（2026-10-10）
+
+本轮权威交接见 [Swift/MLX质量与双工修复HANDOFF](/Users/mincer/项目/s2s/test-output/swift-mps-audit-20261010/HANDOFF.md)，当前代码在本修复worktree。40项修复、前端97/97、backend63/63和生产release构建已完成；录制同步通过实际WebM检查，音轨起点偏移24ms、音视频末尾差75ms。
+
+7862修复版真实服务未启动，7863临时fake服务已停止；7861旧服务保留。用户要求保留正在运行的ComfyUI视频任务，真实性能及音质对照待资源空闲后进行，届时用专项交接中的 `start-fixed.sh` 恢复7862。模拟UI结果不证明真实质量；当前不能沿用下文“性能进实时”“无阻塞项”的历史结论。
+
+以下所有性能数字、启动示例、环境开关和“无剩余工作”的结论均属2026-09-24旧版本记录，不是本轮修复的验收结论。后续操作以专项交接为准。
+
+历史分支：`feature/minicpm-o-native`
+历史HEAD：`56c47b0`（当时与 `origin` 同步、工作区干净）
 
 ---
 
-## 0. 30 秒状态摘要
+## 0. 历史状态摘要（2026-09-24）
 
 | 项 | 值 |
 |---|---|
@@ -17,7 +36,7 @@ HEAD：`56c47b0`（与 `origin` 同步，工作区干净）
 | 质量 | 文本连贯；四个真 bug + 提示词纪律已修并验证 |
 | 剩余工作 | 无阻塞项。移植层面优化已见底，详见 §7 |
 
-**新接手请先读**：`docs/minicpm-o-native-optimization-report.md`（完整回顾 + 14 条已被否决的假设）。
+**2026-09-24历史接手建议**：`docs/minicpm-o-native-optimization-report.md`（完整回顾 + 14 条已被否决的假设）。
 **不要再试**：报告 §4 列出的 14 条假设，每条都已用实测否决。
 
 ---

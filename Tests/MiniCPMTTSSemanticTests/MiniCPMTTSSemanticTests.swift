@@ -2,10 +2,29 @@ import Foundation
 import XCTest
 import MLX
 import MLXNN
+import MiniCPMLLM
 
 @testable import MiniCPMTTSSemantic
 
 final class MiniCPMTTSSemanticTests: XCTestCase {
+    func testRepetitionPenaltyHostCountsPreserveOriginalFP32Operations() {
+        let model = tinyModel()
+        let size = model.configuration.numAudioTokens
+        let logits = MLXArray((0..<size).map { Float($0 % 9 - 4) / 8 })
+        let generated = [0, 0, 2, 3, 2, -1, size, 1, 4, 5, 6, 7, 2, 2, 2, 3, 3, 1]
+        let recent = Array(generated.suffix(16))
+        let ids = MLXArray(recent.map(Int32.init)).expandedDimensions(axis: 1)
+        let vocab = MLXArray(0..<Int32(size)).expandedDimensions(axis: 0)
+        let frequencies = (ids .== vocab).asType(.float32).sum(axis: 0)
+        for penalty: Float in [0.75, 1, 1.05, 2] {
+            let alpha = MLX.exp(MLX.log(MLXArray(penalty)) * frequencies)
+            let expected = MLX.where(logits .< MLXArray(Float(0)), logits * alpha, logits / alpha)
+            let actual = model.applyRepetitionPenalty(
+                logits, generated: generated, penalty: penalty)
+            XCTAssertEqual(actual.asData(access: .copy).data,
+                           expected.asData(access: .copy).data)
+        }
+    }
     /// ``shouldCancel`` is @Sendable because the native duplex engine may
     /// probe it across an async boundary.  The tiny-model tests run
     /// synchronously, but using the same locked probe catches accidental
@@ -39,6 +58,249 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
             audioBOSTokenID: 9,
             textEOSTokenID: 8
         ))
+    }
+
+    func testExactBF16AttentionKeepsOfficialSingleTokenVectorRoute() {
+        XCTAssertFalse(MiniCPMTTSAudioAttention.shouldUseExactBF16SDPA(
+            enabled: true, sequence: 1,
+            queryDType: .bfloat16, keyDType: .bfloat16, valueDType: .bfloat16))
+        XCTAssertTrue(MiniCPMTTSAudioAttention.shouldUseExactBF16SDPA(
+            enabled: true, sequence: 4,
+            queryDType: .bfloat16, keyDType: .bfloat16, valueDType: .bfloat16))
+        XCTAssertFalse(MiniCPMTTSAudioAttention.shouldUseExactBF16SDPA(
+            enabled: false, sequence: 1,
+            queryDType: .bfloat16, keyDType: .bfloat16, valueDType: .bfloat16))
+        for dtype in [DType.float16, .float32] {
+            XCTAssertFalse(MiniCPMTTSAudioAttention.shouldUseExactBF16SDPA(
+                enabled: true, sequence: 1,
+                queryDType: dtype, keyDType: dtype, valueDType: dtype))
+        }
+    }
+
+    func testDiagnosticCachedSingleTokenProbeSeesEntirePrefix() {
+        // Equal scores give a uniform distribution over all three keys.
+        // Looking only at the first key would yield 3 rather than 1.
+        let query = MLXArray.zeros([1, 1, 1, 2], dtype: .bfloat16)
+        let key = MLXArray.zeros([1, 1, 3, 2], dtype: .bfloat16)
+        let value = MLXArray([Float(3), 3, 0, 0, 0, 0], [1, 1, 3, 2]).asType(.bfloat16)
+        let mask = MiniCPMExactBF16SDPA.rightAlignedAdditiveMask(
+            batch: 1, queryHeads: 1, queryTokens: 1, keyTokens: 3)
+        XCTAssertEqual(mask.asType(.float32).asArray(Float.self), [0, 0, 0])
+        let output = MiniCPMExactBF16SDPA.attend(
+            query: query, key: key, value: value, scale: 1,
+            additiveMask: mask)
+        XCTAssertEqual(output.shape, [1, 1, 1, 2])
+        XCTAssertEqual(output.asType(.float32).asArray(Float.self), [1, 1])
+    }
+
+    private func tinyOfficialOracle() throws -> ([String: MLXArray], [String: Any]) {
+        let root = try XCTUnwrap(Bundle.module.resourceURL)
+        let arrays = try MLX.loadArrays(url: root.appendingPathComponent(
+            "Fixtures/minicpm-tts-tiny-oracle.safetensors"))
+        let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(
+            contentsOf: root.appendingPathComponent("Fixtures/minicpm-tts-tiny-oracle.json")))
+            as? [String: Any])
+        XCTAssertEqual(metadata["oracle_backend"] as? String, "official_pytorch_tiny")
+        XCTAssertEqual(metadata["modeling_sha256"] as? String,
+                       "877f20cea7282bb0d05684393a1580646d1f264a2299a42f82467fd99f4028af")
+        return (arrays, metadata)
+    }
+
+    func testCheckpointDTypeRoundsRotaryFrequencyBufferLikeOfficialHF() throws {
+        let (arrays, _) = try tinyOfficialOracle()
+        let input = try XCTUnwrap(arrays["rotary.input"])
+        let expected = try XCTUnwrap(arrays["rotary.expected"])
+        let actual = MiniCPMTTSHFStyleRoPE(dimensions: 4)(input, offset: 53)
+        XCTAssertEqual(actual.dtype, .bfloat16)
+        XCTAssertEqual(actual.asType(.float32).asArray(Float.self),
+                       expected.asType(.float32).asArray(Float.self))
+    }
+
+    func testBF16SiLURoundsAfterFullActivationLikeOfficialTorch() throws {
+        let (arrays, _) = try tinyOfficialOracle()
+        let input = try XCTUnwrap(arrays["activation.input"])
+        let expected = try XCTUnwrap(arrays["activation.expected"])
+        let actual = MiniCPMTTSMLP.activate(input)
+        XCTAssertEqual(actual.asType(.float32).asArray(Float.self),
+                       expected.asType(.float32).asArray(Float.self))
+        XCTAssertNotEqual(silu(input).asType(.float32).asArray(Float.self),
+                          expected.asType(.float32).asArray(Float.self))
+    }
+
+    func testBF16HeadWeightNormalizationMatchesTorchMPS() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        let arrays = try MLX.loadArrays(url: root.appendingPathComponent(
+            "Fixtures/minicpm-tts-weight-norm-mps.safetensors"))
+        let direction = try XCTUnwrap(arrays["direction"])
+        let magnitude = try XCTUnwrap(arrays["magnitude"])
+        let expected = try XCTUnwrap(arrays["expected"])
+        let actual = MiniCPMTTSWeightNormalization.reconstruct(
+            direction: direction, magnitude: magnitude)
+        XCTAssertEqual(actual.dtype, .bfloat16)
+        XCTAssertEqual(actual.asType(.float32).asArray(Float.self),
+                       expected.asType(.float32).asArray(Float.self))
+        let v32 = direction.asType(.float32)
+        let old = (v32 * magnitude.asType(.float32)
+            / sqrt((v32 * v32).sum(axis: -1, keepDims: true))).asType(.bfloat16)
+        XCTAssertNotEqual(old.asType(.float32).asArray(Float.self),
+                          expected.asType(.float32).asArray(Float.self))
+    }
+
+    func testProductionKernelPolicyUsesValidatedLinearAndGeneralAttention() {
+        XCTAssertTrue(MiniCPMTTSKernelPolicy.usesMPSGraph(
+            kernel: "LINEAR", defaultEnabled: true, environment: [:]))
+        XCTAssertTrue(MiniCPMTTSKernelPolicy.usesMPSGraph(
+            kernel: "SDPA", defaultEnabled: true, environment: [:]))
+        XCTAssertFalse(MiniCPMTTSKernelPolicy.usesMPSGraph(
+            kernel: "RMSNORM", defaultEnabled: false, environment: [:]))
+        XCTAssertFalse(MiniCPMTTSKernelPolicy.usesMPSGraph(
+            kernel: "LINEAR", defaultEnabled: true,
+            environment: ["MINICPM_TTS_BF16_LINEAR": "mlx", "MINICPM_TTS_EXACT_KERNELS": "mpsgraph"]))
+        XCTAssertTrue(MiniCPMTTSKernelPolicy.usesMPSGraph(
+            kernel: "RMSNORM", defaultEnabled: false,
+            environment: ["MINICPM_TTS_EXACT_KERNELS": "mpsgraph"]))
+    }
+
+
+    /// Exercise the production bundle loader with independently exported tiny
+    /// Torch weights, including its weight-normalized head reconstruction.
+    private func loadTinyOfficialModel(
+        arrays: [String: MLXArray], metadata: [String: Any], dtype: DType = .float32
+    ) throws -> MiniCPMTTSSemantic {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = try XCTUnwrap(metadata["config"] as? [String: Any])
+        try JSONSerialization.data(withJSONObject: config).write(to: directory.appendingPathComponent("config.json"))
+        var weights: [String: MLXArray] = [:]
+        for (key, value) in arrays where key.hasPrefix("weight.") {
+            weights[String(key.dropFirst(7))] = value.asType(dtype)
+        }
+        try MLX.save(arrays: weights, url: directory.appendingPathComponent("model.safetensors"))
+        return try MiniCPMTTSSemantic.fromDirectory(directory)
+    }
+
+    func testTinyOfficialTeacherForcedLogitsAndProductionStreaming() throws {
+        let (arrays, metadata) = try tinyOfficialOracle()
+        let model = try loadTinyOfficialModel(arrays: arrays, metadata: metadata)
+        let trace = try XCTUnwrap(metadata["trace"] as? [[String: Any]])
+        let teacher = model.makeSession()
+        let streaming = model.makeSession()
+        for (index, entry) in trace.enumerated() {
+            let ids = try XCTUnwrap(entry["tokens"] as? [Int])
+            let condition = try model.buildCondition(
+                hidden: try XCTUnwrap(arrays["chunk\(index).hidden"]),
+                tokenIDs: MLXArray(ids.map(Int32.init)))
+            let expectedCondition = try XCTUnwrap(arrays["chunk\(index).condition"])
+            XCTAssertLessThan(MLX.abs(condition - expectedCondition).max().item(Float.self), 0.0005)
+            let sampled = try XCTUnwrap(arrays["chunk\(index).sampled"]).asArray(Int32.self)
+            let referenceLogits = try XCTUnwrap(arrays["chunk\(index).logits"])
+            for step in 0..<sampled.count {
+                let input = step == 0 ? condition : model.audioEmbedding(
+                    MLXArray([sampled[step - 1]])).expandedDimensions(axis: 0)
+                let hidden = model.decoder(input, caches: teacher.layerCaches, offset: teacher.cacheOffset)
+                let logits = model.audioHead(hidden[0, hidden.dim(1) - 1])
+                XCTAssertLessThan(
+                    MLX.abs(logits - referenceLogits[step]).max().item(Float.self), 0.0005,
+                    "official teacher-forced chunk \(index), step \(step)")
+            }
+            let result = try model.generateStreamingChunk(
+                inputsEmbeds: condition, session: streaming,
+                endOfTurn: index == trace.count - 1,
+                temperature: 0, forceNoStop: true, maxNewToken: 26)
+            XCTAssertEqual(result.committedTokens, entry["committed"] as? [Int])
+            XCTAssertEqual(result.cacheOffset, entry["cache_offset"] as? Int)
+            XCTAssertEqual(teacher.cacheOffset, result.cacheOffset)
+            XCTAssertEqual(streaming.textStartPosition, result.cacheOffset)
+            XCTAssertNil(streaming.pendingToken)
+        }
+    }
+
+    func testProductionLoaderKeepsAudioHeadInCheckpointDType() throws {
+        let (arrays, metadata) = try tinyOfficialOracle()
+        for dtype in [DType.bfloat16, .float16, .float32] {
+            let model = try loadTinyOfficialModel(arrays: arrays, metadata: metadata, dtype: dtype)
+            XCTAssertEqual(model.textEmbedding.weight.dtype, dtype)
+            XCTAssertEqual(model.audioHead.weight.dtype, dtype)
+        }
+    }
+
+    func testBF16ConditionMatchesOfficialNormalizationBoundary() throws {
+        let (arrays, _) = try tinyOfficialOracle()
+        let model = tinyModel()
+        let projected = try XCTUnwrap(arrays["normalization.input"])
+        try model.update(parameters: ModuleParameters.unflattened([
+            "textEmbedding.weight": MLXArray.zeros([10, 8], dtype: .bfloat16),
+            "semanticProjector.linear1.weight": MLXArray.zeros([8, 4], dtype: .bfloat16),
+            "semanticProjector.linear1.bias": projected,
+            "semanticProjector.linear2.weight": MLXArray.eye(8).asType(.bfloat16),
+            "semanticProjector.linear2.bias": MLXArray.zeros([8], dtype: .bfloat16),
+        ]), verify: .none)
+        let condition = try model.buildCondition(
+            hidden: MLXArray.zeros([1, 4], dtype: .bfloat16),
+            tokenIDs: MLXArray([Int32(1)]), addAudioBOS: false)
+        XCTAssertEqual(condition[0, 0].asType(.float32).asArray(Float.self),
+                       try XCTUnwrap(arrays["normalization.expected"]).asType(.float32).asArray(Float.self))
+    }
+
+    func testControlOnlyFinalConditionsRemainAvailableForWaveformFlush() throws {
+        let model = tinyModel()
+        try model.audioHead.update(parameters: ModuleParameters.unflattened([
+            "weight": MLXArray.zeros([7, 8]),
+        ]), verify: .none)
+        let conditions = [
+            try model.buildCondition(
+                hidden: MLXArray.zeros([0, 4]), tokenIDs: MLXArray.zeros([0], dtype: .int32)),
+            try model.buildCondition(
+                hidden: MLXArray.zeros([1, 4]), tokenIDs: MLXArray([Int32(8)])),
+        ]
+        for condition in conditions {
+            let session = model.makeSession()
+            _ = try model.generateStreamingChunk(
+                inputsEmbeds: MLXArray.zeros([1, 2, 8]), session: session,
+                temperature: 0, eosToken: 0, forceNoStop: true)
+            let previousOffset = session.cacheOffset
+            let final = try model.generateStreamingChunk(
+                inputsEmbeds: condition, session: session, endOfTurn: true,
+                temperature: 0, eosToken: 0)
+            XCTAssertTrue(final.isFinalChunk)
+            XCTAssertTrue(final.endedByEOS)
+            XCTAssertEqual(final.sampledTokenCount, 1)
+            XCTAssertEqual(final.cacheOffset, previousOffset + condition.dim(1))
+            XCTAssertFalse(final.sessionWasReset, "caller must flush waveform before teardown")
+            XCTAssertNil(session.pendingToken)
+            XCTAssertFalse(session.turnActive)
+        }
+    }
+
+    func testStreamingFirstAndFinalAllowEOSButMiddleMasksIt() throws {
+        let model = tinyModel()
+        try model.audioHead.update(parameters: ModuleParameters.unflattened([
+            "weight": MLXArray.zeros([7, 8]),
+        ]), verify: .none)
+        let session = model.makeSession()
+        let condition = MLXArray.zeros([1, 2, 8])
+        let first = try model.generateStreamingChunk(
+            inputsEmbeds: condition, session: session, temperature: 0, eosToken: 0)
+        XCTAssertTrue(first.endedByEOS)
+        XCTAssertFalse(first.isFinalChunk)
+        XCTAssertEqual(first.sampledTokenCount, 1)
+        XCTAssertEqual(session.cacheOffset, 2)
+        let middle = try model.generateStreamingChunk(
+            inputsEmbeds: condition, session: session, temperature: 0, eosToken: 0)
+        XCTAssertFalse(middle.endedByEOS)
+        XCTAssertEqual(middle.sampledTokenCount, 26)
+        XCTAssertEqual(middle.committedTokenCount, 25)
+        XCTAssertFalse(middle.committedTokens.contains(0))
+        let final = try model.generateStreamingChunk(
+            inputsEmbeds: condition, session: session, endOfTurn: true,
+            temperature: 0, eosToken: 0)
+        XCTAssertTrue(final.endedByEOS)
+        XCTAssertTrue(final.isFinalChunk)
+        XCTAssertEqual(final.sampledTokenCount, 1)
+        XCTAssertEqual(session.cacheOffset, 31)
+        XCTAssertEqual(session.cacheOffset, session.textStartPosition)
+        XCTAssertNil(session.pendingToken)
     }
 
     /// Return a parity resource only when the opt-in parity gate is enabled.
@@ -339,7 +601,7 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
         XCTAssertEqual(first.sampledTokenCount, 26)
         XCTAssertEqual(first.committedTokenCount, 25)
         XCTAssertNil(first.pendingToken)
-        XCTAssertNotNil(session.pendingToken, "look-ahead stays in the semantic session")
+        XCTAssertNil(session.pendingToken, "official streaming discards the newest sample")
         XCTAssertEqual(first.textStartPosition, 0)
         XCTAssertEqual(first.nextTextStartPosition, 27) // 2 + 25 returned
         XCTAssertEqual(session.cacheOffset, 27)
@@ -360,12 +622,11 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
         XCTAssertEqual(middle.sampledTokenCount, 26)
         XCTAssertEqual(middle.committedTokenCount, 25)
         XCTAssertNil(middle.pendingToken)
-        XCTAssertNotNil(session.pendingToken, "look-ahead stays in the semantic session")
+        XCTAssertNil(session.pendingToken, "official streaming discards the newest sample")
         XCTAssertEqual(middle.textStartPosition, 27)
         XCTAssertEqual(middle.nextTextStartPosition, 55) // +3 +25 returned
-        // The hidden look-ahead code is fed before this condition, but is not
-        // included in text-position bookkeeping.
-        XCTAssertEqual(session.cacheOffset, 56) // pending + condition + 25 fed
+        XCTAssertEqual(session.cacheOffset, 55) // new condition + 25 fed codes
+        XCTAssertEqual(session.cacheOffset, session.textStartPosition)
 
         try session.rollback(to: checkpoint)
         XCTAssertEqual(session.cacheOffset, checkpoint.cacheOffset)
@@ -401,10 +662,10 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
         XCTAssertEqual(final.committedTokenCount, 25)
         XCTAssertEqual(final.textStartPosition, 55)
         XCTAssertEqual(final.nextTextStartPosition, 81) // +1 +25 returned
-        XCTAssertEqual(final.cacheOffset, 83) // pending + condition + 25 fed
+        XCTAssertEqual(final.cacheOffset, 81) // condition + 25 fed codes
         // The caller flushes token2wav before releasing semantic KV.
-        XCTAssertEqual(session.cacheOffset, 83)
-        XCTAssertNotNil(session.pendingToken)
+        XCTAssertEqual(session.cacheOffset, 81)
+        XCTAssertNil(session.pendingToken)
         session.finishTurn()
         XCTAssertEqual(session.cacheOffset, 0)
         XCTAssertNil(session.pendingToken)
@@ -452,7 +713,7 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
         XCTAssertEqual(session.chunkIndex, checkpoint.chunkIndex)
     }
 
-    func testStreamingEOSResetsSessionAfterCapturingResult() throws {
+    func testStreamingFirstChunkAllowsEOSWithoutClosingTurn() throws {
         let model = tinyModel()
         let condition = MLXArray.zeros([1, 2, 8])
         // Probe the deterministic first-step argmax and use it as EOS.  This
@@ -473,7 +734,8 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
             eosToken: eos,
             maxNewToken: 26)
         XCTAssertTrue(result.endedByEOS)
-        XCTAssertTrue(result.isFinalChunk)
+        XCTAssertFalse(result.isFinalChunk)
+        XCTAssertTrue(session.turnActive)
         XCTAssertFalse(result.sessionWasReset)
         XCTAssertEqual(result.sampledTokenCount, 1)
         XCTAssertEqual(result.committedTokens, [])
@@ -548,7 +810,7 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
         XCTAssertEqual(session.committedTokens.count, 25)
     }
 
-    func testRealBundleLoadsAndMatchesGreedyOracle() throws {
+    func testRealBundleLoadsCheckpointDTypesAndCacheContract() throws {
         guard let path = try parityResource(
             "MINICPM_TTS_BUNDLE_PATH", label: "MiniCPM TTS bundle")
         else {
@@ -569,11 +831,9 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
             maxNewToken: 3,
             minNewTokens: 3)
 
-        // Oracle generated by Python MLX from the original full MiniCPM
-        // checkpoint.  This exercises strict key translation, BF16 loading,
-        // RoPE, SDPA, KV state, and the weight-normalized audio head.
-        XCTAssertEqual(result.committedTokens, [1736, 5379])
-        XCTAssertEqual(result.pendingToken, 5645)
+        XCTAssertEqual(model.audioHead.weight.dtype, model.textEmbedding.weight.dtype)
+        XCTAssertEqual(result.committedTokens.count, 2)
+        XCTAssertNotNil(result.pendingToken)
         XCTAssertEqual(result.cacheOffset, 6)
     }
 
@@ -589,6 +849,10 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
         let arrays = try MLX.loadArrays(url: fixtureURL)
         let metadata = try XCTUnwrap(
             try JSONSerialization.jsonObject(with: Data(contentsOf: metadataURL)) as? [String: Any])
+        guard (metadata["format"] as? Int ?? 0) >= 2 else {
+            throw MiniCPMTTSSemanticError.invalidInput(
+                "legacy decoder trace is not an oracle; regenerate with export_minicpm_tts_semantic_oracle.py")
+        }
         let sourceMetadata = try XCTUnwrap(metadata["source"] as? [String: Any])
         XCTAssertEqual(
             sourceMetadata["oracle_backend"] as? String,
@@ -604,6 +868,11 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
             sourceMetadata["unified_modeling_sha256"] as? String,
             "9fceb75f969cfafc6381adf2b59255529be7fb34d64ad784b8417d224ffbabb9")
         XCTAssertEqual(sourceMetadata["condition_verified_with_fixed_source"] as? Bool, true)
+        let traceContract = try XCTUnwrap(metadata["trace_contract"] as? [String: Any])
+        XCTAssertEqual(traceContract["teacher_forcing_required"] as? Bool, true)
+        XCTAssertEqual(
+            traceContract["stable_prefix_contract"] as? String,
+            "unique argmax before first exact tie; no free-running token equality from that tie onward, including subsequent chunks")
         let modelPath = try XCTUnwrap(try parityResource(
             "MINICPM_TTS_BUNDLE_PATH", label: "MiniCPM TTS bundle"))
         let model = try MiniCPMTTSSemantic.fromDirectory(URL(fileURLWithPath: modelPath))
@@ -643,35 +912,18 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
             XCTAssertLessThanOrEqual(maxAbs, 0.125, "\(label) maxAbs=\(maxAbs)")
             XCTAssertLessThanOrEqual(meanAbs, 0.025, "\(label) meanAbs=\(meanAbs)")
             XCTAssertGreaterThan(cosine, 0.99998, "\(label) cosine=\(cosine)")
-            XCTAssertEqual(
-                argMax(lhs, axis: 0).item(Int.self),
-                argMax(rhs, axis: 0).item(Int.self),
-                "\(label) top-1")
+
         }
 
-        // Keep one numerical decoder oracle in addition to token IDs.  BF16
-        // greedy decoding is allowed to choose a different ID when two
-        // logits round to the same value, but the logits themselves must
-        // still match the Python MLX implementation.  This catches weight
-        // layout, RoPE, attention-mask, and KV bugs before the first tie.
-        let logitsFixtureURL = root.appendingPathComponent("minicpm-tts-logits-oracle.safetensors")
-        if FileManager.default.fileExists(atPath: logitsFixtureURL.path) {
-            let logitsArrays = try MLX.loadArrays(url: logitsFixtureURL)
-            let probeCondition = try model.buildCondition(
-                hidden: try XCTUnwrap(arrays["chunk0.hidden"]),
-                tokenIDs: MLXArray([Int32(22), Int32(33), Int32(44)]))
-            let probeSession = model.makeSession()
-            let hidden = model.decoder(
-                probeCondition,
-                caches: probeSession.layerCaches,
-                offset: 0)
-            let actualLogits = model.audioHead(
-                hidden[0, hidden.dim(1) - 1]).asType(.float32)
-            try assertLogitsClose(
-                actualLogits,
-                try XCTUnwrap(logitsArrays["chunk0.first_logits"]),
-                "chunk0.first_logits")
-        }
+        // The official exporter stores logits in the main fixture. Missing
+        // logits are a failure, never a silent skip or another MLX oracle.
+        let probeCondition = try XCTUnwrap(arrays["chunk0.expected"])
+        let probeSession = model.makeSession()
+        let probeHidden = model.decoder(
+            probeCondition, caches: probeSession.layerCaches, offset: 0)
+        try assertLogitsClose(
+            model.audioHead(probeHidden[0, probeHidden.dim(1) - 1]).asType(.float32),
+            try XCTUnwrap(arrays["chunk0.first_logits"]), "chunk0.first_logits")
 
         // results=[] in the official helper is audio BOS only.
         let empty = try model.buildCondition(
@@ -704,6 +956,8 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
         }
 
         let session = model.makeSession()
+        let teacherSession = model.makeSession()
+        var freeRunningPrefixIsValid = true
         for (index, definition) in chunkDefinitions.enumerated() {
             let traceEntry = trace[index]
             let hiddenKey = try XCTUnwrap(definition["hidden_key"] as? String)
@@ -713,6 +967,49 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
                 hidden: try XCTUnwrap(arrays[hiddenKey]),
                 tokenIDs: MLXArray(tokens.map { Int32($0) }))
             try assertClose(condition, try XCTUnwrap(arrays[expectedKey]), "chunk\(index)")
+
+            let referenceCodes = intList(traceEntry["committed"])
+            let referenceLogits = try XCTUnwrap(arrays["chunk\(index).teacher_logits"])
+            XCTAssertEqual(referenceLogits.dim(0), referenceCodes.count + 1)
+            // The official exporter uses multinomial with a tiny positive
+            // temperature.  Swift greedy argmax can select another exact
+            // BF16 tie, after which later free-running inputs diverge.  Check
+            // prefix metadata against the logits rather than trusting a
+            // hard-coded number of supposedly stable tokens.
+            let rows = referenceLogits.asType(.float32).asArray(Float.self)
+            let width = referenceLogits.dim(1)
+            let eos = model.configuration.numAudioTokens - 1
+            var firstTie: Int?
+            for step in 0 ..< referenceLogits.dim(0) {
+                let row = Array(rows[(step * width) ..< ((step + 1) * width)])
+                let candidates = row.enumerated().filter { $0.offset != eos }
+                let maximum = try XCTUnwrap(candidates.map(\.element).max())
+                if candidates.filter({ $0.element == maximum }).count > 1 {
+                    firstTie = step
+                    break
+                }
+            }
+            let stableCount = freeRunningPrefixIsValid
+                ? min(referenceCodes.count, firstTie ?? referenceCodes.count)
+                : 0
+            XCTAssertEqual(intList(traceEntry["stable_prefix"]), Array(referenceCodes.prefix(stableCount)))
+            XCTAssertEqual(traceEntry["free_running_prefix_valid_at_chunk_start"] as? Bool, freeRunningPrefixIsValid)
+            if let firstTie {
+                let tieMetadata = try XCTUnwrap(traceEntry["first_argmax_tie"] as? [String: Any])
+                XCTAssertEqual(tieMetadata["step_index"] as? Int, firstTie)
+                XCTAssertEqual((tieMetadata["top_gap"] as? NSNumber)?.floatValue, 0)
+                freeRunningPrefixIsValid = false
+            }
+            for step in 0 ..< referenceLogits.dim(0) {
+                let input = step == 0 ? condition : model.audioEmbedding(
+                    MLXArray([Int32(referenceCodes[step - 1])])).expandedDimensions(axis: 0)
+                let hidden = model.decoder(
+                    input, caches: teacherSession.layerCaches, offset: teacherSession.cacheOffset)
+                try assertLogitsClose(
+                    model.audioHead(hidden[0, hidden.dim(1) - 1]).asType(.float32),
+                    referenceLogits[step], "chunk\(index).step\(step)")
+            }
+            XCTAssertEqual(teacherSession.cacheOffset, (traceEntry["cache_offset"] as? NSNumber)?.intValue)
 
             let isFinal = (traceEntry["is_final"] as? Bool) ?? false
             let result = try model.generateStreamingChunk(
@@ -745,28 +1042,18 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
                 XCTAssertEqual(
                     Array(result.committedTokens.prefix(prefix.count)),
                     prefix,
-                    "stable prefix before BF16 tie (chunk\(index))")
+                    "stable prefix before first exact BF16 argmax tie (chunk\(index))")
             }
-            // The protocol facade hides the sampled look-ahead token from
-            // Token2Wav, while the session retains it for the next decoder KV
-            // update.  This distinction is what makes offsets 29 -> 60 -> 89
-            // match the official PyTorch trace.
-            XCTAssertNil(result.pendingToken, "look-ahead is hidden from Token2Wav")
-            // The official fixture records its reference pending ID for
-            // diagnostics, but BF16 argmax ties can select a different legal
-            // ID in Swift.  Retention and KV length are the parity contract;
-            // exact IDs are checked only through the stable-prefix rule.
-            XCTAssertNotNil(session.pendingToken, "look-ahead is retained in the semantic session")
-            if let pending = session.pendingToken {
-                XCTAssertGreaterThanOrEqual(pending, 0)
-                XCTAssertLessThan(pending, model.configuration.numAudioTokens)
-            }
+            XCTAssertNil(result.pendingToken)
+            XCTAssertNil(session.pendingToken, "newest official sample is discarded")
+            XCTAssertEqual(session.cacheOffset, session.textStartPosition)
             XCTAssertEqual(result.cacheOffset, (traceEntry["cache_offset"] as? NSNumber)?.intValue)
             XCTAssertEqual(result.isFirstChunk, (traceEntry["is_first"] as? Bool) ?? false)
             XCTAssertEqual(result.isFinalChunk, isFinal)
-            XCTAssertTrue(
-                (traceEntry["force_flush"] as? Bool) ?? false,
-                "fixed MiniCPM-o unified duplex force-flushes every TTS chunk")
+            XCTAssertEqual(
+                traceEntry["force_flush"] as? Bool,
+                index == 0,
+                "modeling_minicpmo.py requests token2wav force_flush only for the first chunk; final flushing also uses end_of_turn")
             XCTAssertFalse(result.endedByEOS)
             XCTAssertFalse(result.sessionWasReset)
 
@@ -780,6 +1067,11 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
         XCTAssertEqual(session.cacheOffset, 0)
         XCTAssertEqual(session.textStartPosition, 0)
         XCTAssertEqual(session.chunkIndex, 0)
+        if ProcessInfo.processInfo.environment["MINICPM_TTS_ENCODED_DECODE"] == "1" {
+            XCTAssertGreaterThanOrEqual(
+                model.decoder.encodedDecodeCount, 78,
+                "the official trace must exercise encoded decode rather than silently fall back")
+        }
     }
 
     /// Diagnostic-only layer trace used while reconciling the native decoder
@@ -811,8 +1103,13 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
                 tokenIDs: MLXArray([Int32(22), Int32(33), Int32(44)]))
         }
         let trace = try MLX.loadArrays(url: URL(fileURLWithPath: tracePath))
+        if let embedding = trace["embedding_input"] {
+            condition = embedding.asType(model.audioEmbedding.weight.dtype)
+        }
+        let localOperators = environment["MINICPM_TTS_DIAGNOSTICS_LOCAL"] == "1"
+        let offset = trace["layer_00.cache_keys_before"]?.dim(2) ?? 0
 
-        func report(_ actual: MLXArray, _ key: String) throws {
+        func report(_ actual: MLXArray, _ key: String, variant: String = "") throws {
             guard let expected = trace[key] else {
                 return XCTFail("missing diagnostic trace tensor (\(key))")
             }
@@ -825,7 +1122,7 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
             let dot = (lhs * rhs).sum().item(Float.self)
             let norm = MLX.sqrt((lhs * lhs).sum() * (rhs * rhs).sum()).item(Float.self)
             let cosine = norm > 0 ? dot / norm : 1
-            print("TTS_LAYER_TRACE \(key) max=\(maxAbs) mean=\(meanAbs) cosine=\(cosine)")
+            print("TTS_LAYER_TRACE \(key)\(variant) max=\(maxAbs) mean=\(meanAbs) cosine=\(cosine)")
             if ProcessInfo.processInfo.environment["MINICPM_TTS_DIAGNOSTICS"] == "1",
                key == "layer_10.mlp_down"
             {
@@ -838,24 +1135,45 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
 
         let session = model.makeSession()
         let caches = session.layerCaches
+        for (index, cache) in caches.enumerated() {
+            let prefix = String(format: "layer_%02d", index)
+            if let keys = trace[prefix + ".cache_keys_before"],
+               let values = trace[prefix + ".cache_values_before"], keys.dim(2) > 0 {
+                _ = cache.update(
+                    keys: keys.asType(condition.dtype),
+                    values: values.asType(condition.dtype))
+            }
+        }
         let batch = condition.dim(0)
         let sequence = condition.dim(1)
         // ``tri - 1`` is only a 0/-1 indicator.  The official additive mask
         // uses the dtype's large negative sentinel for disallowed positions;
         // omitting that scale lets future tokens leak into the diagnostic and
         // falsely attributes the resulting drift to RoPE/SDPA.
-        let causal = (MLXArray.tri(sequence, m: sequence, k: 0, type: Float.self) - 1)
+        let keyLength = offset + sequence
+        let causal = (MLXArray.tri(sequence, m: keyLength, k: offset, type: Float.self) - 1)
             * Float.greatestFiniteMagnitude
-        let mask = MLXFast.ScaledDotProductAttentionMaskMode.array(
-            causal.reshaped(batch, 1, sequence, sequence).asType(condition.dtype))
+        let mask: MLXFast.ScaledDotProductAttentionMaskMode = sequence == 1 && offset > 0
+            ? .none
+            : .array(causal.reshaped(batch, 1, sequence, keyLength).asType(condition.dtype))
+
+        func hfRMSNorm(_ input: MLXArray, _ norm: RMSNorm) -> MLXArray {
+            let value = input.asType(.float32)
+            let scale = rsqrt((value * value).mean(axis: -1, keepDims: true) + norm.eps)
+            return (value * scale).asType(input.dtype) * norm.weight
+        }
 
         try report(condition, "embedding_input")
         var hidden = condition
         for (index, layer) in model.decoder.layers.enumerated() {
             let prefix = String(format: "layer_%02d", index)
+            if localOperators {
+                hidden = try XCTUnwrap(trace[prefix + ".input"]).asType(condition.dtype)
+            }
             try report(hidden, prefix + ".input")
             let inputNorm = layer.inputLayerNorm(hidden)
             try report(inputNorm, prefix + ".input_norm")
+            try report(hfRMSNorm(hidden, layer.inputLayerNorm), prefix + ".input_norm", variant: ".hf_candidate")
             // Split the attention path at the same boundaries captured by
             // the official PyTorch diagnostic exporter.  This tells us
             // whether the first divergence is in Linear layout, RoPE, or
@@ -870,34 +1188,80 @@ final class MiniCPMTTSSemanticTests: XCTestCase {
             let kShape = [batch, sequence, layer.attention.numKVHeads, layer.attention.headDimension]
             let qHeads = rawQ.reshaped(qShape).transposed(0, 2, 1, 3)
             let kHeads = rawK.reshaped(kShape).transposed(0, 2, 1, 3)
-            let qRotated = layer.attention.rope(qHeads, offset: 0)
-            let kRotated = layer.attention.rope(kHeads, offset: 0)
+            let qRotated = layer.attention.rope(qHeads, offset: offset)
+            let kRotated = layer.attention.rope(kHeads, offset: offset)
             try report(qRotated, prefix + ".q_rotated")
             try report(kRotated, prefix + ".k_rotated")
             let attended = layer.attention(
                 inputNorm,
                 cache: caches[index],
-                offset: 0,
+                offset: offset,
                 mask: mask)
             try report(attended, prefix + ".attention")
             let residual = hidden + attended
             let postNorm = layer.postAttentionLayerNorm(residual)
             try report(postNorm, prefix + ".post_attention_norm")
+            let normInput = localOperators
+                ? try XCTUnwrap(trace[prefix + ".residual_before_mlp"]).asType(condition.dtype)
+                : residual
+            try report(layer.postAttentionLayerNorm(normInput), prefix + ".post_attention_norm", variant: ".native_local")
+            try report(hfRMSNorm(normInput, layer.postAttentionLayerNorm), prefix + ".post_attention_norm", variant: ".hf_candidate")
             let mlpGate = layer.mlp.gate(postNorm)
             let mlpUp = layer.mlp.up(postNorm)
-            let mlpActivation = silu(mlpGate)
+            let mlpActivation = MiniCPMTTSMLP.activate(mlpGate)
             let mlp = layer.mlp.down(mlpActivation * mlpUp)
             try report(mlpGate, prefix + ".mlp_gate")
             try report(mlpUp, prefix + ".mlp_up")
             try report(mlpActivation, prefix + ".mlp_activation")
+            let oracleGate = try XCTUnwrap(trace[prefix + ".mlp_gate"]).asType(condition.dtype)
+            let floatGate = oracleGate.asType(.float32)
+            try report(oracleGate / (1 + exp(-oracleGate)), prefix + ".mlp_activation", variant: ".bf16_div_candidate")
+            try report((floatGate * sigmoid(floatGate)).asType(condition.dtype), prefix + ".mlp_activation", variant: ".f32_sigmoid_candidate")
+            try report((floatGate / (1 + exp(-floatGate))).asType(condition.dtype), prefix + ".mlp_activation", variant: ".f32_div_candidate")
             try report(mlp, prefix + ".mlp_down")
             try report(mlp, prefix + ".mlp")
             hidden = residual + mlp
             try report(hidden, prefix + ".output")
         }
+        if localOperators {
+            let last = String(format: "layer_%02d.output", model.decoder.layers.count - 1)
+            hidden = try XCTUnwrap(trace[last]).asType(condition.dtype)
+        }
         let final = model.decoder.norm(hidden)
         try report(final, "final_output")
+        try report(hfRMSNorm(hidden, model.decoder.norm), "final_output", variant: ".hf_candidate")
         let logits = model.audioHead(final[0, final.dim(1) - 1]).asType(.float32)
         try report(logits, "first_logits")
     }
+}
+
+final class E2EMiniCPMTTSHeadTests: XCTestCase {
+    func testDiagnosticCheckpointHeadWeightAndProjection() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let conditionPath = environment["MINICPM_TTS_CONDITION_ORACLE_DIR"],
+              let bundlePath = environment["MINICPM_TTS_BUNDLE_PATH"] else {
+            throw XCTSkip("set TTS condition oracle and bundle paths")
+        }
+        let arrays = try MLX.loadArrays(url: URL(fileURLWithPath: conditionPath)
+            .appendingPathComponent("head-mps-oracle.safetensors"))
+        let model = try MiniCPMTTSSemantic.fromDirectory(URL(fileURLWithPath: bundlePath))
+        let expected = try XCTUnwrap(arrays["expected"])
+        XCTAssertEqual(model.audioHead.weight.asType(.float32).asArray(Float.self),
+                       expected.asType(.float32).asArray(Float.self))
+        if let tracePath = environment["MINICPM_TTS_LAYER_TRACE_PATH"] {
+            let trace = try MLX.loadArrays(url: URL(fileURLWithPath: tracePath))
+            let final = try XCTUnwrap(trace["final_output"])
+                .asType(model.audioHead.weight.dtype)
+            let logits = try XCTUnwrap(trace["first_logits"])
+            for (name, actual) in [
+                ("full", model.audioHead(final)[0, final.dim(1) - 1]),
+                ("last", model.audioHead(final[0, final.dim(1) - 1])),
+            ] {
+                let delta = abs(actual.asType(.float32) - logits)
+                print("TTS_HEAD_TRACE \(name) max=\(delta.max().item(Float.self)) "
+                      + "mean=\(delta.mean().item(Float.self))")
+            }
+        }
+    }
+
 }

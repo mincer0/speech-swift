@@ -3,6 +3,12 @@ import Hummingbird
 import HummingbirdWebSocket
 import NIOCore
 
+/// Synthetic audio advances the model's input timeline independently of the
+/// microphone. Keep it available only as an explicit diagnostic option.
+func miniCPMDemoSyntheticContinuationEnabled(environment: [String: String]) -> Bool {
+    environment["MINICPM_SYNTHETIC_CONTINUATION"] == "1"
+}
+
 /// Registry used by the official backend-client control channel.  WebSocket
 /// carries only init/push/events; `POST /sessions/:id/close` calls this actor
 /// and waits for the backend to release its runtime state before returning.
@@ -375,26 +381,27 @@ final class MiniCPMDemoInputQueue: @unchecked Sendable {
 
 /// Recording is created only after session.init has produced a stable ID, but
 /// the reader may receive frames before that.  This actor keeps the pending
-/// canonical frames and makes recorder access safe from the generation task.
+/// canonical frames and their receive times, and makes recorder access safe
+/// from the generation task.
 private actor MiniCPMDemoRecorderBox {
     private static let maxPendingFrames = 128
     private static let maxPendingBytes = 4 * 1024 * 1024
     private var recorder: MiniCPMDemoWireRecordingSession?
-    private var pendingInbound: [MiniCPMJSONValue] = []
+    private var pendingInbound: [(frame: MiniCPMJSONValue, timestamp: Date)] = []
     private var pendingInboundBytes = 0
 
     func attach(_ recorder: MiniCPMDemoWireRecordingSession) async {
         self.recorder = recorder
-        for frame in pendingInbound {
-            await recorder.record(direction: .up, frame: frame)
+        for pending in pendingInbound {
+            await recorder.record(direction: .up, frame: pending.frame, timestamp: pending.timestamp)
         }
         pendingInbound.removeAll(keepingCapacity: true)
         pendingInboundBytes = 0
     }
 
-    func recordInbound(_ frame: MiniCPMJSONValue) async {
+    func recordInbound(_ frame: MiniCPMJSONValue, timestamp: Date) async {
         if let recorder {
-            await recorder.record(direction: .up, frame: frame)
+            await recorder.record(direction: .up, frame: frame, timestamp: timestamp)
         } else {
             let frameBytes = (try? MiniCPMDemoPersistence.encoder().encode(frame).count) ?? 0
             guard pendingInbound.count < Self.maxPendingFrames,
@@ -403,13 +410,13 @@ private actor MiniCPMDemoRecorderBox {
                 // client cannot retain arbitrary media before session.init.
                 return
             }
-            pendingInbound.append(frame)
+            pendingInbound.append((frame, timestamp))
             pendingInboundBytes += frameBytes
         }
     }
 
-    func recordOutbound(_ frame: MiniCPMJSONValue) async {
-        await recorder?.record(direction: .down, frame: frame)
+    func recordOutbound(_ frame: MiniCPMJSONValue, timestamp: Date) async {
+        await recorder?.record(direction: .down, frame: frame, timestamp: timestamp)
     }
 
     func close(reason: String) async {
@@ -433,6 +440,8 @@ private func handleMiniCPMDemoWS(
     allowSessionClose: Bool
 ) async throws {
     let decoder = JSONDecoder()
+    let syntheticContinuationEnabled = miniCPMDemoSyntheticContinuationEnabled(
+        environment: ProcessInfo.processInfo.environment)
     let outputChannel = MiniCPMDemoOutboundChannel()
     // This task is the sole owner of the NIO writer.  It is explicitly
     // awaited during teardown, so a disconnect cannot leave an unstructured
@@ -537,14 +546,12 @@ private func handleMiniCPMDemoWS(
     // One FIFO generation worker is enough to preserve model ordering while
     // the receive loop remains free to service interrupt/reset/close frames.
     let generationTask: Task<Void, Error> = Task {
-        // Drive the open spoken response with synthetic continuation ticks
-        // while no real packet is queued.  Without this, one engine unit is
-        // only ever produced per client packet, so the output audio rate is
-        // capped by the client's packet cadence (choppy playback whenever the
-        // model can speak faster than packets arrive).  Real queued inputs
-        // always take priority: the loop yields back as soon as the queue is
-        // non-empty so live audio is prefilled in order.
+        // Live duplex follows the official one-input-one-unit timeline.
+        // Diagnostics may explicitly opt in to additional zero-filled audio
+        // units. Each synthetic unit is fully encoded; queued real inputs take
+        // priority before starting the next unit.
         func driveContinuation(for queued: MiniCPMDemoQueuedInput) async throws {
+            guard syntheticContinuationEnabled else { return }
             while await generationEpoch.isCurrent(queued.epoch) {
                 if inputQueue.queuedItemCount > 0 { return }
                 guard let events = await backend.continueResponse() else { return }
@@ -629,6 +636,7 @@ private func handleMiniCPMDemoWS(
     var backendClosed = false
     do {
         for try await message in inbound.messages(maxSize: maxMessageSize) {
+            let receivedAt = Date()
             guard case .text(let text) = message else {
                 throw MiniCPMDemoBackendError.invalidMessage("binary WebSocket frames are not accepted")
             }
@@ -695,7 +703,7 @@ private func handleMiniCPMDemoWS(
             // Record the translated/strict canonical envelope, not an alias
             // frame that the backend will never actually see.
             let canonicalFrame = try MiniCPMDemoWireRecordingSupport.requestValue(request)
-            await recorderBox.recordInbound(canonicalFrame)
+            await recorderBox.recordInbound(canonicalFrame, timestamp: receivedAt)
 
             if request.type == "session.init" {
                 didInit = true
@@ -987,8 +995,9 @@ private func emitMiniCPMDemoEvents(
         guard isOfficialMiniCPMDemoEvent(event.type) else { continue }
         let encoded = try encodeOfficialMiniCPMDemoEvent(event)
         try await outbound.send(encoded)
+        let sentAt = Date()
         if let value = try? MiniCPMDemoWireRecordingSupport.jsonValue(encoded) {
-            await recorder.recordOutbound(value)
+            await recorder.recordOutbound(value, timestamp: sentAt)
         }
     }
 }
@@ -1010,7 +1019,7 @@ private func writeMiniCPMDemoControlEvent(
     if let sessionID { event["session_id"] = .string(sessionID) }
     let value = MiniCPMJSONValue.object(event)
     try await outbound.send(try JSONEncoder().encode(value).asString())
-    await recorder.recordOutbound(value)
+    await recorder.recordOutbound(value, timestamp: Date())
 }
 
 private func writeMiniCPMDemoStateEvent(
@@ -1028,7 +1037,7 @@ private func writeMiniCPMDemoStateEvent(
     if let metrics = event.payload["metrics"] { object["metrics"] = metrics }
     let value = MiniCPMJSONValue.object(object)
     try await outbound.send(try JSONEncoder().encode(value).asString())
-    await recorder.recordOutbound(value)
+    await recorder.recordOutbound(value, timestamp: Date())
 }
 
 private func writeMiniCPMDemoRealtimeError(
@@ -1085,10 +1094,10 @@ private func writeMiniCPMDemoRealtimeBackpressure(
     if let inputID { event["input_id"] = .string(inputID) }
     let value = MiniCPMJSONValue.object(event)
     try await outbound.send(try JSONEncoder().encode(value).asString())
-    await recorder.recordOutbound(value)
+    await recorder.recordOutbound(value, timestamp: Date())
 }
 
-private func encodeOfficialMiniCPMDemoEvent(_ event: MiniCPMDemoEvent) throws -> String {
+func encodeOfficialMiniCPMDemoEvent(_ event: MiniCPMDemoEvent) throws -> String {
     var object: [String: MiniCPMJSONValue] = ["type": .string(event.type)]
     if let sessionID = event.sessionID { object["session_id"] = .string(sessionID) }
     if let responseID = event.responseID { object["response_id"] = .string(responseID) }
@@ -1098,6 +1107,7 @@ private func encodeOfficialMiniCPMDemoEvent(_ event: MiniCPMDemoEvent) throws ->
     if let audio = event.audio { object["audio"] = .string(audio) }
     if let format = event.format { object["format"] = .string(format) }
     if let sampleRate = event.sampleRate { object["sample_rate"] = .number(Double(sampleRate)) }
+    if let silent = event.silent { object["silent"] = .bool(silent) }
     if let reason = event.reason { object["reason"] = .string(reason) }
     if let metrics = event.metrics { object["metrics"] = .object(metrics) }
     if let state = event.state { object["state"] = .string(state) }

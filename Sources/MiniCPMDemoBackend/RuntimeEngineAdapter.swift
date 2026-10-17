@@ -356,11 +356,45 @@ public final class MiniCPMDuplexRuntimeEngineAdapter: MiniCPMDemoBackendEngine, 
         return merged
     }
 
-    private static func configuration(_ parameters: [String: MiniCPMJSONValue]) -> MiniCPMDuplexConfig {
-        let config = parameters["config"]?.objectValue
+    private static func mergedConfiguration(_ parameters: [String: MiniCPMJSONValue]) -> [String: MiniCPMJSONValue] {
+        let nested = parameters["config"]?.objectValue
             ?? parameters["sampling"]?.objectValue
             ?? parameters["duplex"]?.objectValue
-            ?? parameters
+            ?? [:]
+        // Browser session.init places the prompt and use_tts beside config.
+        // Preserve those session settings when a sampling envelope exists.
+        var merged = parameters
+        merged.merge(nested) { _, newer in newer }
+        // A nested spelling also overrides a top-level alias of the same
+        // setting, e.g. config.systemPrompt over top-level system_prompt.
+        let aliases = [
+            ["max_new_speak_tokens_per_chunk", "max_new_tokens", "maxNewTokens"],
+            ["top_k", "topK"], ["top_p", "topP"],
+            ["sliding_window_mode", "slidingWindowMode"],
+            ["basic_window_high_tokens", "basicWindowHighTokens"],
+            ["basic_window_low_tokens", "basicWindowLowTokens"],
+            ["context_previous_max_tokens", "contextPreviousMaxTokens"],
+            ["context_max_units", "contextMaxUnits"],
+            ["context_previous_marker", "contextPreviousMarker"],
+            ["ls_mode", "lsMode"], ["force_listen_count", "forceListenCount"],
+            ["listen_prob_scale", "listen_probability_scale", "listenProbabilityScale"],
+            ["listen_top_k", "listenTopK"],
+            ["greedy_listen_speak_decision", "greedyListenSpeakDecision"],
+            ["repetition_penalty", "repetitionPenalty"],
+            ["text_repetition_window_size", "repetition_window_size", "repetitionWindowSize"],
+            ["generate_audio", "generateAudio", "use_tts", "useTTS"],
+            ["system_prompt", "systemPrompt"],
+        ]
+        for keys in aliases {
+            if let value = keys.compactMap({ nested[$0] }).first {
+                merged[keys[0]] = value
+            }
+        }
+        return merged
+    }
+
+    private static func configuration(_ parameters: [String: MiniCPMJSONValue]) -> MiniCPMDuplexConfig {
+        let config = mergedConfiguration(parameters)
         // Per-unit LLM decode budget. Lowering this to 12 was measured and had
         // **no effect** (`llm_decode_ms` 271.8 -> 290.7 ms, i.e. within noise):
         // the unit normally ends on the sampler's natural `chunk_eos` probe
@@ -373,12 +407,11 @@ public final class MiniCPMDuplexRuntimeEngineAdapter: MiniCPMDemoBackendEngine, 
                 ?? config["max_new_tokens"]?.numberValue
                 ?? config["maxNewTokens"]?.numberValue
                 ?? 20)
-        // Official `generation_config.json` values (OpenBMB/MiniCPM-o-4_5).
-        // The old 0.7 / 0.8 pair was hotter *and* narrower than upstream, which
-        // pushed probability mass onto fewer, more random tail candidates.
-        let temperature = Float(config["temperature"]?.numberValue ?? 0.6)
+        // Full-duplex StreamDecoder uses its own sampling defaults, rather
+        // than the checkpoint's ordinary chat generation_config.json.
+        let temperature = Float(config["temperature"]?.numberValue ?? 0.7)
         let topK = Int(config["top_k"]?.numberValue ?? config["topK"]?.numberValue ?? 20)
-        let topP = Float(config["top_p"]?.numberValue ?? config["topP"]?.numberValue ?? 0.95)
+        let topP = Float(config["top_p"]?.numberValue ?? config["topP"]?.numberValue ?? 0.8)
         let window = config["sliding_window_tokens"]?.numberValue.map(Int.init)
         let windowMode = config["sliding_window_mode"]?.stringValue
             ?? config["slidingWindowMode"]?.stringValue
@@ -455,6 +488,8 @@ public final class MiniCPMDuplexRuntimeEngineAdapter: MiniCPMDemoBackendEngine, 
         let ttsRepetitionPenalty = Float(config["tts_repetition_penalty"]?.numberValue ?? 1.05)
         let generateAudio = config["generate_audio"]?.boolValue
             ?? config["generateAudio"]?.boolValue
+            ?? config["use_tts"]?.boolValue
+            ?? config["useTTS"]?.boolValue
             ?? true
         let systemPrompt = config["system_prompt"]?.stringValue
             ?? config["systemPrompt"]?.stringValue
@@ -539,7 +574,7 @@ public final class MiniCPMDuplexRuntimeEngineAdapter: MiniCPMDemoBackendEngine, 
         var maxSliceNums: [Int]?
         for key in [
             "streaming", "omni_mode", "use_tts_template", "enable_thinking", "generate_audio",
-            "speech_active", "allow_sampled_listen_speak_decision",
+            "speech_active", "allow_sampled_listen_speak_decision", "playback_active",
             "continuation_tick", "continuationOnly",
         ] {
             if let value = object[key]?.boolValue { metadata[key] = value ? "true" : "false" }

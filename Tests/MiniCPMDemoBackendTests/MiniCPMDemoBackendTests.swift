@@ -7,6 +7,34 @@ import HummingbirdWebSocket
 import HummingbirdWSTesting
 
 final class MiniCPMDemoBackendTests: XCTestCase {
+    func testSyntheticContinuationRequiresExplicitDiagnosticOptIn() {
+        XCTAssertFalse(miniCPMDemoSyntheticContinuationEnabled(environment: [:]))
+        XCTAssertTrue(miniCPMDemoSyntheticContinuationEnabled(
+            environment: ["MINICPM_SYNTHETIC_CONTINUATION": "1"]))
+        for value in ["", "0", "true", "yes", "on", "2", " 1", "1 "] {
+            XCTAssertFalse(miniCPMDemoSyntheticContinuationEnabled(
+                environment: ["MINICPM_SYNTHETIC_CONTINUATION": value]),
+                "only the exact value 1 enables diagnostic synthetic audio")
+        }
+    }
+
+    func testOfficialRealtimeEncoderPreservesSilentAudioMarker() throws {
+        let event = MiniCPMDemoEvent(
+            eventID: "silent",
+            type: "response.output.delta",
+            payload: [
+                "kind": .string("audio"),
+                "audio": .string("AAAA"),
+                "format": .string("pcm_f32"),
+                "sample_rate": .number(24_000),
+                "silent": .bool(true),
+            ])
+        let encoded = try encodeOfficialMiniCPMDemoEvent(event)
+        let value = try JSONDecoder().decode(
+            MiniCPMJSONValue.self, from: Data(encoded.utf8))
+        XCTAssertEqual(value.objectValue?["silent"]?.boolValue, true)
+    }
+
     func testJSONValueRoundTripPreservesNestedPayload() throws {
         let value: MiniCPMJSONValue = .object([
             "mode": .string("full_duplex"),
@@ -627,21 +655,30 @@ final class MiniCPMDemoBackendTests: XCTestCase {
         try await adapter.initialize(mode: .fullDuplex, parameters: [:])
         XCTAssertEqual(engine.preparedConfig?.forceListenCount, 0)
         XCTAssertEqual(engine.preparedConfig?.topK, 20)
+        XCTAssertEqual(engine.preparedConfig?.temperature, 0.7)
+        XCTAssertEqual(engine.preparedConfig?.topP, 0.8)
         XCTAssertTrue(engine.preparedConfig?.greedyListenSpeakDecision == false)
 
         _ = try await adapter.prefillResult(mode: .fullDuplex, input: [
             "text": .string("hello"),
             "speech_active": .bool(true),
+            "playback_active": .bool(true),
             "allow_sampled_listen_speak_decision": .bool(true),
             "continuation_tick": .bool(true),
         ])
         XCTAssertEqual(engine.lastInput?.metadata["speech_active"], "true")
+        XCTAssertEqual(engine.lastInput?.metadata["playback_active"], "true")
         XCTAssertEqual(
             engine.lastInput?.metadata["allow_sampled_listen_speak_decision"],
             "true")
         XCTAssertEqual(engine.lastInput?.allowSampledListenSpeakDecision, true)
         XCTAssertEqual(engine.lastInput?.continuationOnly, true)
         XCTAssertEqual(engine.lastInput?.metadata["continuation_tick"], "true")
+
+        _ = try await adapter.prefillResult(mode: .fullDuplex, input: [
+            "text": .string("drained"), "playback_active": .bool(false),
+        ])
+        XCTAssertEqual(engine.lastInput?.metadata["playback_active"], "false")
     }
 
     func testExplicitTTSReferenceOverridesDefaultAndKeepsLLMReferenceSeparate() async throws {

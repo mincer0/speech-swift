@@ -25,6 +25,12 @@ final class E2EMiniCPMAudioGoldenTests: XCTestCase {
             throw MiniCPMAudioGoldenFixture.FixtureError.invalid(
                 "audio golden must be exported by official PyTorch")
         }
+        guard let runtime = fixture.manifest["runtime"] as? [String: Any],
+              runtime["duplex_frontend"] as? String == "official_StreamingMelProcessorExact"
+        else {
+            throw MiniCPMAudioGoldenFixture.FixtureError.invalid(
+                "regenerate the audio golden with the official PCM duplex frontend")
+        }
         try fixture.validateAllArrays()
         return fixture
     }
@@ -752,8 +758,61 @@ final class E2EMiniCPMAudioGoldenTests: XCTestCase {
             prefix: "context_cache_1",
             fixture: fixture,
             label: "context second cache")
-        XCTAssertEqual(first.output.cache?.length, 49)
-        XCTAssertEqual(second.output.cache?.length, 97)
+        XCTAssertEqual(first.output.encoderStates.dim(1), 50)
+        XCTAssertEqual(second.output.encoderStates.dim(1), 50)
+        XCTAssertEqual(first.output.embeddings.dim(1), 10)
+        XCTAssertEqual(second.output.embeddings.dim(1), 10)
+        XCTAssertEqual(first.output.cache?.length, 50)
+        XCTAssertEqual(second.output.cache?.length, 100)
+    }
+
+    func testActualPCMFrontendEncoderAndCacheParity() throws {
+        let fixture = try loadFixture()
+        let model = try loadModel(fixture)
+        let frontend = MiniCPMStreamingMelProcessor()
+        let session = MiniCPMAudioStreamingSession(model: model)
+        for index in 0..<3 {
+            let samples = try fixture.tensor("context_stream_pcm_\(index)")
+                .asType(.float32).asArray(Float.self)
+            XCTAssertEqual(samples.count, index == 0 ? 16_480 : 16_000)
+            let mel = try XCTUnwrap(frontend.accept(samples))
+            XCTAssertEqual(mel.timeFrames, index == 0 ? 102 : 104)
+            let melArray = MLXArray(mel.data, [1, mel.timeFrames, 80])
+            let oracleMel = try fixture.tensor("context_stream_features_\(index)")
+            let boundaryValues = melArray.asType(model.featureDType)
+                .asType(.float32).asArray(Float.self)
+            let oracleBoundary = oracleMel.asType(model.featureDType)
+                .asType(.float32).asArray(Float.self)
+            let boundaryErrors = zip(boundaryValues, oracleBoundary).map { abs($0 - $1) }
+            let mismatchCount = zip(boundaryValues, oracleBoundary)
+                .reduce(0) { $0 + ($1.0 == $1.1 ? 0 : 1) }
+            print("audio-pcm-input chunk=\(index) dtype=\(model.featureDType) "
+                  + "mismatch_count=\(mismatchCount)/\(boundaryValues.count) "
+                  + "max=\(boundaryErrors.max() ?? 0) "
+                  + "mean=\(boundaryErrors.reduce(0, +) / Float(max(1, boundaryErrors.count)))")
+            XCTAssertEqual(mismatchCount, 0, "PCM \(index) checkpoint-dtype frontend boundary")
+            try assertTensor(
+                melArray,
+                expectedName: "context_stream_features_\(index)",
+                fixture: fixture, label: "PCM \(index) mel",
+                maxErrorTolerance: 0.001, meanErrorTolerance: 0.00002,
+                cosineFloor: 0.999999)
+            let encoded = try XCTUnwrap(session.acceptAudio(samples))
+            try assertTensor(
+                encoded.output.encoderStates,
+                expectedName: "context_stream_encoder_states_\(index)",
+                fixture: fixture, label: "PCM \(index) encoder")
+            try assertTensor(
+                encoded.output.embeddings,
+                expectedName: "context_stream_embeddings_\(index)",
+                fixture: fixture, label: "PCM \(index) embeddings")
+            XCTAssertEqual(encoded.output.encoderStates.dim(1), 50)
+            XCTAssertEqual(encoded.output.embeddings.dim(1), 10)
+            XCTAssertEqual(encoded.output.cache?.length, (index + 1) * 50)
+            try assertCache(
+                encoded.output.cache, prefix: "context_cache_\(index)",
+                fixture: fixture, label: "PCM \(index) cache")
+        }
     }
 
     func testSnapshotRollbackCanonicalContinuation() throws {

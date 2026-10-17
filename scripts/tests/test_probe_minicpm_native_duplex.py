@@ -196,6 +196,83 @@ class ProbeProtocolTests(unittest.TestCase):
             any(item.get("event") == "input_backpressure_timeout" for item in timeline)
         )
 
+    def test_startup_silence_requires_explicit_input_commit(self) -> None:
+        observer = PROBE.EventObserver()
+        acknowledgement = observer.register_input(
+            "startup", phase="initial_silence", require_committed=True
+        )
+        observer.handle_event(event("text", input_id="startup", text="抢答"))
+        observer.handle_event(event("listen", input_id="startup", reason="turn_end"))
+        self.assertFalse(acknowledgement.is_set())
+        observer.handle_event({"type": "input.committed", "input_id": "startup"})
+        self.assertTrue(acknowledgement.is_set())
+        self.assertEqual(observer.input_acknowledgements[-1]["event_type"], "input.committed")
+
+    def test_text_is_not_an_input_completion_ack(self) -> None:
+        observer = PROBE.EventObserver()
+        acknowledgement = observer.register_input("question")
+        observer.handle_event(event("text", input_id="question", text="第一块"))
+        self.assertFalse(acknowledgement.is_set())
+        observer.handle_event(event("listen", input_id="question", reason="turn_end"))
+        self.assertTrue(acknowledgement.is_set())
+
+    def test_startup_silence_timeout_never_uses_paced_fallback(self) -> None:
+        async def exercise() -> object:
+            probe = PROBE.NativeDuplexProbe(
+                NonAcknowledgingWebSocket(),
+                Path("/tmp/probe-test"),
+                packet_seconds=0.001,
+                acknowledgement_timeout=0.001,
+            )
+            with self.assertRaises(TimeoutError):
+                await probe.stream_pcm(
+                    PROBE.SILENCE_PACKET,
+                    label="initial_silence",
+                    speech_active=False,
+                    deadline=PROBE.time.monotonic() + 0.01,
+                )
+            return probe.observer
+
+        observer = asyncio.run(exercise())
+        self.assertEqual(observer.input_pacing_fallbacks, [])
+        failures = [
+            item for item in observer.timeline
+            if item.get("event") == "input_backpressure_timeout"
+        ]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["required_event"], "input.committed")
+        self.assertFalse(any(item.get("event") == "input_acknowledged" for item in observer.timeline))
+
+    def test_startup_silence_waits_through_text_until_commit(self) -> None:
+        async def exercise() -> object:
+            probe = PROBE.NativeDuplexProbe(
+                None, Path("/tmp/probe-test"), packet_seconds=0.001,
+                acknowledgement_timeout=0.001,
+            )
+
+            class DelayedCommitWebSocket:
+                async def send(self, payload: str) -> None:
+                    input_id = json.loads(payload)["input"]["input_id"]
+                    probe.observer.handle_event(event("text", input_id=input_id, text="抢答"))
+
+                    async def commit() -> None:
+                        await asyncio.sleep(0.01)
+                        probe.observer.handle_event({"type": "input.committed", "input_id": input_id})
+
+                    asyncio.create_task(commit())
+
+            probe.websocket = DelayedCommitWebSocket()
+            await probe.stream_pcm(
+                PROBE.SILENCE_PACKET, label="initial_silence", speech_active=False,
+                deadline=PROBE.time.monotonic() + 0.5,
+            )
+            return probe.observer
+
+        observer = asyncio.run(exercise())
+        self.assertEqual(observer.input_pacing_fallbacks, [])
+        self.assertEqual(len(observer.input_acknowledgements), 1)
+        self.assertEqual(observer.input_acknowledgements[0]["event_type"], "input.committed")
+
     def test_finish_turn_does_not_send_past_audio_then_turn_end_boundary(self) -> None:
         async def exercise(directory: Path) -> list[dict[str, object]]:
             probe = PROBE.NativeDuplexProbe(
@@ -287,6 +364,20 @@ class ProbeProtocolTests(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<H", data, 22)[0], 1)
         self.assertEqual(struct.unpack_from("<I", data, 24)[0], 16_000)
         self.assertEqual(decoded, payload)
+
+    def test_failed_turn_artifacts_can_be_rewritten_without_empty_pcm_error(self) -> None:
+        turn = PROBE.TurnResult(1, "question")
+        turn.error = "timed out"
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            PROBE._persist_turn_artifacts(turn, output)
+            PROBE._persist_turn_artifacts(turn, output)
+            wav = Path(turn.audio_path).read_bytes()
+            summary = json.loads((output / "turn-01.json").read_text())
+        self.assertEqual(wav[-4:], PROBE.encode_float32_pcm([0.0]))
+        self.assertEqual(summary["error"], "timed out")
+        self.assertEqual(summary["output_audio_seconds"], 0.0)
+        self.assertEqual(turn.audio, b"")
 
     def test_observer_tracks_queue_session_audio_listen_metrics_and_duplicate_text(self) -> None:
         observer = PROBE.EventObserver()
@@ -414,6 +505,171 @@ class ProbeProtocolTests(unittest.TestCase):
         )
         self.assertEqual(len(observer.unsolicited_outputs), 2)
         self.assertEqual(observer.unsolicited_outputs[1]["audio_bytes"], len(audio))
+
+    def test_silent_audio_is_validated_but_not_recorded_or_flagged(self) -> None:
+        observer = PROBE.EventObserver()
+        silent = PROBE.encode_float32_pcm([0.0, 0.0])
+        delta = event(
+            "audio",
+            silent=True,
+            audio=base64.b64encode(silent).decode("ascii"),
+            format="pcm_f32",
+            sample_rate=24_000,
+            input_id="silent_input",
+        )
+        observer.handle_event(delta)
+        self.assertEqual(observer.unsolicited_outputs, [])
+        turn = PROBE.TurnResult(1, "question")
+        observer.set_current(turn)
+        observer.handle_event(delta)
+        self.assertEqual(turn.audio, b"")
+        self.assertIsNone(turn.first_audio_at)
+        self.assertFalse(turn.saw_audio)
+        self.assertFalse(turn.audio_started.is_set())
+        self.assertIn("silent_input", observer._acknowledged_input_ids)
+
+    def test_silent_marker_cannot_hide_nonzero_audio(self) -> None:
+        observer = PROBE.EventObserver()
+        observer.handle_event(
+            event(
+                "audio",
+                silent=True,
+                audio=base64.b64encode(PROBE.encode_float32_pcm([0.25])).decode("ascii"),
+                format="pcm_f32",
+                sample_rate=24_000,
+            )
+        )
+        self.assertEqual(len(observer.unsolicited_outputs), 1)
+        self.assertIn("nonzero PCM", observer.unsolicited_outputs[0]["error"])
+
+    def test_post_silence_speech_is_not_attached_to_last_answer(self) -> None:
+        observer = PROBE.EventObserver()
+        observer.last_completed_turn = PROBE.TurnResult(1, "question")
+        observer.handle_event(
+            event(
+                "audio",
+                input_id="probe_post_silence_0001",
+                audio=base64.b64encode(PROBE.encode_float32_pcm([0.25])).decode("ascii"),
+                format="pcm_f32",
+                sample_rate=24_000,
+            )
+        )
+        self.assertEqual(len(observer.unsolicited_outputs), 1)
+        self.assertEqual(observer.last_completed_turn.audio, b"")
+
+    def test_delayed_startup_output_cannot_become_first_question_answer(self) -> None:
+        observer = PROBE.EventObserver()
+        observer.register_input("startup", phase="initial_silence", require_committed=True)
+        turn = PROBE.TurnResult(1, "question")
+        observer.set_current(turn)
+        observer.register_input("question", phase="turn_01")
+        observer.handle_event(event("text", input_id="startup", response_id="startup_resp", text="启动抢答"))
+        observer.handle_event(event(
+            "audio", input_id="startup", response_id="startup_resp",
+            audio=base64.b64encode(PROBE.encode_float32_pcm([0.25])).decode("ascii"),
+            format="pcm_f32", sample_rate=24_000,
+        ))
+        # A newly submitted question can advance the same startup response.
+        observer.handle_event(event(
+            "text", input_id="question", response_id="startup_resp", text="继续抢答",
+            metrics={"kv_cache_length": 10},
+        ))
+        observer.handle_event(event("listen", input_id="startup", reason="turn_end"))
+        self.assertEqual(turn.text, "")
+        self.assertEqual(turn.audio, b"")
+        self.assertEqual(turn.metrics, [])
+        self.assertFalse(turn.done.is_set())
+        self.assertEqual(len(observer.unsolicited_outputs), 3)
+        self.assertTrue(all(item["phase"] == "initial_silence" for item in observer.unsolicited_outputs))
+
+    def test_late_previous_turn_output_and_boundary_keep_their_owner(self) -> None:
+        observer = PROBE.EventObserver()
+        first = PROBE.TurnResult(1, "first")
+        observer.set_current(first)
+        observer.register_input("first_input", phase="turn_01")
+        observer.handle_event(event("text", input_id="first_input", response_id="first_resp", text="第一轮"))
+        observer.handle_event(event("listen", input_id="first_input", response_id="first_resp", reason="turn_end"))
+        second = PROBE.TurnResult(2, "second")
+        observer.set_current(second)
+        observer.register_input("second_input", phase="turn_02")
+        observer.handle_event(event("text", input_id="first_input", text="延迟尾音"))
+        observer.handle_event(event("text", input_id="cont_0001", response_id="first_resp", text="延迟续块"))
+        observer.handle_event({"type": "response.done", "input_id": "first_input"})
+        self.assertEqual(first.text, "第一轮延迟尾音延迟续块")
+        self.assertEqual(second.text, "")
+        self.assertFalse(second.done.is_set())
+        self.assertEqual(first.completion_reason, "listen_end")
+        self.assertEqual(observer.unsolicited_outputs, [])
+        observer.handle_event(event("text", input_id="second_input", response_id="second_resp", text="第二轮"))
+        self.assertEqual(second.text, "第二轮")
+
+    def test_post_silence_output_keeps_silence_owner_during_next_turn(self) -> None:
+        observer = PROBE.EventObserver()
+        observer.register_input("post", phase="post_silence")
+        turn = PROBE.TurnResult(2, "next")
+        observer.set_current(turn)
+        observer.handle_event(event("text", input_id="post", text="无请求语音"))
+        observer.handle_event({"type": "response.done", "input_id": "post"})
+        self.assertEqual(turn.text, "")
+        self.assertFalse(turn.done.is_set())
+        self.assertEqual([item["phase"] for item in observer.unsolicited_outputs], ["post_silence", "post_silence"])
+
+    def test_unknown_explicit_input_and_continuation_do_not_inherit_current_turn(self) -> None:
+        observer = PROBE.EventObserver()
+        turn = PROBE.TurnResult(1, "question")
+        observer.set_current(turn)
+        observer.handle_event(event("text", input_id="unknown", text="未知来源"))
+        observer.handle_event(event("text", input_id="cont_0001", text="未知续块"))
+        self.assertEqual(turn.text, "")
+        self.assertEqual(len(observer.unsolicited_outputs), 2)
+
+    def test_commit_metrics_keep_registered_input_owner(self) -> None:
+        observer = PROBE.EventObserver()
+        first = PROBE.TurnResult(1, "first")
+        observer.set_current(first)
+        acknowledgement = observer.register_input("first_input", phase="turn_01")
+        second = PROBE.TurnResult(2, "second")
+        observer.set_current(second)
+        observer.handle_event({
+            "type": "input.committed", "input_id": "first_input",
+            "metrics": {"kv_cache_length": 10},
+        })
+        self.assertTrue(acknowledgement.is_set())
+        self.assertEqual(first.kv_cache_lengths, [10])
+        self.assertEqual(second.kv_cache_lengths, [])
+
+    def test_audio_padding_is_removed_from_recorded_answer(self) -> None:
+        observer = PROBE.EventObserver()
+        turn = PROBE.TurnResult(1, "question")
+        observer.set_current(turn)
+        payload = PROBE.encode_float32_pcm([0.0, 0.25, 0.5])
+        observer.handle_event(
+            event(
+                "audio",
+                audio=base64.b64encode(payload).decode("ascii"),
+                format="pcm_f32",
+                sample_rate=24_000,
+                metrics={"audio_padding_samples": 1},
+            )
+        )
+        self.assertEqual(turn.audio, PROBE.encode_float32_pcm([0.25, 0.5]))
+
+    def test_padding_only_audio_does_not_start_speech(self) -> None:
+        observer = PROBE.EventObserver()
+        turn = PROBE.TurnResult(1, "question")
+        observer.set_current(turn)
+        observer.handle_event(
+            event(
+                "audio",
+                audio=base64.b64encode(PROBE.encode_float32_pcm([0.0])).decode("ascii"),
+                format="pcm_f32", sample_rate=24_000,
+                metrics={"audio_padding_samples": 1},
+            )
+        )
+        self.assertEqual(turn.audio, b"")
+        self.assertFalse(turn.saw_audio)
+        self.assertIsNone(turn.first_audio_at)
+        self.assertFalse(turn.audio_started.is_set())
 
     def test_terminal_summary_omits_large_trace_arrays(self) -> None:
         report = {

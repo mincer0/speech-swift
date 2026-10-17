@@ -12,6 +12,23 @@ import MLXNN
 /// Only the dense BF16 path enters MPSGraph; all other dtypes use the exact
 /// implementation supplied by ``Linear``.
 public final class MiniCPMExactBF16Linear: Linear {
+    /// A reusable no-copy weight feed. Keeping this object alive also keeps
+    /// the MLX storage alive, including after the module's parameters change.
+    public final class BF16WeightBridge {
+        public let tensorData: MPSGraphTensorData
+        public let shape: [Int]
+        let storageOwner: MLXArray
+        fileprivate let deviceRegistryID: UInt64
+
+        fileprivate init(storageOwner: MLXArray, buffer: any MTLBuffer) {
+            self.storageOwner = storageOwner
+            self.shape = storageOwner.shape
+            self.deviceRegistryID = buffer.device.registryID
+            self.tensorData = MPSGraphTensorData(
+                buffer, shape: shape.map(NSNumber.init), dataType: .bFloat16)
+        }
+    }
+
     private struct PlanKey: Hashable {
         let inputShape: [Int]
         let weightShape: [Int]
@@ -60,9 +77,17 @@ public final class MiniCPMExactBF16Linear: Linear {
         }
     }
 
+    private final class WeightBridgeCache {
+        let lock = NSLock()
+        var prepared: BF16WeightBridge?
+    }
+
     private static let sharedExecutionContext = SharedExecutionContext.shared
     private let planLock = NSLock()
     private var plans: [PlanKey: Plan] = [:]
+    // Keep the mutable entry inside a reference container. Module's cached
+    // reflection must retain the container, rather than an old bridge value.
+    private let weightBridgeCache = WeightBridgeCache()
 
     public override init(_ inputDimensions: Int, _ outputDimensions: Int, bias: Bool = true) {
         super.init(inputDimensions, outputDimensions, bias: bias)
@@ -70,6 +95,40 @@ public final class MiniCPMExactBF16Linear: Linear {
 
     public override init(weight: MLXArray, bias: MLXArray? = nil) {
         super.init(weight: weight, bias: bias)
+    }
+
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        weightBridgeCache.lock.lock()
+        defer { weightBridgeCache.lock.unlock() }
+        // Module.update changes the inherited MLXArray in place, so its
+        // object identity and C wrapper address cannot identify new weights.
+        // Invalidate even when an update subsequently throws: it may already
+        // have replaced some parameters before detecting an invalid key.
+        weightBridgeCache.prepared = nil
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    /// Prepare the fixed weight once for both independent and grouped BF16
+    /// projections. The separate contiguous array owns its storage even if
+    /// Module.update later replaces the inherited weight array's contents.
+    /// Parameter changes must use Module.update, as required by MLX Module.
+    public func preparedBF16Weight(device: any MTLDevice) -> BF16WeightBridge {
+        weightBridgeCache.lock.lock()
+        defer { weightBridgeCache.lock.unlock() }
+        if let cached = weightBridgeCache.prepared, cached.deviceRegistryID == device.registryID {
+            return cached
+        }
+        precondition(weight.dtype == .bfloat16 && weight.ndim == 2)
+        let storageOwner = weight.contiguous()
+        let buffer = noCopyBuffer(storageOwner, device: device, label: "BF16 weight")
+        let prepared = BF16WeightBridge(storageOwner: storageOwner, buffer: buffer)
+        weightBridgeCache.prepared = prepared
+        return prepared
     }
 
     public override func callAsFunction(_ input: MLXArray) -> MLXArray {
@@ -103,22 +162,22 @@ public final class MiniCPMExactBF16Linear: Linear {
         // non-row-contiguous strides, which cannot be represented by that
         // bridge.  Materialize those views in MLX first; this remains a GPU
         // operation and does not introduce a Data/CPU copy or a GEMM fallback.
-        let graphInput = rowContiguousInput(input)
-        let inputBuffer = noCopyBuffer(graphInput, device: device, label: "BF16 input")
-        let weightBuffer = noCopyBuffer(weight, device: device, label: "BF16 weight")
+        let graphInput = input.contiguous()
+        let preparedWeight = preparedBF16Weight(device: device)
 
         var outputShape = Array(inputShape.dropLast())
         outputShape.append(weightShape[0])
         let output = MLXArray.zeros(outputShape, dtype: .bfloat16)
+        // Submit the dynamic input and destination together. Evaluating the
+        // input before allocating the destination would add a second MLX
+        // submission and CPU wait to every independent projection.
+        eval([graphInput, output])
+        let inputBuffer = noCopyBuffer(graphInput, device: device, label: "BF16 input")
         let outputBuffer = noCopyBuffer(output, device: device, label: "BF16 output")
 
         let inputData = MPSGraphTensorData(
             inputBuffer,
             shape: inputShape.map(NSNumber.init),
-            dataType: .bFloat16)
-        let weightData = MPSGraphTensorData(
-            weightBuffer,
-            shape: weightShape.map(NSNumber.init),
             dataType: .bFloat16)
         let outputData = MPSGraphTensorData(
             outputBuffer,
@@ -135,21 +194,16 @@ public final class MiniCPMExactBF16Linear: Linear {
         let executionContext = Self.sharedExecutionContext
         executionContext.executionLock.lock()
         defer { executionContext.executionLock.unlock() }
-        plan.graph.run(
-            with: executionContext.commandQueue,
-            feeds: [plan.inputTensor: inputData, plan.weightTensor: weightData],
-            targetOperations: nil,
-            resultsDictionary: results)
-        return output
-    }
-
-    private func rowContiguousInput(_ input: MLXArray) -> MLXArray {
-        eval(input)
-        let backing = input.asData(access: .noCopy)
-        guard !isRowContiguous(shape: input.shape, strides: backing.strides) else {
-            return input
+        // TensorData retains the no-copy buffer wrapper, not its MLX storage owner.
+        withExtendedLifetime((graphInput, preparedWeight, output)) {
+            plan.graph.run(
+                with: executionContext.commandQueue,
+                feeds: [plan.inputTensor: inputData,
+                        plan.weightTensor: preparedWeight.tensorData],
+                targetOperations: nil,
+                resultsDictionary: results)
         }
-        return input.contiguous()
+        return output
     }
 
     private var metalDevice: any MTLDevice { Self.sharedExecutionContext.device }

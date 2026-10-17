@@ -64,3 +64,8 @@ benchmark-results/
 .build*/
 # Golden fixtures / recorded outputs (150M+ of wav)
 test-output/
+
+# Small deterministic decoder test weights
+!Tests/MiniCPMTTSSemanticTests/Fixtures/minicpm-tts-tiny-oracle.safetensors
+!Tests/MiniCPMTTSSemanticTests/Fixtures/minicpm-tts-weight-norm-mps.safetensors
+!Tests/MiniCPMLLMTests/Fixtures/model.safetensors

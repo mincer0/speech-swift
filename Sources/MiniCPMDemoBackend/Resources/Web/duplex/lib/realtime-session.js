@@ -23,17 +23,29 @@ export class RealtimeSession {
                 ? Math.max(0, config.reconnectAttempts) : 3,
             reconnectBaseDelayMs: Number.isFinite(config.reconnectBaseDelayMs)
                 ? Math.max(100, config.reconnectBaseDelayMs) : 500,
-            // Keep a small acknowledgement window so a slow model cannot
-            // accumulate seconds of stale microphone audio in the gateway.
-            // The server still enforces its own byte/item budget.
+            // Keep a small acknowledgement window and retain unsent audio
+            // locally in timeline order. Backlog limits pause the session
+            // explicitly instead of silently dropping microphone packets.
             maxInputInFlight: Number.isFinite(config.maxInputInFlight)
                 ? Math.max(1, Math.min(4, Math.floor(config.maxInputInFlight))) : 2,
+            maxPendingInputPackets: Number.isFinite(config.maxPendingInputPackets)
+                ? Math.max(1, Math.min(64, Math.floor(config.maxPendingInputPackets))) : 16,
+            maxPendingInputBytes: Number.isFinite(config.maxPendingInputBytes)
+                ? Math.max(1024, Math.min(32 * 1024 * 1024, Math.floor(config.maxPendingInputBytes)))
+                : 8 * 1024 * 1024,
+            // Producers opt in only after they can synchronously hold capture.
+            // Keep the hard queue limits for producers that do not cooperate.
+            enableInputFlowControl: config.enableInputFlowControl === true,
             getWsUrl: config.getWsUrl || (() => {
                 const proto = location.protocol === 'https:' ? 'wss' : 'ws';
                 const url = `${proto}://${location.host}/v1/realtime`;
                 return window.ClientIdentity ? window.ClientIdentity.appendToUrl(url) : url;
             }),
         };
+        this.config.inputFlowHighWaterPackets = Number.isFinite(config.inputFlowHighWaterPackets)
+            ? Math.max(1, Math.min(this.config.maxPendingInputPackets,
+                Math.floor(config.inputFlowHighWaterPackets)))
+            : Math.min(4, this.config.maxPendingInputPackets);
 
         this.ws = null;
         this.audioPlayer = new AudioPlayer({
@@ -46,12 +58,18 @@ export class RealtimeSession {
         this.paused = false;
         this.pauseState = 'active';
         this.forceListenActive = false;
+        this._pendingCancelAcks = 0;
         this.currentSpeakText = '';
         this._speakHandle = null;
         this._started = false;
         this._intentionalClose = false;
         this._reconnecting = false;
+        // An open transport is not yet a model session. Microphone capture
+        // can keep running during reconnect, but its old timeline must never
+        // precede session.init or be replayed into the fresh model context.
+        this._sessionReady = false;
         this._reconnectPromise = null;
+        this._reconnectReject = null;
         this._reconnectGeneration = 0;
         this._startGeneration = 0;
         this._sessionArgs = null;
@@ -67,11 +85,17 @@ export class RealtimeSession {
         this._resultCount = 0;
         this._lastDriftMs = null;
         this._lastKvCacheLength = 0;
+        this._lastKvEngineEpoch = null;
         this._lastFrameMetrics = {};
         this._inputBackpressureUntil = 0;
         this._inputSequence = 0;
         this._recentInputs = new Map();
-        this._pendingInput = null;
+        this._pendingInputs = [];
+        this._pendingInputBytes = 0;
+        this._inputFlowHeld = false;
+        this._inputAdmissionSequence = 0;
+        this._lastSubmittedInputSequence = 0;
+        this._usesInputCommitted = false;
         this._inputRetryTimer = null;
         this._sessionInitTimer = null;
         this._modelState = 'listening';
@@ -100,11 +124,18 @@ export class RealtimeSession {
         this.audioPlayer.onFarEndReference = (samples, sampleRate, timestamp) => {
             this.echoReference.pushPlayback(samples, sampleRate, timestamp);
         };
+        this.audioPlayer.onPlaybackTimelineReset = () => this.echoReference.reset();
+        this.audioPlayer.onPlaybackError = error => {
+            this._logProtoEvent('client', 'audio.playback_error', error.message);
+            this.onSystemLog(`Audio playback could not start: ${error.message}`);
+        };
     }
 
     get running() { return this._started; }
     get eventLog() { return this._eventLog; }
     get modelState() { return this._modelState; }
+    get inputFlowHeld() { return this._inputFlowHeld; }
+    get _awaitingCancelAck() { return this._pendingCancelAcks > 0; }
 
     // ==== Hooks ====
     onSystemLog(text) {}
@@ -121,6 +152,7 @@ export class RealtimeSession {
     onRunningChange(running) {}
     onForceListenChange(active) {}
     onPauseStateChange(state) {}
+    onInputFlowChange(state) {}
     /** New: protocol event logged (for data flow panel). */
     onProtocolEvent(entry) {}
     onEchoDiagnostics(data) {}
@@ -157,11 +189,17 @@ export class RealtimeSession {
         try {
             await new Promise((resolve, reject) => {
                 this.ws = new WebSocket(wsUrl);
-                this.ws.onopen = () => resolve();
-                this.ws.onerror = () => reject(new Error('WebSocket connection failed'));
-                this.ws.onclose = () => {
-                    if (!this._started) reject(new Error('WebSocket closed before ready'));
+                const fail = error => {
+                    if (this._queueReject === fail) this._queueReject = null;
+                    reject(error);
                 };
+                this._queueReject = fail;
+                this.ws.onopen = () => {
+                    if (this._queueReject === fail) this._queueReject = null;
+                    resolve();
+                };
+                this.ws.onerror = () => fail(new Error('WebSocket connection failed'));
+                this.ws.onclose = () => fail(new Error('WebSocket closed before ready'));
             });
             this._assertStartActive(startGeneration);
 
@@ -169,7 +207,22 @@ export class RealtimeSession {
             await new Promise((resolve, reject) => {
                 let queueDone = false;
                 let initSent = false;
-                this._queueReject = reject;
+                const fail = error => {
+                    this._clearSessionInitTimer();
+                    if (this._queueReject === fail) this._queueReject = null;
+                    reject(error);
+                };
+                this._queueReject = fail;
+                this.ws.onerror = () => {
+                    if (this._started || startGeneration !== this._startGeneration || this._intentionalClose) return;
+                    if (this._sessionReady) this.cleanup();
+                    fail(new Error('WebSocket failed during session initialization'));
+                };
+                this.ws.onclose = () => {
+                    if (this._started || startGeneration !== this._startGeneration || this._intentionalClose) return;
+                    if (this._sessionReady) this.cleanup();
+                    fail(new Error('WebSocket closed during session initialization'));
+                };
 
                 const sendSessionInit = () => {
                     if (initSent
@@ -193,6 +246,7 @@ export class RealtimeSession {
                 };
 
                 this.ws.onmessage = (e) => {
+                    if (startGeneration !== this._startGeneration || this._intentionalClose) return;
                     const msg = JSON.parse(e.data);
 
                     if (msg.type === 'session.queued') {
@@ -214,7 +268,6 @@ export class RealtimeSession {
                         });
                     } else if (msg.type === 'session.queue_done') {
                         queueDone = true;
-                        this._queueReject = null;
                         this._logProtoEvent('server', 'session.queue_done', '', msg);
                         this.onQueueDone();
                         this.onQueueUpdate(null);
@@ -232,7 +285,6 @@ export class RealtimeSession {
                         });
                     } else if (msg.type === 'queue_done') {
                         queueDone = true;
-                        this._queueReject = null;
                         this._logProtoEvent('server', 'queue_done (compat)', '', msg);
                         this.onQueueDone();
                         this.onQueueUpdate(null);
@@ -242,7 +294,11 @@ export class RealtimeSession {
                     } else if (msg.type === 'session.created') {
                         this._clearSessionInitTimer();
                         this._queueReject = null;
+                        this._sessionReady = true;
                         this.sessionId = msg.session_id || '';
+                        this._usesInputCommitted = msg.metrics?.backend === 'swift_mlx';
+                        this._lastFrameMetrics = msg.metrics || {};
+                        this._resetKvBaseline(this._lastFrameMetrics);
                         this.recordingSessionId = this.sessionId;
                         this._logProtoEvent('server', 'session.created',
                             `session_id=${this.sessionId}`, msg);
@@ -251,12 +307,10 @@ export class RealtimeSession {
                         this.onSystemLog(`Session created: ${this.sessionId} (${msg.prompt_length || '?'} tokens)`);
                         resolve();
                     } else if (msg.type === 'error') {
-                        this._clearSessionInitTimer();
-                        this._queueReject = null;
                         this._logProtoEvent('server', 'error',
                             `${msg.error?.code}: ${msg.error?.message}`, msg);
                         const errMsg = msg.error?.message || msg.error || 'Unknown error';
-                        reject(new Error(errMsg));
+                        fail(new Error(errMsg));
                     }
                 };
 
@@ -276,6 +330,7 @@ export class RealtimeSession {
             this._started = true;
             this.onRunningChange(true);
             this.ws.onmessage = (e) => this._handleMessage(JSON.parse(e.data));
+            this.ws.onerror = null;
             this.ws.onclose = () => this._handleTransportClose();
         } catch (err) {
             if (startGeneration === this._startGeneration && !this._intentionalClose) {
@@ -291,14 +346,10 @@ export class RealtimeSession {
      * and translates to the new { type: 'input.append', input: { audio, ... } }
      */
     sendChunk(msg) {
-        if (this.paused) return;
-        // Input cadence probe. MiniCPM duplex expects one input chunk per
-        // second; the callers self-correct their timers, yet the gap between
-        // the server's audio deltas grows to ~1.4 s late in a long session
-        // while the server-side stage timings stay flat (~762 ms/unit). That
-        // surplus must therefore originate in the browser, so measure the real
-        // inter-send interval here instead of guessing where it goes. Logs at
-        // most one line every 3 s, and only when the target is actually missed.
+        if (this.paused || !this._sessionReady) return;
+        // Measure unexpected slips during active capture. Deliberate flow
+        // holds reset the baseline so their processing wait is not reported
+        // as a browser timer failure.
         {
             const now = typeof performance !== 'undefined'
                 ? performance.now()
@@ -328,6 +379,8 @@ export class RealtimeSession {
             input: {
                 audio: msg.audio_base64,
                 input_id: inputID,
+                // Model turn end can arrive before the audible tail drains.
+                playback_active: this.audioPlayer.hasBufferedAudio === true,
             },
         };
 
@@ -354,8 +407,6 @@ export class RealtimeSession {
         this._observeInput(msg);
         this._submitInput({
             event: newMsg,
-            priority: (msg.speech_active === true || msg.force_listen || this.forceListenActive)
-                ? 3 : 1,
             retries: 0,
         });
     }
@@ -366,22 +417,24 @@ export class RealtimeSession {
     }
 
     _submitInput(entry) {
-        if (this._intentionalClose || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        if (this.paused || !this._sessionReady || this._intentionalClose
+            || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
             // Reconnect creates a fresh model timeline, so old audio is never
             // replayed across a transport boundary.
             return false;
         }
-        if (performance.now() < this._inputBackpressureUntil) {
-            this._queuePendingInput(entry);
+        if (!Number.isFinite(entry.sequence)) entry.sequence = ++this._inputAdmissionSequence;
+        if (this._pendingInputs.length
+            || this._awaitingCancelAck
+            || performance.now() < this._inputBackpressureUntil
+            || this._recentInputs.size >= this.config.maxInputInFlight) {
+            if (!this._queuePendingInput(entry)) return false;
             this._schedulePendingInputRetry();
-            return false;
-        }
-        if (this._recentInputs.size >= this.config.maxInputInFlight) {
-            this._queuePendingInput(entry);
             this.onMetrics({
                 type: 'input_window',
                 inFlight: this._recentInputs.size,
                 limit: this.config.maxInputInFlight,
+                pending: this._pendingInputs.length,
             });
             return false;
         }
@@ -389,8 +442,9 @@ export class RealtimeSession {
     }
 
     _sendInput(entry) {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+        if (!this._sessionReady || !this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
         this.ws.send(JSON.stringify(entry.event));
+        this._lastSubmittedInputSequence = Math.max(this._lastSubmittedInputSequence, entry.sequence);
         this.chunksSent++;
 
         const inputID = entry.event.message_id;
@@ -411,46 +465,120 @@ export class RealtimeSession {
         return true;
     }
 
-    _queuePendingInput(entry, replaceEqual = false) {
-        if (!this._pendingInput
-            || entry.priority > this._pendingInput.priority
-            || (replaceEqual && entry.priority === this._pendingInput.priority)
-            // For audio, latest-wins bounds latency instead of replaying an
-            // old packet after the user has already moved on.
-            || (entry.priority === this._pendingInput.priority
-                && (entry.priority === 1 || entry.priority === 3))) {
-            this._pendingInput = entry;
+    _queuePendingInput(entry) {
+        const inputID = entry.event.message_id;
+        if (this._pendingInputs.some(pending => pending.event.message_id === inputID)) return true;
+        entry.queuedBytes = JSON.stringify(entry.event).length * 2;
+        if (this._pendingInputs.length >= this.config.maxPendingInputPackets
+            || this._pendingInputBytes + entry.queuedBytes > this.config.maxPendingInputBytes) {
+            this._pauseInputTimeline('Input backlog exceeded its audio queue limit');
+            return false;
+        }
+        // A rejected packet retains its original sequence and returns before
+        // newer unsent packets; speech, silence and continuation share one FIFO.
+        const index = this._pendingInputs.findIndex(pending => pending.sequence > entry.sequence);
+        if (index < 0) this._pendingInputs.push(entry);
+        else this._pendingInputs.splice(index, 0, entry);
+        this._pendingInputBytes += entry.queuedBytes;
+        this._updateInputFlowControl();
+        return true;
+    }
+
+    _setInputFlowHeld(held, reason = 'drain') {
+        if (this._inputFlowHeld === held) return;
+        this._inputFlowHeld = held;
+        this._lastSendAt = null;
+        const state = held ? 'held' : 'active';
+        if (held) {
+            this.onSystemLog('Processing queued audio; input capture temporarily paused.');
+        } else if (reason === 'drain') {
+            this.onSystemLog('Queued audio caught up; input capture resumed.');
+        }
+        this.onMetrics({
+            type: 'input_flow',
+            state,
+            held,
+            reason,
+            pending: this._pendingInputs.length,
+            pendingBytes: this._pendingInputBytes,
+            inFlight: this._recentInputs.size,
+            highWaterPackets: this.config.inputFlowHighWaterPackets,
+        });
+        // The producer must pause synchronously on held. Already posted
+        // worklet messages still enter the same FIFO instead of being lost.
+        // On explicit clear, the producer checks the session lifecycle before
+        // resuming; clearing a stopped or paused session is not a drain.
+        this.onInputFlowChange(state);
+    }
+
+    _updateInputFlowControl() {
+        if (!this.config.enableInputFlowControl) return;
+        if (!this._inputFlowHeld
+            && this._pendingInputs.length >= this.config.inputFlowHighWaterPackets) {
+            this._setInputFlowHeld(true);
+        } else if (this._inputFlowHeld && !this._pendingInputs.length
+            && this._recentInputs.size < this.config.maxInputInFlight
+            && this._sessionReady && !this.paused && !this._awaitingCancelAck
+            && !this._intentionalClose) {
+            this._setInputFlowHeld(false);
         }
     }
 
+    _pauseInputTimeline(reason) {
+        this.onSystemLog(`${reason}. Session paused; resume to start fresh input.`);
+        this.onMetrics({
+            type: 'input_overflow',
+            reason,
+            pending: this._pendingInputs.length,
+            pendingBytes: this._pendingInputBytes,
+            packetLimit: this.config.maxPendingInputPackets,
+            byteLimit: this.config.maxPendingInputBytes,
+        });
+        this.paused = true;
+        this.pauseState = 'paused';
+        this._cancelCurrentResponse();
+        this._sendControl('session.pause');
+        this.onPauseStateChange('paused');
+        this.onMetrics({ type: 'state', sessionState: 'Paused' });
+    }
+
     _schedulePendingInputRetry() {
-        if (this._inputRetryTimer || !this._pendingInput || this.paused) return;
+        if (this._inputRetryTimer || !this._pendingInputs.length || this.paused || !this._sessionReady
+            || this._awaitingCancelAck || this._intentionalClose
+            || this._recentInputs.size >= this.config.maxInputInFlight) return;
         const delay = Math.max(0, this._inputBackpressureUntil - performance.now());
         this._inputRetryTimer = setTimeout(() => {
             this._inputRetryTimer = null;
-            if (!this._pendingInput || this.paused || this._intentionalClose) return;
+            if (this.paused || !this._sessionReady || this._awaitingCancelAck || this._intentionalClose
+                || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
             if (performance.now() < this._inputBackpressureUntil) {
                 this._schedulePendingInputRetry();
                 return;
             }
-            const pending = this._pendingInput;
-            this._pendingInput = null;
-            // Re-enter the normal admission path.  A retry timer must not
-            // bypass the acknowledgement window or a newly received limit.
-            if (!this._submitInput(pending) && !this._pendingInput) {
-                this._queuePendingInput(pending);
+            while (this._pendingInputs.length
+                && this._recentInputs.size < this.config.maxInputInFlight) {
+                const pending = this._pendingInputs.shift();
+                this._pendingInputBytes -= pending.queuedBytes;
+                this._sendInput(pending);
             }
+            this._updateInputFlowControl();
         }, delay);
     }
 
     _clearPendingInputs() {
+        // Cancellation, explicit pause and reconnect begin a fresh timeline
+        // even when the queue never reached the automatic hold watermark.
+        this._lastSendAt = null;
         if (this._inputRetryTimer) {
             clearTimeout(this._inputRetryTimer);
             this._inputRetryTimer = null;
         }
-        this._pendingInput = null;
+        this._pendingInputs = [];
+        this._pendingInputBytes = 0;
         this._recentInputs.clear();
         this._inputBackpressureUntil = 0;
+        this._lastSubmittedInputSequence = 0;
+        this._setInputFlowHeld(false, 'clear');
     }
 
     _takeLatestRecentInput() {
@@ -471,29 +599,71 @@ export class RealtimeSession {
         }
     }
 
+    _sendControl(type) {
+        if (!this._sessionReady || !this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+        this.ws.send(JSON.stringify({ type }));
+        this._logProtoEvent('client', type, '');
+        return true;
+    }
+
+    _stopCurrentSpeech() {
+        this.audioPlayer.stopAll();
+        // References are collected when sources are scheduled. Cancelled
+        // future audio must not suppress the user's next microphone chunk.
+        this.echoReference.reset();
+        if (this._speakHandle) this.onSpeakEnd();
+        this._speakHandle = null;
+        this.currentSpeakText = '';
+        this._modelState = 'listening';
+        this._wasListening = true;
+        this._lastListenTime = performance.now();
+        this._lastTTFS = 0;
+        this.onMetrics({ type: 'result', modelState: 'listening' });
+    }
+
+    _cancelCurrentResponse() {
+        // Establish the barrier before the flow callback can synchronously
+        // restart a producer with a fresh packet. Each successful cancel has
+        // its own interrupt ACK; one ACK cannot reopen input past a later
+        // cancellation that is still pending.
+        this._pendingCancelAcks++;
+        this._resetKvBaseline();
+        this._clearPendingInputs();
+        this._stopCurrentSpeech();
+        let sent = false;
+        try {
+            sent = this._sendControl('response.cancel');
+        } finally {
+            if (!sent) this._pendingCancelAcks = Math.max(0, this._pendingCancelAcks - 1);
+        }
+    }
+
     toggleForceListen() {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        if (!this._sessionReady || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         this.forceListenActive = !this.forceListenActive;
         this.onForceListenChange(this.forceListenActive);
         if (this.forceListenActive) {
             this.onSystemLog('Force Listen ON');
-            this.audioPlayer.stopAll();
-            if (this.audioPlayer.turnActive) this.audioPlayer.endTurn();
+            this._cancelCurrentResponse();
         } else {
-            if (this.audioPlayer.turnActive) this.audioPlayer.endTurn();
             this.onSystemLog('Force Listen OFF');
         }
     }
 
     pauseToggle() {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        if (!this._sessionReady || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         if (this.pauseState === 'active') {
             this.paused = true;
             this.pauseState = 'paused';
+            // Invalidate already queued inputs before pausing the worker;
+            // otherwise an old input can reach a paused backend and fail.
+            this._cancelCurrentResponse();
+            this._sendControl('session.pause');
             this.onPauseStateChange('paused');
             this.onMetrics({ type: 'state', sessionState: 'Paused' });
             this.onSystemLog('Session paused');
         } else if (this.pauseState === 'paused') {
+            this._sendControl('session.resume');
             this.paused = false;
             this.pauseState = 'active';
             this.onPauseStateChange('active');
@@ -505,7 +675,7 @@ export class RealtimeSession {
 
     stop() {
         this._intentionalClose = true;
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        if (this._sessionReady && this.ws && this.ws.readyState === WebSocket.OPEN) {
             const msg = { type: 'session.close', reason: 'user_stop' };
             this.ws.send(JSON.stringify(msg));
             this._logProtoEvent('client', 'session.close', 'user_stop');
@@ -525,12 +695,22 @@ export class RealtimeSession {
         if (this._cleaned) return;
         this._cleaned = true;
         this._intentionalClose = true;
+        this._sessionReady = false;
         this._startGeneration++;
         this._reconnectGeneration++;
+        const rejectReconnect = this._reconnectReject;
+        this._reconnectReject = null;
+        if (rejectReconnect) rejectReconnect(new Error('Reconnect cancelled by user'));
+        const rejectStartup = this._queueReject;
+        this._queueReject = null;
+        if (rejectStartup) rejectStartup(new Error('Session start cancelled by user'));
         this._clearSessionInitTimer();
         this._clearPendingInputs();
-        this.onCleanup();
+        // Crop cancelled output on its audio clock before the page finalizes
+        // the recording, including when the output context is interrupted.
         this.audioPlayer.stop();
+        this.onCleanup();
+        this.echoReference.reset();
         if (this.ws) {
             this.ws.onclose = null;
             try { this.ws.close(); } catch (_) {}
@@ -541,6 +721,7 @@ export class RealtimeSession {
         this.paused = false;
         this.pauseState = 'active';
         this.forceListenActive = false;
+        this._pendingCancelAcks = 0;
         this.onRunningChange(false);
         this.onForceListenChange(false);
         this.onPauseStateChange('active');
@@ -552,9 +733,11 @@ export class RealtimeSession {
     // ==== Internal ====
 
     _reset() {
+        this._sessionReady = false;
         this._clearSessionInitTimer();
         this._clearPendingInputs();
         this._cleaned = false;
+        this._sessionReady = false;
         this._sessionStartTime = performance.now();
         this._lastListenTime = 0;
         this._wasListening = true;
@@ -565,9 +748,12 @@ export class RealtimeSession {
         this._resultCount = 0;
         this._lastDriftMs = null;
         this._lastKvCacheLength = 0;
+        this._lastKvEngineEpoch = null;
         this._lastFrameMetrics = {};
         this._inputBackpressureUntil = 0;
         this._inputSequence = 0;
+        this._inputAdmissionSequence = 0;
+        this._usesInputCommitted = false;
         this._modelState = 'listening';
         this._autoContinuationUsed = false;
         this.chunksSent = 0;
@@ -576,6 +762,7 @@ export class RealtimeSession {
         this.paused = false;
         this.pauseState = 'active';
         this.forceListenActive = false;
+        this._pendingCancelAcks = 0;
         this._queueReject = null;
         this._eventLog = [];
         this.echoReference.reset();
@@ -615,6 +802,7 @@ export class RealtimeSession {
     }
 
     async _handleTransportClose() {
+        this._sessionReady = false;
         if (this._intentionalClose || !this._started) {
             if (!this._intentionalClose) this.cleanup();
             return;
@@ -629,6 +817,7 @@ export class RealtimeSession {
         this._firstServerTs = 0;
         this._firstClientTs = 0;
         this._lastKvCacheLength = 0;
+        this._lastKvEngineEpoch = null;
         this._lastFrameMetrics = {};
         this._modelState = 'listening';
         this._autoContinuationUsed = false;
@@ -636,11 +825,9 @@ export class RealtimeSession {
         // reconnect creates a new model session rather than continuing the
         // old LLM/TTS KV context. Stop queued old audio and close the visible
         // assistant turn before creating that fresh session.
-        this.audioPlayer.stopAll();
-        if (this.audioPlayer.turnActive) this.audioPlayer.endTurn();
-        if (this._speakHandle) this.onSpeakEnd();
-        this._speakHandle = null;
-        this.currentSpeakText = '';
+        this._stopCurrentSpeech();
+        this._lastListenTime = 0;
+        this._pendingCancelAcks = 0;
         this.onReconnectState('reconnecting');
         this.onMetrics({ type: 'state', sessionState: 'Reconnecting...' });
         this.onSystemLog('Network disconnected — reconnecting…');
@@ -671,6 +858,7 @@ export class RealtimeSession {
                     return;
                 } catch (error) {
                     lastError = error;
+                    this._sessionReady = false;
                     if (this.ws) {
                         this.ws.onclose = null;
                         try { this.ws.close(); } catch (_) {}
@@ -690,25 +878,44 @@ export class RealtimeSession {
     }
 
     async _connectForReconnect(systemPrompt, preparePayload) {
+        this._sessionReady = false;
         const wsUrl = this.config.getWsUrl();
         const ws = new WebSocket(wsUrl);
         this.ws = ws;
         await new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error('WebSocket reconnect timeout')), 10_000);
-            ws.onopen = () => { clearTimeout(timer); resolve(); };
-            ws.onerror = () => { clearTimeout(timer); reject(new Error('WebSocket reconnect failed')); };
-            ws.onclose = () => { clearTimeout(timer); reject(new Error('WebSocket closed during reconnect')); };
+            const fail = error => {
+                clearTimeout(timer);
+                if (this._reconnectReject === fail) this._reconnectReject = null;
+                reject(error);
+            };
+            const timer = setTimeout(() => fail(new Error('WebSocket reconnect timeout')), 10_000);
+            this._reconnectReject = fail;
+            ws.onopen = () => {
+                clearTimeout(timer);
+                if (this._reconnectReject === fail) this._reconnectReject = null;
+                resolve();
+            };
+            ws.onerror = () => fail(new Error('WebSocket reconnect failed'));
+            ws.onclose = () => fail(new Error('WebSocket closed during reconnect'));
         });
+        if (this._intentionalClose || this.ws !== ws) throw new Error('Reconnect cancelled by user');
 
         await new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error('session.init reconnect timeout')), 30_000);
-            ws.onclose = () => {
+            const fail = error => {
                 clearTimeout(timer);
-                reject(new Error('WebSocket closed during session reconnect'));
+                clearTimeout(initTimer);
+                if (this._reconnectReject === fail) this._reconnectReject = null;
+                reject(error);
             };
+            const timer = setTimeout(() => fail(new Error('session.init reconnect timeout')), 30_000);
+            let initTimer = null;
+            this._reconnectReject = fail;
+            ws.onclose = () => fail(new Error('WebSocket closed during session reconnect'));
+            ws.onerror = () => fail(new Error('WebSocket failed during session reconnect'));
             let initSent = false;
             const sendInit = () => {
-                if (initSent || ws.readyState !== WebSocket.OPEN) return;
+                if (initSent || this._intentionalClose || this.ws !== ws
+                    || ws.readyState !== WebSocket.OPEN) return;
                 initSent = true;
                 ws.send(JSON.stringify({
                     type: 'session.init',
@@ -716,6 +923,7 @@ export class RealtimeSession {
                 }));
             };
             ws.onmessage = event => {
+                if (this._intentionalClose || this.ws !== ws) return;
                 let msg;
                 try { msg = JSON.parse(event.data); } catch (_) { return; }
                 if (msg.type === 'session.queued' || msg.type === 'session.queue_update') {
@@ -733,20 +941,25 @@ export class RealtimeSession {
                 }
                 if (msg.type === 'session.created') {
                     clearTimeout(timer);
+                    clearTimeout(initTimer);
+                    if (this._reconnectReject === fail) this._reconnectReject = null;
+                    this._sessionReady = true;
                     this.sessionId = msg.session_id || '';
+                    this._usesInputCommitted = msg.metrics?.backend === 'swift_mlx';
+                    this._lastFrameMetrics = msg.metrics || {};
+                    this._resetKvBaseline(this._lastFrameMetrics);
                     this.recordingSessionId = this.sessionId;
                     this.onMetrics({ type: 'state', sessionId: this.sessionId });
                     resolve();
                     return;
                 }
                 if (msg.type === 'error') {
-                    clearTimeout(timer);
-                    reject(new Error(msg.error?.message || msg.error || 'session.init failed'));
+                    fail(new Error(msg.error?.message || msg.error || 'session.init failed'));
                 }
             };
             // The Swift backend can emit queue_done, while compatibility
             // gateways accept session.init immediately.
-            setTimeout(sendInit, 100);
+            initTimer = setTimeout(sendInit, 100);
         });
 
         ws.onmessage = event => {
@@ -758,12 +971,22 @@ export class RealtimeSession {
 
     _handleMessage(msg) {
         const type = msg.type || '';
-        if (type !== 'response.backpressure' && msg.input_id) {
+        if (type === 'input.committed' || msg.metrics?.backend === 'swift_mlx') {
+            this._usesInputCommitted = true;
+        }
+        const legacyCompletion = !this._usesInputCommitted
+            && (type === 'response.output_audio.delta' || type === 'response.listen'
+                || type === 'response.done'
+                || (type === 'response.output.delta'
+                    && (msg.kind === 'audio' || msg.kind === 'listen' || msg.kind === 'done'))
+                || (type === 'result' && (msg.is_listen || msg.audio_data || msg.end_of_turn)));
+        if ((type === 'input.committed' || legacyCompletion) && msg.input_id) {
             this._recentInputs.delete(msg.input_id);
             // A completed input frees one slot in the client window.  The
             // pending packet is sent on the next turn of the event loop so
             // this handler never recursively processes model output.
             this._schedulePendingInputRetry();
+            this._updateInputFlowControl();
         }
 
         switch (type) {
@@ -799,6 +1022,28 @@ export class RealtimeSession {
                 this._handleOutputDelta(msg);
                 break;
 
+            case 'session.state':
+            case 'backend.state':
+                this._logProtoEvent('server', type,
+                    `reason=${msg.reason || ''}`, msg);
+                if (msg.reason === 'interrupt' || msg.reason === 'reset') {
+                    const isCancelAck = msg.reason === 'interrupt' && this._awaitingCancelAck;
+                    if (isCancelAck) this._pendingCancelAcks--;
+                    // Interrupt rollback and reset can shorten KV without a
+                    // sliding window. Do not compare the new timeline with
+                    // the provisional cache from the cancelled generation.
+                    this._lastFrameMetrics = msg.metrics || {};
+                    this._resetKvBaseline(msg.metrics || msg);
+                    // Local cancellation already cleared the previous queue.
+                    // Audio captured while waiting for its ACK belongs to the
+                    // fresh timeline and must not be discarded by that ACK.
+                    if (!isCancelAck) this._clearPendingInputs();
+                    this._stopCurrentSpeech();
+                    this._handleListen(msg, { autoContinue: false });
+                    this._schedulePendingInputRetry();
+                }
+                break;
+
             case 'session.closed':
                 this._logProtoEvent('server', 'session.closed',
                     `reason=${msg.reason}`, msg);
@@ -815,11 +1060,16 @@ export class RealtimeSession {
                 break;
 
             case 'response.backpressure': {
+                if (this.paused || this._awaitingCancelAck || this._intentionalClose) break;
                 const retryAfter = Number(msg.retry_after_ms) || 250;
                 this._inputBackpressureUntil = Math.max(
                     this._inputBackpressureUntil,
                     performance.now() + Math.max(100, retryAfter));
                 const rejectedID = msg.input_id || '';
+                if (!rejectedID && this._recentInputs.size > 1) {
+                    this._pauseInputTimeline('Input rejection did not identify which audio packet was refused');
+                    break;
+                }
                 const tracked = rejectedID
                     ? (() => {
                         const entry = this._recentInputs.get(rejectedID);
@@ -830,12 +1080,17 @@ export class RealtimeSession {
                 const rejected = tracked?.entry || null;
                 const retryID = tracked?.inputID || rejectedID;
                 if (rejected) {
+                    if (rejected.sequence < this._lastSubmittedInputSequence) {
+                        this._pauseInputTimeline(`Input ${retryID || '?'} was refused after later audio was submitted`);
+                        break;
+                    }
                     const retryEntry = { ...rejected, retries: rejected.retries + 1 };
                     if (retryEntry.retries <= 8) {
-                        this._queuePendingInput(retryEntry, true);
+                        if (!this._queuePendingInput(retryEntry)) break;
                         this._schedulePendingInputRetry();
                     } else {
-                        this.onSystemLog(`Input ${retryID || '?'} dropped after 8 bounded retries`);
+                        this._pauseInputTimeline(`Input ${retryID || '?'} could not be admitted after 8 retries`);
+                        break;
                     }
                 }
                 this._logProtoEvent('server', 'response.backpressure',
@@ -897,12 +1152,14 @@ export class RealtimeSession {
             return;
         }
         if (msg && (msg.kv_cache_length !== undefined || msg.wall_clock_ms !== undefined || msg.generate_ms !== undefined)) {
-            this._lastFrameMetrics = {
-                ...this._lastFrameMetrics,
-                kv_cache_length: msg.kv_cache_length,
-                wall_clock_ms: msg.wall_clock_ms,
-                generate_ms: msg.generate_ms,
-            };
+            this._lastFrameMetrics = { ...this._lastFrameMetrics };
+            for (const key of [
+                'kv_cache_length', 'wall_clock_ms', 'generate_ms', 'backend',
+                'engine_epoch', 'sliding_window_mode',
+                'sliding_window_high_watermark', 'sliding_window_low_watermark',
+            ]) {
+                if (msg[key] !== undefined) this._lastFrameMetrics[key] = msg[key];
+            }
         }
     }
 
@@ -931,7 +1188,12 @@ export class RealtimeSession {
     }
 
     /** Handle new protocol response.listen */
-    _handleListen(msg) {
+    _handleListen(msg, { autoContinue = true } = {}) {
+        const modelInterrupted = msg.reason === 'model_barge_in'
+            || msg.reason === 'model_interrupted';
+        // The runtime accepted an interruption during an answer or its tail. Stop
+        // its unheard output while retaining the user's new input timeline.
+        if (modelInterrupted) this._stopCurrentSpeech();
         this._applyFrameMetrics(msg);
         const recvTime = performance.now();
         this._resultCount++;
@@ -946,7 +1208,7 @@ export class RealtimeSession {
             kv_cache_length: this._lastFrameMetrics.kv_cache_length,
         };
 
-        this._checkKvCache(result);
+        this._checkKvCache({ ...this._lastFrameMetrics, ...result });
         this._emitMetrics(result, recvTime);
 
         const completedText = this.currentSpeakText;
@@ -959,12 +1221,13 @@ export class RealtimeSession {
         this.onListenResult(result);
         this.onExtraResult(result, recvTime);
         this._lastResultTime = recvTime;
-        this._maybeAutoContinue(completedText);
+        if (autoContinue && !modelInterrupted) this._maybeAutoContinue(completedText);
     }
 
     _maybeAutoContinue(completedText) {
         const text = taskContinuationForAssistantText(completedText);
-        if (!text || this._autoContinuationUsed || this.paused || this._intentionalClose) return;
+        if (!text || !this._sessionReady || this._autoContinuationUsed || this.paused
+            || this.forceListenActive || this._awaitingCancelAck || this._intentionalClose) return;
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
         this._autoContinuationUsed = true;
@@ -978,7 +1241,7 @@ export class RealtimeSession {
                 allow_sampled_listen_speak_decision: true,
             },
         };
-        this._submitInput({ event, priority: 2, retries: 0 });
+        this._submitInput({ event, retries: 0 });
         this._modelState = 'waiting_response';
         this.onAutoContinuation(text);
         this.onSystemLog('Continuing the requested story...');
@@ -987,6 +1250,11 @@ export class RealtimeSession {
     /** Handle new protocol response.output_audio.delta */
     _handleSpeak(msg) {
         this._applyFrameMetrics(msg);
+        // A listen clock marker is not speech. AudioContext time advances
+        // without a source, so queuing this PCM would insert a one-second
+        // pause ahead of the next answer and corrupt TTFS/UI statistics.
+        if (msg.silent === true || this._intentionalClose || this.paused || this.forceListenActive
+            || this._awaitingCancelAck) return;
         const recvTime = performance.now();
         this._resultCount++;
         this._modelState = msg.end_of_turn ? 'end_of_turn' : 'speaking';
@@ -1003,8 +1271,10 @@ export class RealtimeSession {
                 msg.audio,
                 recvTime,
                 msg.metrics?.wall_clock_ms ?? this._lastFrameMetrics.wall_clock_ms,
-                msg.metrics?.audio_padding_samples
-                    ?? this._lastFrameMetrics.audio_padding_samples,
+                // Padding describes this packet only. Reusing the previous
+                // frame's metrics would trim real speech from a later packet
+                // whose optional metrics are absent.
+                msg.metrics?.audio_padding_samples,
             );
         }
 
@@ -1016,7 +1286,7 @@ export class RealtimeSession {
             kv_cache_length: this._lastFrameMetrics.kv_cache_length,
         };
 
-        this._checkKvCache(result);
+        this._checkKvCache({ ...this._lastFrameMetrics, ...result });
         this._emitMetrics(result, recvTime);
 
         if (result.text) {
@@ -1036,10 +1306,12 @@ export class RealtimeSession {
     _handleResultCompat(result) {
         if (result.is_listen) {
             this._handleListen({
+                ...result,
                 kv_cache_length: result.kv_cache_length,
             });
         } else {
             this._handleSpeak({
+                ...result,
                 text: result.text,
                 audio: result.audio_data,
                 end_of_turn: result.end_of_turn,
@@ -1073,7 +1345,7 @@ export class RealtimeSession {
         this._lastFrameMetrics = metrics || {};
         const maxKv = this.config.getMaxKvTokens();
         const kvCacheLength = this._lastFrameMetrics.kv_cache_length;
-        this._checkKvCache({ kv_cache_length: kvCacheLength });
+        this._checkKvCache(this._lastFrameMetrics);
         this.onMetrics({
             type: 'result',
             latencyMs: this._lastFrameMetrics.wall_clock_ms || this._lastFrameMetrics.generate_ms,
@@ -1087,14 +1359,38 @@ export class RealtimeSession {
         });
     }
 
+    _resetKvBaseline(metrics = {}) {
+        this._lastKvCacheLength = Number.isFinite(metrics.kv_cache_length)
+            ? Math.max(0, metrics.kv_cache_length) : 0;
+        this._lastKvEngineEpoch = Number.isFinite(metrics.engine_epoch)
+            ? metrics.engine_epoch : null;
+    }
+
     _checkKvCache(result) {
         const maxKv = this.config.getMaxKvTokens();
         const curKv = result.kv_cache_length;
-        if (curKv !== undefined && curKv > 0) {
+        if (Number.isFinite(curKv) && curKv >= 0) {
+            const epoch = Number.isFinite(result.engine_epoch) ? result.engine_epoch : null;
+            const native = this._usesInputCommitted || result.backend === 'swift_mlx';
+            const sameEpoch = epoch !== null
+                ? epoch === this._lastKvEngineEpoch
+                : !native && this._lastKvEngineEpoch === null;
+            // Cache decreases also occur during ordinary rollback. The
+            // native backend exposes window mode, watermarks and epoch, but
+            // no pruning counter: only a basic-window high-to-low transition
+            // in the same generation is sufficient evidence here. Context
+            // windows cannot be inferred from a decrease alone.
+            const basicWindowPruned = result.sliding_window_mode === 'basic'
+                && Number.isFinite(result.sliding_window_high_watermark)
+                && Number.isFinite(result.sliding_window_low_watermark)
+                && result.sliding_window_high_watermark > result.sliding_window_low_watermark
+                && this._lastKvCacheLength >= result.sliding_window_high_watermark
+                && curKv <= result.sliding_window_low_watermark
+                && curKv < this._lastKvCacheLength && sameEpoch;
             if (curKv >= maxKv) {
                 this.onSystemLog(`⚠ KV cache (${curKv.toLocaleString()}) reached limit. Auto-stopping.`);
                 setTimeout(() => this.stop(), 0);
-            } else if (this._lastKvCacheLength > 0 && curKv < this._lastKvCacheLength) {
+            } else if (basicWindowPruned) {
                 const prev = this._lastKvCacheLength;
                 this.onSystemLog(`✂ KV pruned: ${prev.toLocaleString()} → ${curKv.toLocaleString()}`);
                 if (this.config.getStopOnSlidingWindow()) {
@@ -1103,6 +1399,7 @@ export class RealtimeSession {
                 }
             }
             this._lastKvCacheLength = curKv;
+            this._lastKvEngineEpoch = epoch;
         }
     }
 

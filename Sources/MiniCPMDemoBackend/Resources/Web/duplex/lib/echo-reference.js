@@ -53,14 +53,13 @@ export class FarEndEchoReference {
             this.sampleRate,
             Math.round((options.historyMs || 2000) / 1000 * this.sampleRate),
         );
-        this._farEnd = new Float32Array(0);
-        this._lastPlaybackAt = 0;
+        this._segments = [];
+        this._maxDelayMs = 200;
         this._last = null;
     }
 
     reset() {
-        this._farEnd = new Float32Array(0);
-        this._lastPlaybackAt = 0;
+        this._segments = [];
         this._last = null;
     }
 
@@ -68,13 +67,72 @@ export class FarEndEchoReference {
     pushPlayback(samples, sampleRate = this.sampleRate, timestamp = performance.now()) {
         const normalized = resampleLinear(samples, sampleRate, this.sampleRate);
         if (normalized.length === 0) return;
-        const joined = new Float32Array(this._farEnd.length + normalized.length);
-        joined.set(this._farEnd);
-        joined.set(normalized, this._farEnd.length);
-        this._farEnd = joined.length > this.maxSamples
-            ? joined.slice(joined.length - this.maxSamples)
-            : joined;
-        this._lastPlaybackAt = timestamp;
+        if (!Number.isFinite(timestamp)) return;
+        this._segments.push({
+            start: timestamp,
+            end: timestamp + normalized.length / this.sampleRate * 1000,
+            samples: Float32Array.from(normalized),
+        });
+    }
+
+    _alignedReference(mic, timestamp) {
+        const durationMs = mic.length / this.sampleRate * 1000;
+        const oldest = timestamp - durationMs - this._maxDelayMs
+            - this.maxSamples / this.sampleRate * 1000;
+        this._segments = this._segments.filter(segment => segment.end > oldest);
+        const delaySamples = Math.round(this._maxDelayMs / 1000 * this.sampleRate);
+        const start = timestamp - durationMs - this._maxDelayMs;
+        const timeline = new Float32Array(mic.length + delaySamples);
+        const covered = new Uint8Array(timeline.length);
+        // Build the time-aligned history once, then inspect cheap views for
+        // each delay. Reconstructing it per candidate stalls the capture UI.
+        for (const segment of this._segments) {
+            if (segment.start >= timestamp || segment.end <= start) continue;
+            const first = Math.max(0, Math.ceil((segment.start - start) * this.sampleRate / 1000 - 1e-6));
+            const end = Math.min(timeline.length, Math.ceil((segment.end - start) * this.sampleRate / 1000 - 1e-6));
+            const offset = (start - segment.start) * this.sampleRate / 1000;
+            for (let i = first; i < end; i++) {
+                const position = Math.max(0, offset + i);
+                const left = Math.min(segment.samples.length - 1, Math.floor(position));
+                const right = Math.min(segment.samples.length - 1, left + 1);
+                timeline[i] = segment.samples[left]
+                    + (segment.samples[right] - segment.samples[left]) * (position - left);
+                covered[i] = 1;
+            }
+        }
+        const missing = new Uint32Array(timeline.length + 1);
+        for (let i = 0; i < timeline.length; i++) missing[i + 1] = missing[i] + (1 - covered[i]);
+        let best = { far: new Float32Array(0), correlation: 0, delayMs: null };
+        // Timestamp is the END of the captured mic chunk; playback timestamps
+        // are the START of scheduled sources. Only a complete past window can
+        // suppress input. Uncertain timing/coverage leaves browser AEC in charge.
+        for (let delayMs = 0; delayMs <= this._maxDelayMs; delayMs += 10) {
+            const first = delaySamples - Math.round(delayMs / 1000 * this.sampleRate);
+            const end = first + mic.length;
+            if (mic.length === 0 || missing[end] !== missing[first]) continue;
+            const far = timeline.subarray(first, end);
+            const correlation = normalizedCorrelation(mic, far);
+            if (best.delayMs === null || correlation > best.correlation) {
+                best = { far, correlation, delayMs };
+            }
+        }
+        return best;
+    }
+
+    _analyze(mic, timestamp) {
+        const aligned = this._alignedReference(mic, timestamp);
+        const micRms = rms(mic);
+        const farRms = rms(aligned.far);
+        const { correlation, delayMs } = aligned;
+        const suppressionSuggested = delayMs !== null && farRms > 0.01 && correlation > 0.55;
+        const diagnostics = {
+            micRms, farRms, correlation,
+            playbackAgeMs: delayMs,
+            referenceAligned: delayMs !== null,
+            suppressionSuggested,
+        };
+        this._last = diagnostics;
+        return { ...aligned, diagnostics };
     }
 
     /**
@@ -84,27 +142,7 @@ export class FarEndEchoReference {
      */
     analyzeInput(samples, sampleRate = this.sampleRate, timestamp = performance.now()) {
         const mic = resampleLinear(samples, sampleRate, this.sampleRate);
-        const far = this._farEnd.slice(Math.max(0, this._farEnd.length - mic.length));
-        const micRms = rms(mic);
-        const farRms = rms(far);
-        const correlation = normalizedCorrelation(mic, far);
-        const playbackAgeMs = this._lastPlaybackAt > 0
-            ? Math.max(0, timestamp - this._lastPlaybackAt)
-            : null;
-        // A strong positive correlation while playback is recent is a useful
-        // warning, but the browser's AEC and the model still receive `mic`.
-        const suppressionSuggested = farRms > 0.01
-            && correlation > 0.55
-            && (playbackAgeMs === null || playbackAgeMs < 1500);
-        const result = {
-            micRms,
-            farRms,
-            correlation,
-            playbackAgeMs,
-            suppressionSuggested,
-        };
-        this._last = result;
-        return result;
+        return this._analyze(mic, timestamp).diagnostics;
     }
 
     /**
@@ -118,9 +156,8 @@ export class FarEndEchoReference {
             return { samples, diagnostics: this.analyzeInput(samples, sampleRate, timestamp) };
         }
         const mic = resampleLinear(samples, sampleRate, this.sampleRate);
-        const diagnostics = this.analyzeInput(samples, sampleRate, timestamp);
-        const far = this._farEnd.slice(Math.max(0, this._farEnd.length - mic.length));
-        if (!diagnostics.suppressionSuggested || far.length !== mic.length) {
+        const { diagnostics, far } = this._analyze(mic, timestamp);
+        if (!diagnostics.suppressionSuggested || sampleRate !== this.sampleRate) {
             return { samples, diagnostics, suppressed: false, gain: 0 };
         }
 
@@ -142,9 +179,7 @@ export class FarEndEchoReference {
         }
         const residualRms = Math.sqrt(residualEnergy / Math.max(1, filtered.length));
         const accepted = residualRms <= diagnostics.micRms * 1.05;
-        const output = accepted && sampleRate === this.sampleRate
-            ? filtered
-            : samples;
+        const output = accepted ? filtered : samples;
         return {
             samples: output,
             diagnostics: { ...diagnostics, echoSuppressed: accepted, echoGain: gain, residualRms },

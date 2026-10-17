@@ -39,14 +39,14 @@ public struct MiniCPMDuplexConfig: Sendable, Equatable {
     public var forceListenCount: Int
     public var listenProbabilityScale: Float
     public var listenTopK: Int?
-    /// Make only the leading listen/speak decision deterministic while the
-    /// model is between turns. A per-input recent-speech override may restore
-    /// the official sampled decision without changing text generation.
+    /// Make only the leading listen/speak decision deterministic between turns
+    /// or while speech permits a model barge-in. A per-input recent-speech
+    /// override may restore sampling without changing text generation.
     public var greedyListenSpeakDecision: Bool
     public var repetitionPenalty: Float
     public var repetitionWindowSize: Int
-    /// Penalty applied to protocol terminators after the natural chunk-EOS
-    /// probe (official MiniCPM default: 1.1).
+    /// Compatibility control for chat-style terminator shaping. Native
+    /// duplex follows StreamDecoder and does not apply this penalty.
     public var lengthPenalty: Float
     /// Semantic TTS has an independent sampler in the official duplex
     /// runtime; do not inherit the text-head temperature by accident.
@@ -865,15 +865,19 @@ public actor MiniCPMDuplexRuntime {
         // immediately so the next microphone chunk can enter the session;
         // only spoken output keeps the deferred-finalize transaction open.
         if output.isListen && output.needsFinalize {
-            try session.engine.finalize()
-            session.prefetched = false
-            session.needsFinalize = false
+            session.needsFinalize = true
+            try finalize(sessionID: sessionID)
+            if session.interrupted {
+                return MiniCPMDuplexOutput(
+                    isListen: true, needsFinalize: false, finishReason: "interrupt")
+            }
         } else {
             session.needsFinalize = output.needsFinalize
         }
         return MiniCPMDuplexOutput(
             text: output.text,
             audio: output.audio,
+            audioPaddingSamples: output.audioPaddingSamples,
             isListen: output.isListen,
             endOfTurn: output.endOfTurn,
             needsFinalize: output.needsFinalize && !output.isListen,
@@ -883,6 +887,28 @@ public actor MiniCPMDuplexRuntime {
     public func finalize(sessionID: String = "default") throws {
         let session = try requireSession(sessionID)
         guard session.needsFinalize else { return }
+        guard interruptionRegistry.isCurrent(
+            sessionID: sessionID, epoch: session.generationEpoch) else {
+            // Cancellation can arrive after the transport's epoch check but
+            // before this actor receives its deferred acceptance. Repair the
+            // provisional unit here rather than committing stale output.
+            session.staleOutputDiscardCount &+= 1
+            session.lastCancelRequestedAtNS =
+                interruptionRegistry.lastRequestAtNS(sessionID: sessionID)
+                    ?? DispatchTime.now().uptimeNanoseconds
+            defer {
+                session.interrupted = true
+                session.needsFinalize = false
+                session.prefetched = false
+                session.generationEpoch = interruptionRegistry.current(sessionID: sessionID)
+                    ?? session.generationEpoch
+                session.engine.setGenerationEpoch(session.generationEpoch)
+                session.lastCancelReturnedAtNS = DispatchTime.now().uptimeNanoseconds
+            }
+            session.engine.interrupt()
+            try session.engine.rollback()
+            return
+        }
         try session.engine.finalize()
         session.needsFinalize = false
         session.prefetched = false

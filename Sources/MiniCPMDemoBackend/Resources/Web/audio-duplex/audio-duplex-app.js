@@ -139,6 +139,47 @@ function sendTimelineInput(activity, rawSamples = activity.samples) {
     return true;
 }
 
+// Input flow control leaves the model and output player running while the
+// bounded FIFO drains. Suspend the source context to preserve partial capture
+// and file position; restarting the worklet would discard its partial packet.
+function syncInputCaptureFlow() {
+    if (!session || !session._sessionReady) return;
+    const held = session.inputFlowHeld || session.paused;
+    if (media) {
+        if (held) media.pause();
+        else media.resume();
+    }
+    if (audioCtxIn && audioCtxIn.state !== 'closed') {
+        const operation = held ? audioCtxIn.suspend() : audioCtxIn.resume();
+        operation.catch(err => addSystemLog(`Input capture: ${err.message}`));
+    }
+    if (session.running) {
+        setStatusLamp(held ? 'preparing' : 'live');
+        if (session.inputFlowHeld && !session.paused) {
+            const label = document.querySelector('#statusLamp .label');
+            if (label) label.textContent = currentMode === 'live'
+                ? 'Processing — mic paused' : 'Processing — file paused';
+        }
+    }
+}
+
+function syncRecorderInputFlow() {
+    if (session && (!session._sessionReady || session.inputFlowHeld || media?._waitingForInputDrain)) {
+        sessionRecorder?.pauseInputCapture();
+    } else {
+        sessionRecorder?.resumeInputCapture();
+    }
+}
+
+function resetLiveCaptureTimeline() {
+    liveInputTimeline.reset();
+    if (captureNodeLive) {
+        captureNodeLive._captureEpoch = (captureNodeLive._captureEpoch || 0) + 1;
+        captureNodeLive.port.postMessage({ command: 'start', captureEpoch: captureNodeLive._captureEpoch });
+    }
+    media?.resetCaptureTimeline?.();
+}
+
 function buildDuplexSystemPrompt(value) {
     return String(value || '').trim();
 }
@@ -398,20 +439,28 @@ class FileAudioProvider {
         this._objectUrl = null;
 
         this.onChunk = null;
+        this.onReady = null;
         this.onEnd = null;
         this.getResponseState = null;
         this.getPlaybackActive = null;
+        this.getInputPending = null;
+        this.canResumeInput = null;
+        this.onInputHoldChange = null;
+        this._waitingForInputDrain = false;
         this.running = false;
         this.paused = false;
+        this._aborted = false;
         this._padBeforeTimer = null;
         this._responseDrain = new FileResponseDrain();
     }
 
     async start() {
+        this._assertNotAborted();
         addSystemLog('Processing audio file...');
 
         // 1. Get duration
         const rawDuration = await this._getAudioDuration();
+        this._assertNotAborted();
         const cappedDuration = Math.min(rawDuration, FILE_MAX_DURATION);
         this._mainChunks = Math.max(1, Math.ceil(cappedDuration));
         if (rawDuration > FILE_MAX_DURATION) {
@@ -420,10 +469,12 @@ class FileAudioProvider {
 
         // 2. Decode file audio and normalize
         await this._decodeFileAudio(cappedDuration);
+        this._assertNotAborted();
 
         // 3. Setup mic (mixed mode)
         if (this._audioMode === 'mixed') {
             await this._setupMic();
+            this._assertNotAborted();
         }
 
         // 4. Phase boundaries
@@ -440,6 +491,8 @@ class FileAudioProvider {
         // 5. Prepare playback element (user hears the original file audio)
         this._objectUrl = URL.createObjectURL(this._file);
         this._audioEl.src = this._objectUrl;
+        if (this.onReady) await this.onReady();
+        this._assertNotAborted();
 
         // 6. Start feeding
         this._chunkIdx = 0;
@@ -456,6 +509,10 @@ class FileAudioProvider {
         }
     }
 
+    _assertNotAborted() {
+        if (this._aborted) throw new Error('Media preparation cancelled');
+    }
+
     // ==================== File-only mode: unified timer ====================
 
     _buildPaddedArrays() {
@@ -469,13 +526,8 @@ class FileAudioProvider {
 
     _feedNext() {
         if (!this.running || this.paused) return;
-        // Cadence probe. The duplex contract needs a 1 Hz input feed, and the
-        // self-correcting timer below (`CHUNK_MS - elapsed`) should hold it.
-        // Server-side stage timings are flat (~762 ms/unit) while the measured
-        // gap between the server's audio deltas grows to ~1.4 s late in a
-        // session, so the surplus has to be browser-side. This logs only
-        // actual slips, at most one line every 3 s, so the cause can be
-        // attributed instead of guessed at.
+        // Observe active file cadence; resume resets this baseline because a
+        // deliberate processing hold is not a missed one-second timer.
         const probeNow = performance.now();
         if (this._lastFeedAt != null) {
             const delta = probeNow - this._lastFeedAt;
@@ -488,12 +540,29 @@ class FileAudioProvider {
         }
         this._lastFeedAt = probeNow;
         if (this._chunkIdx >= this._grandTotal) {
+            // EOF cannot end a session whose final file packets are still in
+            // the model queue. Poll without adding silence until their output
+            // is available; response-drain grace must count processed input.
+            if (this.getInputPending?.()) {
+                if (!this._waitingForInputDrain) {
+                    this._waitingForInputDrain = true;
+                    this.onInputHoldChange?.();
+                }
+                this._timer = setTimeout(() => this._feedNext(), CHUNK_MS);
+                return;
+            }
+            if (this._waitingForInputDrain) {
+                this._waitingForInputDrain = false;
+                this.onInputHoldChange?.();
+            }
             if (this._continueResponseDrain()) {
                 const t0 = performance.now();
                 this._chunkIdx++;
                 if (this.onChunk) this.onChunk({ audio: new Float32Array(SAMPLE_RATE_IN) });
                 const elapsed = performance.now() - t0;
-                this._timer = setTimeout(() => this._feedNext(), Math.max(0, CHUNK_MS - elapsed));
+                if (this.running && !this.paused) {
+                    this._timer = setTimeout(() => this._feedNext(), Math.max(0, CHUNK_MS - elapsed));
+                }
                 return;
             }
             this.running = false;
@@ -510,14 +579,16 @@ class FileAudioProvider {
         this._chunkIdx++;
         if (this.onChunk) this.onChunk({ audio });
         const elapsed = performance.now() - t0;
-        this._timer = setTimeout(() => this._feedNext(), Math.max(0, CHUNK_MS - elapsed));
+        if (this.running && !this.paused) {
+            this._timer = setTimeout(() => this._feedNext(), Math.max(0, CHUNK_MS - elapsed));
+        }
     }
 
     // ==================== Mixed mode: phased feeding ====================
 
     async _setupMic() {
         const _micId = adxDeviceSelector.getSelectedMicId();
-        this._micStream = await navigator.mediaDevices.getUserMedia({
+        const stream = await navigator.mediaDevices.getUserMedia({
             // Keep the browser's hardware AEC in the capture path.  Full
             // duplex must continue sending mic frames while the model speaks;
             // this is mitigation, not a speaker-energy gate.
@@ -530,11 +601,19 @@ class FileAudioProvider {
             },
             video: false,
         });
+        if (this._aborted) {
+            stream.getTracks().forEach(track => track.stop());
+            this._assertNotAborted();
+        }
+        this._micStream = stream;
 
-        this._micCtx = new AudioContext({ sampleRate: SAMPLE_RATE_IN });
-        if (this._micCtx.state === 'suspended') await this._micCtx.resume();
+        const context = new AudioContext({ sampleRate: SAMPLE_RATE_IN });
+        this._micCtx = context;
+        if (context.state === 'suspended') await context.resume();
+        this._assertNotAborted();
 
-        await this._micCtx.audioWorklet.addModule('/static/duplex/lib/capture-processor.js');
+        await context.audioWorklet.addModule('/static/duplex/lib/capture-processor.js');
+        this._assertNotAborted();
 
         this._micSource = this._micCtx.createMediaStreamSource(this._micStream);
 
@@ -607,11 +686,12 @@ class FileAudioProvider {
         // Wire chunk handler
         this._captureNode.port.onmessage = (e) => {
             if (e.data.type === 'chunk') {
+                if (e.data.captureEpoch !== this._captureEpoch) return;
                 this._handleMicChunk(e.data.audio);
             }
         };
 
-        this._captureNode.port.postMessage({ command: 'start' });
+        this.resetCaptureTimeline();
         this._fileSrcNode.start();
         this._fileSrcNode.onended = () => addSystemLog('File audio in graph completed');
 
@@ -664,6 +744,36 @@ class FileAudioProvider {
         // During padding: file audio = zero → mix = mic only
         // During main:    file audio = real → mix = mic + file
         if (this._chunkIdx >= this._grandTotal) {
+            if (this._waitingForInputDrain) {
+                // The worklet may already have posted another complete packet
+                // when suspension was requested. Keep that audio in the FIFO.
+                this._chunkIdx++;
+                if (this.onChunk) this.onChunk({ audio: mixedAudio });
+                return;
+            }
+            if (this.getInputPending?.()) {
+                // Freeze the mixed graph at EOF while earlier packets finish,
+                // then make the response-drain decision with current output.
+                this._chunkIdx++;
+                if (this.onChunk) this.onChunk({ audio: mixedAudio });
+                this._waitingForInputDrain = true;
+                this.onInputHoldChange?.();
+                this.pause();
+                const poll = () => {
+                    this._timer = null;
+                    if (!this.running || !this._waitingForInputDrain) return;
+                    if (this.getInputPending?.() || this.canResumeInput?.() === false) {
+                        this._timer = setTimeout(poll, CHUNK_MS);
+                        return;
+                    }
+                    this._waitingForInputDrain = false;
+                    this.onInputHoldChange?.();
+                    this._handleMicChunk(new Float32Array(SAMPLE_RATE_IN));
+                    if (this.running && this.canResumeInput?.() !== false) this.resume();
+                };
+                this._timer = setTimeout(poll, CHUNK_MS);
+                return;
+            }
             if (this._continueResponseDrain()) {
                 this._micChunkCount++;
                 this._chunkIdx++;
@@ -792,6 +902,12 @@ class FileAudioProvider {
         });
     }
 
+    resetCaptureTimeline() {
+        if (!this._captureNode) return;
+        this._captureEpoch = (this._captureEpoch || 0) + 1;
+        this._captureNode.port.postMessage({ command: 'start', captureEpoch: this._captureEpoch });
+    }
+
     pause() {
         if (!this.running || this.paused) return;
         this.paused = true;
@@ -800,8 +916,8 @@ class FileAudioProvider {
         // Cancel pending padBefore timer (delayed HTML play)
         if (this._padBeforeTimer) { clearTimeout(this._padBeforeTimer); this._padBeforeTimer = null; }
         // Mixed: suspend AudioContext (freezes entire graph — mic, file buffer, capture)
-        if (this._micCtx && this._micCtx.state === 'running') {
-            this._micCtx.suspend();
+        if (this._micCtx && this._micCtx.state !== 'closed') {
+            this._micCtx.suspend()?.catch(err => addSystemLog(`Input capture: ${err.message}`));
         }
         // Pause speaker output
         if (!this._audioEl.paused) this._audioEl.pause();
@@ -810,7 +926,9 @@ class FileAudioProvider {
 
     resume() {
         if (!this.running || !this.paused) return;
+        if (this._waitingForInputDrain && this._audioMode !== 'file') return;
         this.paused = false;
+        this._lastFeedAt = null;
         if (this._audioMode === 'file') {
             // File-only: restart the timer and HTML element
             if (this._chunkIdx >= this._mainStart && this._chunkIdx < this._grandTotal) {
@@ -819,8 +937,8 @@ class FileAudioProvider {
             this._feedNext();
         } else {
             // Mixed: resume AudioContext (unfreezes entire graph)
-            if (this._micCtx && this._micCtx.state === 'suspended') {
-                this._micCtx.resume();
+            if (this._micCtx && this._micCtx.state !== 'closed') {
+                this._micCtx.resume()?.catch(err => addSystemLog(`Input capture: ${err.message}`));
             }
             // Resume or schedule HTML audio playback
             if (this._chunkIdx < this._mainStart) {
@@ -838,8 +956,10 @@ class FileAudioProvider {
     }
 
     stop() {
+        this._aborted = true;
         this.running = false;
         this.paused = false;
+        this._waitingForInputDrain = false;
         if (this._timer) { clearTimeout(this._timer); this._timer = null; }
         if (this._padBeforeTimer) { clearTimeout(this._padBeforeTimer); this._padBeforeTimer = null; }
         this._disconnectMic();
@@ -854,10 +974,12 @@ class FileAudioProvider {
         this._fileSrcNode = null;
         this._micSource = null;
         this._graphConnected = false;
-        this._audioEl.muted = false;
-        this._audioEl.volume = 1.0;
-        this._audioEl.pause();
-        this._audioEl.src = '';
+        if (this._objectUrl && this._audioEl.src === this._objectUrl) {
+            this._audioEl.muted = false;
+            this._audioEl.volume = 1.0;
+            this._audioEl.pause();
+            this._audioEl.src = '';
+        }
         if (this._objectUrl) { URL.revokeObjectURL(this._objectUrl); this._objectUrl = null; }
     }
 }
@@ -957,6 +1079,7 @@ async function startSession() {
     }
 
     session = new RealtimeSession('adx', {
+        enableInputFlowControl: true,
         getMaxKvTokens: () => parseInt(document.getElementById('maxKvTokens').value, 10) || 8192,
         getPlaybackDelayMs: () => parseInt(document.getElementById('playbackDelay').value, 10) || 200,
         outputSampleRate: SAMPLE_RATE_OUT,
@@ -966,6 +1089,9 @@ async function startSession() {
             return window.ClientIdentity ? window.ClientIdentity.appendToUrl(url) : url;
         },
     });
+    const ownerSession = session;
+    const ownerMedia = media;
+    const ownerMode = currentMode;
 
     setStatusLamp('preparing');
     document.getElementById('lampTimer').textContent = '';
@@ -986,20 +1112,36 @@ async function startSession() {
         media?.continueAfterAutoContinuation?.();
     };
     session.onRunningChange = (running) => setDuplexButtonStates(running);
-    session.onPauseStateChange = (state) => {
-        setDefaultPauseBtnState(state);
-        if (session && session.running) {
-            if (state === 'active') setStatusLamp('live');
-            else if (state === 'paused') setStatusLamp('preparing');
+    session.onInputFlowChange = (state) => {
+        syncRecorderInputFlow();
+        syncInputCaptureFlow();
+    };
+    session.onReconnectState = (state) => {
+        if (state === 'connected') {
+            resetLiveCaptureTimeline();
+            syncRecorderInputFlow();
+            syncInputCaptureFlow();
+        } else if (state === 'reconnecting') {
+            syncRecorderInputFlow();
+            // The old capture clock must stop while a new session prepares.
+            media?.pause();
+            if (audioCtxIn && audioCtxIn.state !== 'closed') {
+                audioCtxIn.suspend().catch(err => addSystemLog(`Input capture: ${err.message}`));
+            }
         }
-        // Pause/resume media provider and recording to keep timeline aligned
+    };
+    session.onPauseStateChange = (state) => {
+        if (!session?.running) return;
+        setDefaultPauseBtnState(state);
+        // File resume emits its first packet synchronously. Restore recording
+        // before reopening capture so that packet is present in both timelines.
         if (state === 'paused' || state === 'pausing') {
-            if (media && media.pause) media.pause();
             if (sessionRecorder && sessionRecorder.pause) sessionRecorder.pause();
         } else if (state === 'active') {
-            if (media && media.resume) media.resume();
+            resetLiveCaptureTimeline();
             if (sessionRecorder && sessionRecorder.resume) sessionRecorder.resume();
         }
+        syncInputCaptureFlow();
     };
     session.onQueueUpdate = (data) => {
         const lamp = document.getElementById('statusLamp');
@@ -1036,6 +1178,7 @@ async function startSession() {
     };
     session.onForceListenChange = (active) => setDefaultForceListenBtnState(active);
     session.onCleanup = () => {
+        if (session !== ownerSession) return;
         _duplexCountdown.stop();
         if (_stopDingDong) { _stopDingDong(); _stopDingDong = null; }
         _queuePhase = null;
@@ -1110,31 +1253,51 @@ async function startSession() {
             session.audioPlayer.onRawAudio = (samples, sr, ts) => {
                 if (sessionRecorder) sessionRecorder.pushRight(samples, sr, ts);
             };
+            session.audioPlayer.onPlaybackCancel = ts => sessionRecorder?.cancelRight(ts);
         }
 
         await session.start(
             buildDuplexSystemPrompt(document.getElementById('systemPrompt').value),
             preparePayload,
-            currentMode === 'live' ? startMicrophone : async () => {
+            async () => {
+                if (session !== ownerSession || media !== ownerMedia) {
+                    throw new Error('Media preparation cancelled');
+                }
+                if (ownerMode === 'live') {
+                    await startMicrophone(ownerSession);
+                    return;
+                }
+                media.onReady = () => {
+                    if (session !== ownerSession || media !== ownerMedia) {
+                        throw new Error('Media preparation cancelled');
+                    }
+                    sessionRecorder?.start();
+                };
                 media.onChunk = (chunk) => {
                     const activity = liveInputTimeline.prepare(chunk.audio, rms(chunk.audio));
-                    sendTimelineInput(activity, chunk.audio);
                     if (sessionRecorder) sessionRecorder.pushLeft(chunk.audio);
+                    sendTimelineInput(activity, chunk.audio);
                 };
                 media.getResponseState = () => session?.modelState || 'listening';
                 media.getPlaybackActive = () => session?.audioPlayer?.hasBufferedAudio || false;
+                media.getInputPending = () => !!session && (
+                    session._recentInputs.size > 0 || session._pendingInputs.length > 0);
+                media.canResumeInput = () => !!session && session._sessionReady
+                    && !session.paused && !session.inputFlowHeld;
+                media.onInputHoldChange = () => syncRecorderInputFlow();
                 media.onEnd = () => {
                     addSystemLog('File playback and assistant drain completed. Auto-stopping session.');
                     stopSession();
                 };
                 await media.start();
+                if (session !== ownerSession || media !== ownerMedia) {
+                    throw new Error('Media preparation cancelled');
+                }
                 mixerCtrl?.stopMixerMic();
                 mixerCtrl?.startMixerMeters();
             }
         );
-
-        // Start recording after media is ready
-        if (sessionRecorder) sessionRecorder.start();
+        if (session !== ownerSession) return;
 
         document.getElementById('chatSessionInfo').textContent = session.sessionId;
         metricsPanel.update({ type: 'state', sessionState: 'Active' });
@@ -1143,6 +1306,7 @@ async function startSession() {
 
         if (_saveShareUI && session.recordingSessionId) _saveShareUI.setSessionId(session.recordingSessionId);
     } catch (e) {
+        if (session !== ownerSession) return;
         const isCancelled = e.message?.includes('cancelled');
         if (!isCancelled) addSystemLog(`Error: ${e.message}`);
         if (session) { try { session.cleanup(); } catch (_) {} }
@@ -1165,14 +1329,23 @@ function toggleForceListen() { if (session) session.toggleForceListen(); }
 // ============================================================================
 // Microphone (Live mode — with Waveform AnalyserNode)
 // ============================================================================
-async function startMicrophone() {
-    audioCtxIn = new AudioContext({ sampleRate: SAMPLE_RATE_IN });
-    if (audioCtxIn.state === 'suspended') await audioCtxIn.resume();
+async function startMicrophone(ownerSession = session) {
+    const context = new AudioContext({ sampleRate: SAMPLE_RATE_IN });
+    audioCtxIn = context;
+    const assertCurrent = () => {
+        if (session !== ownerSession || audioCtxIn !== context) {
+            context.close().catch(() => {});
+            throw new Error('Microphone preparation cancelled');
+        }
+    };
+    if (context.state === 'suspended') await context.resume();
+    assertCurrent();
 
-    await audioCtxIn.audioWorklet.addModule('/static/duplex/lib/capture-processor.js');
+    await context.audioWorklet.addModule('/static/duplex/lib/capture-processor.js');
+    assertCurrent();
 
     const _micId = adxDeviceSelector.getSelectedMicId();
-    audioStream = await navigator.mediaDevices.getUserMedia({
+    const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
             channelCount: 1,
             echoCancellation: true,
@@ -1181,6 +1354,11 @@ async function startMicrophone() {
             ...(_micId ? { deviceId: { exact: _micId } } : {}),
         },
     });
+    if (session !== ownerSession || audioCtxIn !== context) {
+        stream.getTracks().forEach(track => track.stop());
+        assertCurrent();
+    }
+    audioStream = stream;
     audioSource = audioCtxIn.createMediaStreamSource(audioStream);
 
     analyserNode = audioCtxIn.createAnalyser();
@@ -1194,9 +1372,12 @@ async function startMicrophone() {
     audioSource.connect(analyserNode);
     analyserNode.connect(captureNodeLive);
 
-    captureNodeLive.port.postMessage({ command: 'start' });
-    captureNodeLive.port.onmessage = (e) => {
+    sessionRecorder?.start();
+    resetLiveCaptureTimeline();
+    const node = captureNodeLive;
+    node.port.onmessage = (e) => {
         if (e.data.type === 'chunk') {
+            if (captureNodeLive !== node || e.data.captureEpoch !== node._captureEpoch) return;
             if (!session || !session.running || session.paused) return;
             const chunk = e.data.audio;
             const filtered = session.prepareInputChunk(chunk);
@@ -1218,8 +1399,8 @@ async function startMicrophone() {
             }
             // Keep raw mic samples for echo diagnostics and the local
             // recording; only the transport payload is filtered.
-            sendTimelineInput(transport, chunk);
             if (sessionRecorder) sessionRecorder.pushLeft(chunk);
+            sendTimelineInput(transport, chunk);
         }
     };
 

@@ -166,19 +166,22 @@ public final class MiniCPMExactBF16RMSNorm: RMSNorm {
         let executionContext = Self.sharedExecutionContext
         executionContext.executionLock.lock()
         defer { executionContext.executionLock.unlock() }
-        plan.powerGraph.run(
-            with: executionContext.commandQueue,
-            feeds: [
-                plan.powerInputTensor: inputData,
-                plan.exponentTensor: exponentData,
-            ],
-            targetOperations: nil,
-            resultsDictionary: [plan.squaredTensor: squaredData])
-        plan.meanGraph.run(
-            with: executionContext.commandQueue,
-            feeds: [plan.meanInputTensor: squaredData],
-            targetOperations: nil,
-            resultsDictionary: [plan.varianceTensor: varianceData])
+        // Both graph submissions alias MLX storage through no-copy buffer wrappers.
+        withExtendedLifetime((inputFloat, exponent, squared, variance)) {
+            plan.powerGraph.run(
+                with: executionContext.commandQueue,
+                feeds: [
+                    plan.powerInputTensor: inputData,
+                    plan.exponentTensor: exponentData,
+                ],
+                targetOperations: nil,
+                resultsDictionary: [plan.squaredTensor: squaredData])
+            plan.meanGraph.run(
+                with: executionContext.commandQueue,
+                feeds: [plan.meanInputTensor: squaredData],
+                targetOperations: nil,
+                resultsDictionary: [plan.varianceTensor: varianceData])
+        }
 
         // The variance is deliberately materialized into an MLX FP32 array
         // before the remaining pointwise operations.  This is a GPU-backed

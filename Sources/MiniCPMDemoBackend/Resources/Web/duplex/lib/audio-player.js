@@ -70,6 +70,9 @@ export class AudioPlayer {
         this._sources = [];
         this._delayTimer = null;
         this._pendingChunks = [];  // {resampled: Float32Array, raw: Float32Array}[]
+        this._playbackGeneration = 0;
+        this._resumeRequest = null;
+        this._resumeOperation = null;
         this._adaptiveDelayMs = 0;
         this._learnedDelayMs = 0;
         this._generationLatencyMs = 0;
@@ -107,6 +110,23 @@ export class AudioPlayer {
          * (samples: Float32Array, sampleRate: number, playbackTimestamp: number) => void
          */
         this.onRawAudio = null;
+
+        /**
+         * Explicit playback cancellation callback for session recording.
+         * Receives the performance.now() cutoff; normal turn endings preserve
+         * queued audio and do not call it.
+         */
+        this.onPlaybackCancel = null;
+
+        /**
+         * Device recovery replaced the scheduled playback timeline. Consumers
+         * must discard references to the old schedule before retained audio
+         * is scheduled again. Recording cancellation has its own callback.
+         */
+        this.onPlaybackTimelineReset = null;
+
+        /** Output-context recovery failed; queued PCM remains available to retry. */
+        this.onPlaybackError = null;
 
         /**
          * Far-end reference callback for browser AEC diagnostics.  It fires
@@ -149,19 +169,28 @@ export class AudioPlayer {
     /** Start a new SPEAK turn */
     beginTurn() {
         if (this._turnActive) return;
-        this._stopAllSources();
+        // A model turn can finish before its queued audio has played. Keep
+        // that timeline across normal turn boundaries so the next chunk
+        // follows the previous tail; explicit stopAll/stop handles interrupts.
+        const continuePlayback = this.hasBufferedAudio;
+        const waitingForResume = !!this._resumeRequest;
+        if (!continuePlayback) this._stopAllSources();
+        else this._invalidatePlaybackStart();
         this._turnActive = true;
-        this._playing = false;
         this._turnIdx++;
-        this._pendingChunks = [];
-        this._nextTime = 0;
-        this._firstChunkTime = 0;
-        this._playbackStartTime = 0;
+        if (!this._playing) {
+            this._nextTime = 0;
+            this._playbackStartTime = 0;
+            this._playbackStartCtxTime = 0;
+        }
+        if (!this._pendingChunks.length) this._firstChunkTime = 0;
         this._gapCount = 0;
         this._totalShiftMs = 0;
         this._rebufferCount = 0;
         this._lastGapMs = 0;
-        this._lastAheadMs = 0;
+        this._lastAheadMs = this._playing
+            ? Math.max(0, (this._nextTime - this._ctx.currentTime) * 1000)
+            : 0;
         this._lastArrivalTime = 0;
         this._adaptiveDelayMs = Math.min(
             this._maxStartupDelayMs,
@@ -170,6 +199,9 @@ export class AudioPlayer {
         this._generationLatencyMs = 0;
         this._audioDurationMs = 0;
         if (this._delayTimer) { clearTimeout(this._delayTimer); this._delayTimer = null; }
+        if (this._playing) this._startAheadMonitor();
+        else if (waitingForResume && this._pendingChunks.length) this._startPlayback();
+        else if (this._pendingChunks.length) this._armStartupTimer();
         console.log(`[AudioPlayer] === turn #${this._turnIdx} begin ===`);
     }
 
@@ -214,6 +246,8 @@ export class AudioPlayer {
         }
         this._lastArrivalTime = arrivalTime || t0;
 
+        const interrupted = this._playing && this._ctx.state !== 'running';
+        if (interrupted) this._retainInterruptedPlayback();
         if (this._playing) {
             this._scheduleChunk(resampled, raw);
             this._lastAheadMs = (this._nextTime - this._ctx.currentTime) * 1000;
@@ -230,12 +264,46 @@ export class AudioPlayer {
                     this._maxStartupDelayMs,
                 ),
             );
-            this._armStartupTimer();
+            // Startup buffering already completed before a running output
+            // context was interrupted. Recover its retained tail directly.
+            if (interrupted) this._startPlayback();
+            else this._armStartupTimer();
         }
     }
 
+    _retainInterruptedPlayback() {
+        const stoppedAt = this._ctx.currentTime;
+        const playedUntilMs = this._playbackStartTime
+            + (stoppedAt - this._playbackStartCtxTime) * 1000;
+        const remaining = [];
+        for (const source of this._sources) {
+            const chunk = source._playbackChunk;
+            if (!chunk) continue;
+            const playedSeconds = Math.max(0, stoppedAt - chunk.startTime);
+            const playedSamples = Math.min(chunk.samples.length,
+                Math.floor(playedSeconds * this._outputSR));
+            if (playedSamples === chunk.samples.length) continue;
+            const rawOffset = chunk.rawSamples
+                ? Math.min(chunk.rawSamples.length,
+                    Math.floor(playedSeconds * this._outputSR_expected))
+                : 0;
+            remaining.push({
+                resampled: chunk.samples.subarray(playedSamples),
+                raw: chunk.rawSamples?.subarray(rawOffset) || null,
+            });
+        }
+        remaining.push(...this._pendingChunks);
+        this._stopAllSources();
+        this._pendingChunks = remaining;
+        if (this.onPlaybackTimelineReset) this.onPlaybackTimelineReset();
+        // Previously scheduled recording entries used the old context clock.
+        // Retain the audible prefix, then place this tail at its recovered
+        // wall-clock time through the ordinary onRawAudio callback.
+        if (this.onPlaybackCancel) this.onPlaybackCancel(playedUntilMs);
+    }
+
     _armStartupTimer() {
-        if (this._playing || this._pendingChunks.length === 0) return;
+        if (this._playing || this._resumeRequest || this._pendingChunks.length === 0) return;
         if (this._delayTimer) { clearTimeout(this._delayTimer); this._delayTimer = null; }
         const elapsed = this._firstChunkTime
             ? Math.max(0, performance.now() - this._firstChunkTime)
@@ -278,11 +346,14 @@ export class AudioPlayer {
     }
 
     _startPlayback() {
-        if (this._playing) return;
+        if (this._playing || this._resumeRequest || !this._ctx || !this._pendingChunks.length) return;
+        if (this._ctx.state !== 'running') {
+            this._resumeBeforePlayback();
+            return;
+        }
         this._playing = true;
         this._playbackStartTime = performance.now();
         this._playbackStartCtxTime = this._ctx.currentTime;
-        if (this._ctx.state === 'suspended') this._ctx.resume();
 
         this._nextTime = this._ctx.currentTime;
         for (const chunk of this._pendingChunks) {
@@ -297,9 +368,70 @@ export class AudioPlayer {
             bufferTargetMs: this._adaptiveDelayMs,
             bufferedChunks: this._enqueueCount,
         });
-        this._startAheadMonitor();
+        if (this._turnActive) this._startAheadMonitor();
 
         console.log(`[AudioPlayer] playback started (buffered=${this._lastAheadMs.toFixed(0)}ms, pdelay=${pdelay.toFixed(0)}ms, target=${this._adaptiveDelayMs.toFixed(0)}ms)`);
+    }
+
+    _resumeBeforePlayback() {
+        const context = this._ctx;
+        const request = { context, generation: this._playbackGeneration };
+        this._resumeRequest = request;
+        // A normal turn boundary or cancellation invalidates its scheduling
+        // callback, but an AudioContext.resume() cannot itself be cancelled.
+        // Reuse that operation if a fresh turn needs the same context.
+        let operation = this._resumeOperation;
+        if (!operation || operation.context !== context) {
+            operation = { context, promise: null };
+            this._resumeOperation = operation;
+            try {
+                operation.promise = Promise.resolve(context.resume());
+            } catch (error) {
+                operation.promise = Promise.reject(error);
+            }
+            const clearOperation = () => {
+                if (this._resumeOperation === operation) this._resumeOperation = null;
+            };
+            operation.promise.then(clearOperation, clearOperation);
+        }
+        const isCurrent = () => this._resumeRequest === request
+            && this._ctx === context
+            && this._playbackGeneration === request.generation;
+        operation.promise.then(() => {
+            if (!isCurrent()) return;
+            this._resumeRequest = null;
+            if (context.state !== 'running') {
+                this._reportPlaybackError(new Error(`Audio output is ${context.state} after resume`));
+                return;
+            }
+            // Establish the recording/playback anchor only once audio time
+            // can advance. Chunks arriving during recovery remain in order.
+            this._startPlayback();
+        }, error => {
+            if (!isCurrent()) return;
+            this._resumeRequest = null;
+            this._reportPlaybackError(error);
+        }).catch(error => {
+            // Scheduling failures must not escape the asynchronous recovery
+            // callback as an unhandled promise rejection.
+            if (this._ctx === context && this._playbackGeneration === request.generation) {
+                this._reportPlaybackError(error);
+            }
+        });
+    }
+
+    _reportPlaybackError(error) {
+        const failure = error instanceof Error ? error : new Error(String(error));
+        console.warn(`[AudioPlayer] Unable to resume audio output: ${failure.message}`);
+        if (this.onPlaybackError) {
+            try { this.onPlaybackError(failure); }
+            catch (callbackError) { console.warn('[AudioPlayer] Playback error callback failed', callbackError); }
+        }
+    }
+
+    _invalidatePlaybackStart() {
+        this._playbackGeneration++;
+        this._resumeRequest = null;
     }
 
     _scheduleChunk(samples, rawSamples) {
@@ -345,6 +477,7 @@ export class AudioPlayer {
             this.onFarEndReference(rawSamples, this._outputSR_expected, playbackMs);
         }
 
+        source._playbackChunk = { samples, rawSamples, startTime: this._nextTime };
         source.start(this._nextTime);
         this._nextTime += buffer.duration;
 
@@ -393,6 +526,7 @@ export class AudioPlayer {
     }
 
     _stopAllSources() {
+        this._invalidatePlaybackStart();
         if (this._delayTimer) { clearTimeout(this._delayTimer); this._delayTimer = null; }
         this._stopAheadMonitor();
         for (const src of this._sources) {
@@ -402,18 +536,31 @@ export class AudioPlayer {
         this._sources = [];
         this._playing = false;
         this._pendingChunks = [];
+        this._nextTime = 0;
     }
 
     /** Stop all playback immediately (public API) */
     stopAll() {
+        const now = performance.now();
+        const frozenPlayback = this._playing && this._ctx
+            && (this._ctx.state === 'suspended' || this._ctx.state === 'interrupted');
+        // Audio time stops during an output interruption. Cancellation can
+        // arrive before another chunk detects that interruption, so crop the
+        // recording at the last audible sample rather than the later wall time.
+        // A startup queue or a repeated stop has no active playback anchor.
+        const cutoff = frozenPlayback
+            ? Math.min(now, this._playbackStartTime
+                + Math.max(0, this._ctx.currentTime - this._playbackStartCtxTime) * 1000)
+            : now;
         this._stopAllSources();
+        this._turnActive = false;
+        if (this.onPlaybackCancel) this.onPlaybackCancel(cutoff);
     }
 
     /** Full session stop */
     stop() {
         console.log(`[AudioPlayer] session stop (${this._enqueueCount} chunks total)`);
-        this._stopAllSources();
-        this._turnActive = false;
+        this.stopAll();
         const ctx = this._ctx;
         this._ctx = null;
         this._outputSR = 0;

@@ -59,13 +59,25 @@ final class MiniCPMEncoderAttention: Module {
     let headDimension: Int
     let scale: Float
 
-    /// Streaming KV caches pad the key length to multiples of this bucket so
-    /// attention tensor shapes repeat within a session and the compiled
-    /// graph plans / Metal kernels are reused instead of re-planned per
-    /// chunk (~400ms per new shape). Must match the golden oracle's
-    /// KV_BUCKET_POSITIONS.
+    /// Optional shape-reuse experiment. The official encoder uses real key
+    /// lengths; padding can change BF16 reduction boundaries even though the
+    /// masked zero positions are mathematically neutral.
     static let keyBucketLength = 256
 
+    static func keyBucketEnabled(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        guard let value = environment["MINICPM_AUDIO_KV_BUCKET"]?.lowercased()
+        else { return false }
+        return value == "1" || value == "true" || value == "yes"
+    }
+
+    static func attentionKeyLength(realLength: Int, bucketEnabled: Bool) -> Int {
+        precondition(realLength > 0)
+        return bucketEnabled
+            ? ((realLength + keyBucketLength - 1) / keyBucketLength) * keyBucketLength
+            : realLength
+    }
 
     @ModuleInfo(key: "q_proj") var queryProjection: Linear
     @ModuleInfo(key: "k_proj") var keyProjection: Linear
@@ -125,7 +137,7 @@ final class MiniCPMEncoderAttention: Module {
             values = concatenated([cache.values, currentValues], axis: 2)
             totalRealLength = cache.realLength + length
         }
-        if useCache {
+        if useCache && Self.keyBucketEnabled() {
             // Static-shape bucket layout: keys are laid out
             // [zeros | real_past | current] with the total padded up to the
             // next multiple of keyBucketLength, and the additive mask
@@ -135,8 +147,8 @@ final class MiniCPMEncoderAttention: Module {
             // transparent while attention shapes stay stable within a bucket
             // (one plan re-build per ~16s of audio instead of per chunk).
             let pastReal = totalRealLength - length
-            let bucket = ((totalRealLength + Self.keyBucketLength - 1)
-                / Self.keyBucketLength) * Self.keyBucketLength
+            let bucket = Self.attentionKeyLength(
+                realLength: totalRealLength, bucketEnabled: true)
             let headPad = bucket - totalRealLength
             if headPad >= 0 {
                 if let cache {
@@ -175,6 +187,11 @@ final class MiniCPMEncoderAttention: Module {
                 additiveMask = tiled(rowMask, repetitions: [1, heads, 1, 1])
                     .contiguous()
             }
+        } else if useCache {
+            // Match the official streaming [past | current] geometry and its
+            // all-zero additive mask. FAST never enables bucket padding.
+            additiveMask = MLXArray.zeros(
+                [batch, heads, length, totalRealLength], dtype: keys.dtype)
         }
 
         // MiniCPM passes an all-zero additive mask for streaming calls: every
@@ -539,7 +556,7 @@ private func audioAveragePool1d(
 /// MLX's general matmul reduction is numerically stable, but its tiling can
 /// round BF16 inputs differently from ``torch.nn.functional.linear`` on MPS.
 /// This kernel deliberately accumulates one output element in FP32, adds the
-/// bias after the reduction, and performs one destination-dtype store.  Keep
+/// bias after the reduction, and performs one destination-dtype store.
 /// The grid is grouped along sequence positions, so SIMD lanes share the
 /// output row's weight address while each output's FMA order stays unchanged.
 @inline(__always)
@@ -548,6 +565,11 @@ private func audioLinearMPS(_ layer: Linear, _ input: MLXArray) -> MLXArray {
     // for a hand-written scalar Metal kernel, which is the dominant per-unit
     // cost in the duplex loop (380 ms -> 113 ms once bypassed).
     if audioSkipParityLinear { return layer(input) }
+    if audioUseTiledLinear,
+       let output = MiniCPMAudioExactTiledLinear.apply(
+           input: input, weight: layer.weight, bias: layer.bias) {
+        return output
+    }
     guard input.ndim == 3 else { return layer(input) }
     let contiguousInput = input.contiguous()
     let contiguousWeight = layer.weight.contiguous()
@@ -599,24 +621,12 @@ private func audioConv1d(_ layer: Conv1d, _ input: MLXArray) -> MLXArray {
     return output.asType(outputDType)
 }
 
-/// Conv1d boundary used by production MiniCPM audio inference.
-///
-/// ``MLX.conv1d``/matmul are excellent general kernels, but their reduction
-/// tiling and fused bias path do not reproduce the pinned PyTorch MPS result
-/// for this BF16 Whisper front-end.  This small MLX Metal kernel follows the
-/// reference order explicitly: temporal window, input-channel reduction in
-/// FP32, separate bias add, and one BF16 store.
-@inline(__always)
 /// Opt-in fast path for the audio front-end convolutions.
 ///
-/// The default hand-written Metal kernel mirrors PyTorch MPS's exact boundary
-/// arithmetic, but it launches with `threadGroup: (1, 1, 1)` and a scalar
-/// FP32 accumulation loop - one thread per output element. Measured against
-/// the per-unit stage timings, `audio_encoder_ms` is by far the largest stage
-/// (~403 ms of a ~1130 ms duplex unit, i.e. 36%), while the LLM prefill for the
-/// same unit is ~2 ms. `MLX.conv1d` uses a tiled im2col/GEMM kernel and also
-/// accumulates in FP32 with a separate bias add, so the numerical contract is
-/// the same; only the launch shape differs.
+/// The default Metal kernel keeps one sequential FP32 reduction per output
+/// element and groups independent output channels into 32-thread groups.
+/// MLX's built-in convolution uses a different reduction tiling, so opting
+/// into it can change the pinned PyTorch MPS result even with FP32 inputs.
 ///
 /// Set `MINICPM_AUDIO_CONV=mlx` (or `1`/`true`/`builtin`) to compare.
 private let audioUseBuiltinConv: Bool = {
@@ -625,26 +635,11 @@ private let audioUseBuiltinConv: Bool = {
     return value == "mlx" || value == "builtin" || value == "1" || value == "true"
 }()
 
-/// Master switch that hands the whole audio front-end back to MLX's built-in
-/// kernels instead of the MPS-parity hand-written ones.
-///
-/// Every `Linear` in the encoder is replaced by
-/// `MiniCPMAudioMetalKernels.linear`, a scalar Metal kernel that assigns one
-/// thread per output element and then loops serially in FP32 over all
-/// `inputChannels` (`audioLinearMPS`). The encoder's MLP alone is
-/// 1024 -> 4096 -> 1024, so a single 50-position chunk costs
-/// `4096*50*1024 + 1024*50*4096 ≈ 6.3e8` scalar FMAs per layer, times 24
-/// layers - roughly two orders of magnitude off a tiled GEMM.
-///
-/// Measured against the per-unit stage timings, this is what makes
-/// `audio_encoder_ms` a flat ~380 ms (the code comment in
-/// `MiniCPMDuplexEngine` still quotes ~16 ms), which is 36% of a ~1070 ms
-/// duplex unit and the reason the playout buffer never fills.
-///
-/// The custom kernels exist only to reproduce PyTorch MPS's exact FP32
-/// reduction boundary (one-ULP drift was visible in layer 7's FFN). MLX's
-/// built-in path uses the same FP32 accumulation and a separate bias add, so
-/// set `MINICPM_AUDIO_FAST=1` to trade that exactness for speed and compare.
+/// Diagnostic switch that uses MLX's built-in front-end kernels. The exact
+/// linear path retains a sequential FP32 reduction per output; the 50-position
+/// 1024→4096→1024 feed-forward pair alone performs about 4.19e8 FMAs per layer.
+/// Built-in matmul/convolution use different reduction tiling and can change
+/// BF16 rounding, so this flag is not a parity-preserving optimization.
 private let audioFastMathOverride: Bool = {
     guard let value = ProcessInfo.processInfo.environment["MINICPM_AUDIO_FAST"]?
         .lowercased() else { return false }
@@ -661,7 +656,14 @@ private let audioUseBuiltinLinear: Bool = {
 }()
 
 private let audioSkipParityLinear = audioFastMathOverride || audioUseBuiltinLinear
+private let audioUseTiledLinear = ProcessInfo.processInfo.environment[
+    "MINICPM_AUDIO_LINEAR_TILED"] == "1"
 
+/// Conv1d boundary used by production MiniCPM audio inference.
+///
+/// The exact kernel follows the reference order explicitly: temporal window,
+/// input-channel reduction in FP32, separate bias add, and one BF16 store.
+@inline(__always)
 private func audioConv1dMPS(_ layer: Conv1d, _ input: MLXArray) -> MLXArray {
     if audioFastMathOverride || audioUseBuiltinConv {
         return audioConv1d(layer, input)
@@ -669,6 +671,15 @@ private func audioConv1dMPS(_ layer: Conv1d, _ input: MLXArray) -> MLXArray {
     guard let bias = layer.bias else {
         return audioConv1d(layer, input)
     }
+    return audioConv1dMPSKernel(layer, input, bias: bias, threadGroupWidth: 32)
+}
+
+private func audioConv1dMPSKernel(
+    _ layer: Conv1d,
+    _ input: MLXArray,
+    bias: MLXArray,
+    threadGroupWidth: Int
+) -> MLXArray {
     let contiguousInput = input.contiguous()
     let contiguousWeight = layer.weight.contiguous()
     let contiguousBias = bias.contiguous()
@@ -696,7 +707,9 @@ private func audioConv1dMPS(_ layer: Conv1d, _ input: MLXArray) -> MLXArray {
         ],
         template: [("T", contiguousInput.dtype)],
         grid: (outputChannels, outputLength, batch),
-        threadGroup: (1, 1, 1),
+        // Channels are independent: grouping them fills a SIMD group without
+        // changing any output element's sequential reduction or bias add.
+        threadGroup: (threadGroupWidth, 1, 1),
         outputShapes: [[batch, outputLength, outputChannels]],
         outputDTypes: [contiguousInput.dtype]
     )[0]
@@ -1557,6 +1570,25 @@ public final class MiniCPMAudioModel: Module {
         ]
     }
 
+    /// Compare the same exact convolution kernel with its original scalar
+    /// launch and the production channel grouping. Bypass environment fast
+    /// paths so this regression always measures launch geometry alone.
+    func diagnosticConvolutionLaunchVariants(
+        input: MLXArray,
+        convolutionIndex: Int
+    ) -> (scalar: MLXArray, grouped: MLXArray) {
+        precondition(convolutionIndex == 1 || convolutionIndex == 2)
+        let layer = convolutionIndex == 1 ? encoder.conv1 : encoder.conv2
+        guard let bias = layer.bias else {
+            preconditionFailure("Whisper convolutions require bias")
+        }
+        let typedInput = input.asType(layer.weight.dtype)
+        return (
+            audioConv1dMPSKernel(layer, typedInput, bias: bias, threadGroupWidth: 1),
+            audioConv1dMPSKernel(layer, typedInput, bias: bias, threadGroupWidth: 32)
+        )
+    }
+
     /// Compare convolution/GELU operation boundaries against the pinned
     /// PyTorch first-window trace.  The candidates remain useful for guarding
     /// the production convolution boundary against future MLX kernel changes.
@@ -1605,9 +1637,8 @@ public final class MiniCPMAudioModel: Module {
 /// Explicit NLC im2col + GEMM path for the Whisper convolutions.
 /// The model uses groups == 1 and kernel dilation == 1, so each temporal
 /// window can be flattened and multiplied by the flattened [out, K*in]
-/// weight matrix.  Conv1 uses this path in production because it matches the
-/// official MPS accumulation boundary; the diagnostic also exercises it for
-/// Conv2 while evaluating alternatives.
+/// weight matrix. This diagnostic candidate is separate from the production
+/// exact sequential convolution kernel.
 private func audioConv1dIm2Col(
     _ layer: Conv1d,
     _ input: MLXArray,

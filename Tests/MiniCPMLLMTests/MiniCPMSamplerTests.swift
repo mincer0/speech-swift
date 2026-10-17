@@ -61,6 +61,52 @@ final class MiniCPMSamplerTests: XCTestCase {
         XCTAssertEqual(token, 0)
     }
 
+    func testZeroListenScaleCannotUnmaskForbiddenListen() {
+        let config = MiniCPMSamplingConfig(
+            mode: .greedy, repetitionPenalty: 1, repetitionPolicy: .officialDuplex,
+            lengthPenalty: 1, listenProbabilityScale: 0)
+        let logits = MLXArray([Float(-1), 100, -100, -100, -100, -100, -100, -100, -100])
+        var state = MiniCPMSamplerState(seed: 1)
+        XCTAssertEqual(MiniCPMSampler.sample(
+            logits: logits, config: config, protocol: protocolIDs,
+            forbidden: [protocolIDs.listen], state: &state).item(Int.self), 0)
+    }
+
+    func testListenRescueAlwaysLowersPositiveAndNegativeLogits() {
+        for listenLogit: Float in [-1, 1] {
+            let logits = MLXArray([
+                listenLogit - 0.25, listenLogit,
+                -100, -100, -100, -100, -100, -100, -100,
+            ])
+            var config = MiniCPMSamplingConfig(
+                mode: .greedy, repetitionPenalty: 1,
+                repetitionPolicy: .officialDuplex, lengthPenalty: 1)
+            XCTAssertEqual(MiniCPMSampler.sample(
+                logits: logits, config: config, protocol: protocolIDs,
+                uniform: 0).item(Int.self), protocolIDs.listen)
+            config.listenLogProbabilityScale = 0.5
+            XCTAssertEqual(MiniCPMSampler.sample(
+                logits: logits, config: config, protocol: protocolIDs,
+                uniform: 0).item(Int.self), 0)
+            config.listenLogProbabilityScale = 0
+            XCTAssertEqual(MiniCPMSampler.sample(
+                logits: logits, config: config, protocol: protocolIDs,
+                uniform: 0).item(Int.self), 0)
+            XCTAssertEqual(logits[protocolIDs.listen].item(Float.self), listenLogit)
+        }
+    }
+
+    func testListenRescueCannotUnmaskForbiddenListen() {
+        let config = MiniCPMSamplingConfig(
+            mode: .greedy, repetitionPenalty: 1,
+            repetitionPolicy: .officialDuplex, lengthPenalty: 1,
+            listenLogProbabilityScale: 0)
+        let logits = MLXArray([Float(-1), 100, -100, -100, -100, -100, -100, -100, -100])
+        XCTAssertEqual(MiniCPMSampler.sample(
+            logits: logits, config: config, protocol: protocolIDs,
+            forbidden: [protocolIDs.listen], uniform: 0).item(Int.self), 0)
+    }
+
     func testNaturalChunkEOSProbeWinsBeforeFiltering() {
         let config = MiniCPMSamplingConfig(
             temperature: 1, topK: 0, topP: 1, repetitionPenalty: 1,
@@ -70,6 +116,205 @@ final class MiniCPMSamplerTests: XCTestCase {
             logits: logits, config: config, protocol: protocolIDs,
             forbidden: [2], uniform: 0).item(Int.self)
         XCTAssertEqual(token, 2)
+    }
+
+    func testProductionStateSuppressesNaturalChunkEOS() {
+        let config = MiniCPMSamplingConfig(
+            temperature: 1, topK: 1, topP: 1, repetitionPenalty: 1,
+            lengthPenalty: 1, suppressNaturalChunkEOS: true)
+        let logits = MLXArray([Float(0), -100, 100, -100, -100, -100, -100, -100, -100])
+        var state = MiniCPMSamplerState(seed: 1)
+        var expectedState = state
+        _ = expectedState.nextUniform()
+        _ = expectedState.nextUniform()
+        let token = MiniCPMSampler.sample(
+            logits: logits, config: config, protocol: protocolIDs,
+            forbidden: [protocolIDs.chunkEOS], state: &state).item(Int.self)
+        XCTAssertEqual(token, 0)
+        XCTAssertEqual(state.rawState, expectedState.rawState, "A suppressed probe still consumes the final draw")
+        XCTAssertEqual(state.sampledTokens, [0])
+    }
+
+    func testProductionGreedySuppressesNaturalChunkEOS() {
+        let config = MiniCPMSamplingConfig(
+            mode: .greedy, repetitionPenalty: 1, lengthPenalty: 1,
+            suppressNaturalChunkEOS: true)
+        let logits = MLXArray([Float(0), -100, 100, -100, -100, -100, -100, -100, -100])
+        var state = MiniCPMSamplerState(seed: 1)
+        let originalState = state
+        let token = MiniCPMSampler.sample(
+            logits: logits, config: config, protocol: protocolIDs,
+            forbidden: [protocolIDs.chunkEOS], state: &state).item(Int.self)
+        XCTAssertEqual(token, 0)
+        XCTAssertEqual(state.rawState, originalState.rawState)
+        XCTAssertEqual(state.sampledTokens, [0])
+    }
+
+    func testProductionUnsuppressedNaturalChunkEOSConsumesOneDraw() {
+        let config = MiniCPMSamplingConfig(repetitionPenalty: 1, lengthPenalty: 1)
+        let logits = MLXArray([Float(0), -100, 100, -100, -100, -100, -100, -100, -100])
+        var state = MiniCPMSamplerState(seed: 1)
+        var expectedState = state
+        _ = expectedState.nextUniform()
+        let token = MiniCPMSampler.sample(
+            logits: logits, config: config, protocol: protocolIDs,
+            forbidden: [protocolIDs.chunkEOS], state: &state).item(Int.self)
+        XCTAssertEqual(token, protocolIDs.chunkEOS)
+        XCTAssertEqual(state, expectedState)
+    }
+
+    func testProductionListenTopKEarlyReturnDoesNotConsumeFinalDrawOrHistory() {
+        let config = MiniCPMSamplingConfig(
+            temperature: 1, repetitionPolicy: .officialDuplex, lengthPenalty: 1,
+            listenTopK: 1)
+        let logits = MLXArray([Float(0), 100, -100, -100, -100, -100, -100, -100, -100])
+        var state = MiniCPMSamplerState(seed: 1)
+        var expectedState = state
+        _ = expectedState.nextUniform()
+        XCTAssertEqual(MiniCPMSampler.sample(
+            logits: logits, config: config, protocol: protocolIDs,
+            state: &state).item(Int.self), protocolIDs.listen)
+        XCTAssertEqual(state, expectedState)
+    }
+
+    func testListenTopFiveUsesStrictZeroBasedRankAndRespectsExplicitZero() {
+        // Four scores exceed listen: zero-based rank 4 belongs to top five.
+        let rankFour = MLXArray([Float(10), 5, -100, -100, 9, 8, 7, -100, -100])
+        // A fifth higher score puts listen exactly outside the same boundary.
+        let rankFive = MLXArray([Float(10), 5, -100, -100, 9, 8, 7, 6, -100])
+        for (logits, k, expected) in [(rankFour, 5, 1), (rankFive, 5, 0), (rankFour, 0, 0)] {
+            let config = MiniCPMSamplingConfig(
+                mode: .greedy, repetitionPenalty: 1,
+                repetitionPolicy: .officialDuplex, lengthPenalty: 1, listenTopK: k)
+            var state = MiniCPMSamplerState(seed: 99)
+            XCTAssertEqual(MiniCPMSampler.sample(
+                logits: logits, config: config, protocol: protocolIDs,
+                state: &state).item(Int.self), expected)
+        }
+    }
+
+    func testNaturalChunkEOSStillWinsWhenListenIsInTopFive() {
+        let config = MiniCPMSamplingConfig(
+            mode: .greedy, repetitionPenalty: 1,
+            repetitionPolicy: .officialDuplex, lengthPenalty: 1, listenTopK: 5)
+        let logits = MLXArray([Float(0), 9, 10, -100, -100, -100, -100, -100, -100])
+        var state = MiniCPMSamplerState(seed: 99)
+        let before = state
+        XCTAssertEqual(MiniCPMSampler.sample(
+            logits: logits, config: config, protocol: protocolIDs,
+            forbidden: [protocolIDs.chunkEOS], state: &state).item(Int.self), protocolIDs.chunkEOS)
+        XCTAssertEqual(state, before)
+    }
+
+    func testSamplerStateRecordsFilteredProtocolTokensAndRestoresHistory() {
+        let config = MiniCPMSamplingConfig(
+            mode: .greedy, repetitionPenalty: 1, repetitionPolicy: .officialDuplex,
+            lengthPenalty: 1)
+        var state = MiniCPMSamplerState(seed: 1)
+        let before = state.snapshot()
+        let logits = MLXArray([Float(0), 100, -100, -100, -100, -100, -100, -100, -100])
+        _ = MiniCPMSampler.sample(
+            logits: logits, config: config, protocol: protocolIDs, state: &state)
+        XCTAssertEqual(state.sampledTokens, [protocolIDs.listen])
+        let sampledSnapshot = state.snapshot()
+        state.clearTokenHistory()
+        XCTAssertEqual(state.rawState, sampledSnapshot.rawState)
+        XCTAssertTrue(state.sampledTokens.isEmpty)
+        state.restore(sampledSnapshot)
+        XCTAssertEqual(state.sampledTokens, [protocolIDs.listen])
+        state.restore(before)
+        XCTAssertTrue(state.sampledTokens.isEmpty)
+    }
+
+    func testOfficialDuplexPenalizesNegativeHistoryWithCheckpointRule() {
+        // StreamDecoder.decode divides a historical -1 by 1.05. It therefore
+        // outranks -1.02; Hugging Face instead multiplies -1 and selects id 9.
+        let logits = MLXArray([Float(-1), -100, -100, -100, -100, -100, -100, -100, -100, -1.02])
+        var config = MiniCPMSamplingConfig(
+            mode: .greedy, repetitionPenalty: 1.05, repetitionPolicy: .officialDuplex,
+            lengthPenalty: 1)
+        var state = MiniCPMSamplerState(seed: 1)
+        XCTAssertEqual(MiniCPMSampler.sample(
+            logits: logits, config: config, protocol: protocolIDs,
+            previousTokens: [0], state: &state).item(Int.self), 0)
+        config.repetitionPolicy = .huggingFace
+        XCTAssertEqual(MiniCPMSampler.sample(
+            logits: logits, config: config, protocol: protocolIDs,
+            previousTokens: [0], state: &state).item(Int.self), 9)
+    }
+
+    func testOfficialDuplexIncludesProtocolHistory() {
+        let logits = MLXArray([Float(5), 5.1, -100, -100, -100, -100, -100, -100, -100])
+        var config = MiniCPMSamplingConfig(
+            mode: .greedy, repetitionPenalty: 1.05, repetitionPolicy: .officialDuplex,
+            lengthPenalty: 1)
+        var state = MiniCPMSamplerState(seed: 1)
+        XCTAssertEqual(MiniCPMSampler.sample(
+            logits: logits, config: config, protocol: protocolIDs,
+            previousTokens: [protocolIDs.listen], state: &state).item(Int.self), 0)
+        config.repetitionPolicy = .huggingFace
+        XCTAssertEqual(MiniCPMSampler.sample(
+            logits: logits, config: config, protocol: protocolIDs,
+            previousTokens: [protocolIDs.listen], state: &state).item(Int.self), protocolIDs.listen)
+    }
+
+    func testSamplerPreservesCallerLogitsAcrossMasksAndShaping() {
+        let values: [Float] = [5, 5.1, -100, -100, -100, -100, -100, -100, 4]
+        for shape in [[values.count], [1, values.count], [1, 1, values.count]] {
+            let logits = MLXArray(values, shape)
+            let config = MiniCPMSamplingConfig(
+                mode: .greedy, repetitionPenalty: 1.05, repetitionPolicy: .officialDuplex,
+                lengthPenalty: 1, listenProbabilityScale: 0.8)
+            var state = MiniCPMSamplerState(seed: 1)
+            XCTAssertEqual(MiniCPMSampler.sample(
+                logits: logits, config: config, protocol: protocolIDs,
+                forbidden: [8], previousTokens: [protocolIDs.listen],
+                state: &state).item(Int.self), 0)
+            XCTAssertEqual(logits.asArray(Float.self), values, "Raw logits must survive score shaping")
+            let chatConfig = MiniCPMSamplingConfig(mode: .greedy, lengthPenalty: 1)
+            XCTAssertEqual(MiniCPMSampler.sample(
+                logits: logits, config: chatConfig, protocol: protocolIDs,
+                state: &state).item(Int.self), protocolIDs.listen)
+        }
+    }
+
+    func testOfficialDuplexIgnoresLengthPenalty() {
+        let config = MiniCPMSamplingConfig(
+            mode: .greedy, repetitionPenalty: 1, repetitionPolicy: .officialDuplex,
+            lengthPenalty: 2)
+        let logits = MLXArray([Float(9), -100, -100, -100, 9.5, -100, -100, -100, -100])
+        var state = MiniCPMSamplerState(seed: 1)
+        XCTAssertEqual(MiniCPMSampler.sample(
+            logits: logits, config: config, protocol: protocolIDs,
+            state: &state).item(Int.self), protocolIDs.turnEOS)
+    }
+
+    func testOfficialZeroRepetitionWindowUsesAllHistoryWhileChatDisablesIt() {
+        let logits = MLXArray([Float(5.1), -100, -100, -100, -100, -100, -100, -100, -100, 5])
+        var config = MiniCPMSamplingConfig(
+            mode: .greedy, repetitionPenalty: 1.05, repetitionWindowSize: 0,
+            repetitionPolicy: .officialDuplex, lengthPenalty: 1)
+        var state = MiniCPMSamplerState(seed: 1)
+        XCTAssertEqual(MiniCPMSampler.sample(
+            logits: logits, config: config, protocol: protocolIDs,
+            previousTokens: [0], state: &state).item(Int.self), 9)
+        config.repetitionPolicy = .huggingFace
+        XCTAssertEqual(MiniCPMSampler.sample(
+            logits: logits, config: config, protocol: protocolIDs,
+            previousTokens: [0], state: &state).item(Int.self), 0)
+    }
+
+    func testTopKRetainsAllTokensTiedAtThreshold() {
+        let config = MiniCPMSamplingConfig(
+            temperature: 1, topK: 2, topP: 1, repetitionPenalty: 1,
+            lengthPenalty: 1)
+        let logits = MLXArray([Float(3), -100, -100, -100, -100, -100, -100, -100, 2, 2])
+        let tokens = [Float(0), 0.7, 0.999].map { draw in
+            MiniCPMSampler.sample(
+                logits: logits, config: config, protocol: protocolIDs,
+                uniforms: [0, draw]).item(Int.self)
+        }
+        XCTAssertEqual(Set(tokens), Set([0, 8, 9]))
     }
 
     func testSpecialHistoryDoesNotReceiveRepetitionPenalty() {

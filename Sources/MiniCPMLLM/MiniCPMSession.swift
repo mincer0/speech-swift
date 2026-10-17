@@ -179,6 +179,7 @@ public final class MiniCPMSession {
         protocolTokens.removeAll(keepingCapacity: true)
         generatedTokens.removeAll(keepingCapacity: true)
         generatedSpecialTokens.removeAll(keepingCapacity: true)
+        samplerState.clearTokenHistory()
         units.removeAll(keepingCapacity: true)
         systemEmbeddings.removeAll(keepingCapacity: true)
         systemPrefixEmbeddings.removeAll(keepingCapacity: true)
@@ -371,8 +372,10 @@ public final class MiniCPMSession {
     /// Draw one protocol token while advancing this session's RNG.  Keeping
     /// this tiny adapter beside the KV/session snapshot makes it difficult for
     /// a caller to accidentally use a global/fixed random source.  The token
-    /// is deliberately not recorded here: callers may need to inspect or
-    /// route protocol markers before committing them to a unit.
+    /// is deliberately not committed to generatedTokens here: callers may
+    /// inspect or route protocol markers before committing a unit. Filtered
+    /// samples are recorded separately for duplex repetition penalties and
+    /// restored together with the session snapshot.
     @discardableResult
     public func sample(
         logits: MLXArray,
@@ -381,12 +384,14 @@ public final class MiniCPMSession {
         forbidden: [Int] = [],
         previousTokens: [Int]? = nil
     ) -> MLXArray {
-        MiniCPMSampler.sample(
+        let history = config.repetitionPolicy == .officialDuplex
+            ? samplerState.sampledTokens : (previousTokens ?? generatedTokens)
+        return MiniCPMSampler.sample(
             logits: logits,
             config: config,
             protocol: `protocol`,
             forbidden: forbidden,
-            previousTokens: previousTokens ?? generatedTokens,
+            previousTokens: history,
             state: &samplerState)
     }
 
@@ -669,7 +674,21 @@ public final class MiniCPMSession {
                 generatedSpecialTokens.removeLast()
             }
         }
-        rebuildFromReplay()
+        let currentLength = state.sequenceLength
+        if finalMarkerLength <= currentLength,
+           state.position == currentLength,
+           let retained = model.droppingState(
+            state,
+            preserveLength: currentLength - finalMarkerLength,
+            droppingLength: finalMarkerLength) {
+            // Copy the accepted prefix into independent storage before
+            // replacing its final markers. A trimmed view shares storage
+            // with snapshots and would overwrite their original markers.
+            // Suffix removal requires no RoPE reindexing or history replay.
+            state = retained
+        } else {
+            rebuildFromReplay()
+        }
         let markers = MLXArray([Int32(turnEosId), Int32(unitEndId)])
         let markerEmbeddings = model.embed(markers).asType(.bfloat16)
         let output = model.forward(inputEmbeddings: markerEmbeddings, state: state)
